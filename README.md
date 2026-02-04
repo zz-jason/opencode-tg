@@ -1,36 +1,38 @@
-# Telegram Bot for OpenCode
+# OpenCode Telegram Bot
 
-一个 Telegram 机器人，用于与内网部署的 OpenCode AI 编程助手进行交互。Bot 运行在内网环境，通过 HTTP 代理访问 Telegram API，采用轮询方式获取消息。
+A Telegram bot for interacting with OpenCode AI programming assistant deployed in internal networks. The bot runs in internal network environments, accesses Telegram API via HTTP proxy, and uses polling to receive messages. It provides a CLI-like experience for users to interact with OpenCode through Telegram.
 
-## 功能特性
+## Features
 
-- ✅ 通过 Telegram Bot 与 OpenCode 交互
-- ✅ 支持 HTTP 代理（用于访问境外服务）
-- ✅ 轮询模式（无需公网 IP）
-- ✅ 会话管理（每个用户独立会话）
-- ✅ 查看任务状态和中间输出
-- ✅ 发起编程任务并流式接收响应
-- ✅ 支持中断正在执行的任务
-- ✅ 文件浏览、代码搜索等辅助功能（待实现）
+- ✅ Interact with OpenCode through Telegram Bot
+- ✅ HTTP proxy support (for accessing external services)
+- ✅ Polling mode (no public IP required)
+- ✅ Session management (independent sessions per user)
+- ✅ View task status and intermediate outputs
+- ✅ Initiate programming tasks with streaming responses
+- ✅ Abort running tasks
+- ✅ File browsing and project exploration
+- ✅ Model selection and AI provider management
+- ✅ Real-time message updates and progress tracking
 
-## 系统架构
+## System Architecture
 
 ```
-Telegram API <--[HTTP Proxy]--> Telegram Bot (Golang) <--[内网HTTP]--> OpenCode Server
+Telegram API <--[HTTP Proxy]--> Telegram Bot (Golang) <--[Internal HTTP]--> OpenCode Server
 ```
 
-## 快速开始
+## Quick Start
 
-### 前提条件
+### Prerequisites
 
-1. OpenCode 服务器运行在 `http://192.168.50.100:8080`
-2. HTTP 代理可访问 Telegram API（如 `http://127.0.0.1:7890`）
-3. Telegram Bot Token（从 @BotFather 获取）
-4. Go 1.21+ 开发环境
+1. OpenCode server running at `http://192.168.50.100:8080` (or your OpenCode server URL)
+2. HTTP proxy accessible to Telegram API (e.g., `http://127.0.0.1:7890`)
+3. Telegram Bot Token (obtain from @BotFather)
+4. Go 1.21+ development environment
 
-### 配置
+### Configuration
 
-复制 `config.example.toml` 为 `config.toml` 并修改配置：
+Copy `config.example.toml` to `config.toml` and modify the settings:
 
 ```toml
 [telegram]
@@ -44,163 +46,206 @@ url = "http://127.0.0.1:7890"
 
 [opencode]
 url = "http://192.168.50.100:8080"
-timeout = 30
+timeout = 300  # Increased timeout for long-running tasks
 
 [storage]
-type = "memory"
+type = "memory"  # or "sqlite"
+sqlite_path = "sessions.db"
 
 [logging]
 level = "info"
 output = "bot.log"
 ```
 
-### 构建和运行
+### Build and Run
 
 ```bash
-# 安装依赖
+# Install dependencies
 make deps
 
-# 构建
+# Build the bot
 make build
 
-# 检查 OpenCode 连接
+# Check OpenCode connection
 make check-opencode
 
-# 运行
+# Run the bot
 make run
 ```
 
-或者直接使用：
+Or run directly:
 
 ```bash
 go run cmd/bot/main.go
 ```
 
-## 使用指南
+## Usage Guide
 
-### 基本命令
+### Basic Commands
 
-- `/start` - 显示欢迎信息
-- `/help` - 显示帮助
-- `/sessions` - 列出所有会话
-- `/new [名称]` - 创建新会话
-- `/switch <会话ID>` - 切换当前会话
-- `/current` - 显示当前会话信息
-- `/abort` - 中止当前任务
-- `/status` - 查看当前任务状态
+- `/start` - Show welcome message
+- `/help` - Display help information
+- `/sessions` - List all your sessions
+- `/new [name]` - Create a new session
+- `/switch <sessionID>` - Switch to a different session
+- `/current` - Show current session information
+- `/abort` - Abort current task
+- `/status` - View current task status
 
-### 交互模式
+### File Operations
+- `/files [path]` - Browse project files (default: current directory)
+- `/search <pattern>` - Search code text (if API available)
+- `/findfile <pattern>` - Search for files (if API available)
+- `/symbol <name>` - Search for symbols (if API available)
 
-发送任何非命令文本，Bot 会将其作为指令发送给 OpenCode 并流式返回响应。
+### AI Model Management
+- `/models` - List available AI models with numeric IDs
+- `/providers` - List AI providers and connection status
+- `/setmodel <number>` - Set model for current session
+- `/newmodel <name> <number>` - Create new session with specific model
 
-示例：
+### Interactive Mode
+
+Send any non-command text, and the bot will send it as an instruction to OpenCode and stream back the response.
+
+Example:
 ```
-用户: 写一个Go函数计算斐波那契数列
-Bot: 🤖 处理中...
-Bot: 这是一个计算斐波那契数列的Go函数...
+User: Write a Go function to calculate Fibonacci sequence
+Bot: 🤖 Processing...
+Bot: Here's a Go function to calculate Fibonacci sequence...
 ```
 
-### 会话管理
+### Session Management
 
-- 每个 Telegram 用户默认有一个会话
-- 使用 `/new` 可以创建多个会话用于不同任务
-- 使用 `/switch` 可以在会话间切换
-- 会话状态保存在内存中（重启后丢失）
+- Each Telegram user has one default session
+- Use `/new` to create multiple sessions for different tasks
+- Use `/switch` to switch between sessions
+- Session state is stored in memory (lost on restart)
 
-## 开发
+## Development
 
-### 项目结构
+### Project Structure
 
 ```
 tg-bot/
-├── cmd/bot/main.go          # 程序入口
+├── cmd/bot/main.go          # Application entry point
 ├── internal/
-│   ├── config/              # 配置管理（TOML）
-│   ├── handler/             # Telegram 命令处理器
-│   ├── opencode/            # OpenCode API 客户端
-│   ├── session/             # 会话管理器
-│   ├── stream/              # SSE 流式处理
-│   └── logging/             # 日志配置
-├── config.toml              # 配置文件
-└── docs/tg-coding.md        # 设计文档
+│   ├── config/              # Configuration management (TOML)
+│   ├── handler/             # Telegram command handlers
+│   ├── opencode/            # OpenCode API client
+│   ├── session/             # Session manager
+│   ├── stream/              # SSE streaming utilities
+│   └── logging/             # Logging configuration
+├── config.toml              # Configuration file
+├── DESIGN.md                # Design documentation
+└── docs/tg-coding.md        # Development notes
 ```
 
-### 测试
+### Testing
 
 ```bash
-# 运行所有测试
+# Run all tests
 make test
 
-# 运行特定包测试
+# Run specific package tests
 go test ./internal/config
 go test ./internal/opencode
 go test ./internal/session
 ```
 
-### 添加新命令
+### Adding New Commands
 
-1. 在 `internal/handler/handlers.go` 中注册命令：
+1. Register the command in `internal/handler/handlers.go`:
    ```go
    b.tgBot.Handle("/newcommand", b.handleNewCommand)
    ```
 
-2. 实现处理函数：
+2. Implement the handler function:
    ```go
    func (b *Bot) handleNewCommand(c telebot.Context) error {
-       // 处理逻辑
-       return c.Send("响应")
+       // Handler logic
+       return c.Send("Response")
    }
    ```
 
-## 配置说明
+## Configuration Reference
 
-### Telegram 配置
-- `token`: Telegram Bot Token（必需）
-- `polling_timeout`: 轮询超时时间（秒）
-- `polling_limit`: 每次轮询获取的消息数量
+### Telegram Configuration
+- `token`: Telegram Bot Token (required)
+- `polling_timeout`: Polling timeout in seconds
+- `polling_limit`: Number of messages to fetch per poll
 
-### 代理配置
-- `enabled`: 是否启用代理
-- `url`: 代理服务器地址
+### Proxy Configuration
+- `enabled`: Whether to enable proxy
+- `url`: Proxy server URL
 
-### OpenCode 配置
-- `url`: OpenCode 服务器地址（必需）
-- `timeout`: API 请求超时时间（秒）
+### OpenCode Configuration
+- `url`: OpenCode server URL (required)
+- `timeout`: API request timeout in seconds (increased to 300 for long tasks)
 
-### 存储配置
-- `type`: 存储类型（`memory` 或 `sqlite`）
-- `sqlite_path`: SQLite 数据库路径（当 type=sqlite 时）
+### Storage Configuration
+- `type`: Storage type (`memory` or `sqlite`)
+- `sqlite_path`: SQLite database path (when type=sqlite)
 
-### 日志配置
-- `level`: 日志级别（debug, info, warn, error）
-- `output`: 日志输出文件（stdout 或文件路径）
+### Logging Configuration
+- `level`: Log level (debug, info, warn, error)
+- `output`: Log output file (stdout or file path)
 
-## 故障排除
+## Current Implementation Status
 
-### OpenCode 连接失败
+### ✅ Implemented Features
+- Full session management (create, list, switch sessions)
+- Real-time message streaming with periodic updates
+- File browsing (`/files` command)
+- AI model and provider management
+- Task status monitoring (`/status` command)
+- Task abortion (`/abort` command)
+- Message formatting optimization (removed redundant headers)
+- Tool call display with JSON parsing
+- Proxy support for Telegram API access
+- Health checks and error handling
+
+### ⚠️ Known Limitations
+- Search APIs (`/search`, `/findfile`, `/symbol`) return "API not available" messages as OpenCode search endpoints return HTML instead of JSON
+- Some advanced OpenCode features may not be available via API
+- Session persistence is memory-only (optional SQLite support available)
+
+### 🔧 Technical Details
+- **Message Updates**: Uses 5-second periodic polling to update message status
+- **Tool Call Display**: Attempts to parse JSON snapshots to show tool names and arguments
+- **Timeout Handling**: Increased to 300 seconds to accommodate long-running tasks
+- **Proxy Configuration**: Explicit proxy settings to avoid proxy interference with local OpenCode connections
+
+## Troubleshooting
+
+### OpenCode Connection Failure
 ```
 ERROR: OpenCode health check failed
 ```
-- 检查 OpenCode 服务器是否运行
-- 检查网络连通性
-- 验证 `opencode.url` 配置
+- Verify OpenCode server is running
+- Check network connectivity
+- Validate `opencode.url` configuration
 
-### Telegram 连接失败
+### Telegram Connection Failure
 ```
 ERROR: Failed to create Telegram bot
 ```
-- 检查 Bot Token 是否正确
-- 检查代理配置是否正确
-- 验证代理服务器可访问 Telegram API
+- Verify Bot Token is correct
+- Check proxy configuration
+- Ensure proxy server can access Telegram API
 
-### 流式响应中断
-- 检查 OpenCode 的 SSE 端点是否正常工作
-- 查看日志中的错误信息
+### Streaming Response Interruption
+- Check if OpenCode SSE endpoint is working properly
+- Review error messages in logs
 
-## 许可证
+### "context deadline exceeded" Errors
+- Increase `timeout` in OpenCode configuration (currently 300 seconds)
+- Check OpenCode server performance
+
+## License
 
 MIT License
 
-## 贡献
+## Contributing
 
-欢迎提交 Issue 和 Pull Request。
+Issues and Pull Requests are welcome.
