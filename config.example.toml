@@ -1,0 +1,23 @@
+# Telegram Bot Configuration Example
+# Copy this file to config.toml and modify the values
+
+[telegram]
+token = "YOUR_BOT_TOKEN_HERE"
+polling_timeout = 60
+polling_limit = 100
+
+[proxy]
+enabled = true
+url = "http://127.0.0.1:7890"
+
+[opencode]
+url = "http://192.168.50.100:8080"
+timeout = 30
+
+[storage]
+type = "memory"  # or "sqlite"
+sqlite_path = "sessions.db"
+
+[logging]
+level = "info"
+output = "bot.log"
