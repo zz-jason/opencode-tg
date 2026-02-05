@@ -281,7 +281,7 @@ func (b *Bot) handleCurrent(c telebot.Context) error {
 	sessionID, exists := b.sessionManager.GetUserSession(userID)
 
 	if !exists {
-		return c.Send("你还没有当前会话。使用 /new 创建一个新会话。")
+		return c.Send("You don't have a current session. Use /new to create a new session.")
 	}
 
 	meta, exists := b.sessionManager.GetSessionMeta(sessionID)
@@ -372,8 +372,8 @@ func formatMessageParts(parts []interface{}) string {
 					sb.WriteString("🤔 Reasoning: Processed\n")
 				}
 			case "step-start":
-				// Skip "任务开始" message as it's redundant
-				// sb.WriteString("🚀 任务开始\n")
+				// Skip "Task start" message as it's redundant
+				// sb.WriteString("🚀 Task start\n")
 			case "step-finish":
 				finishMsg := fmt.Sprintf("✅ Task completed")
 				if partResp.Reason != "" {
@@ -706,7 +706,7 @@ func (b *Bot) handleProviders(c telebot.Context) error {
 	providersResp, err := b.opencodeClient.GetProviders(b.ctx)
 	if err != nil {
 		log.Errorf("Failed to get providers: %v", err)
-		return c.Send(fmt.Sprintf("获取提供商失败: %v", err))
+		return c.Send(fmt.Sprintf("Failed to get providers: %v", err))
 	}
 
 	// Create a set of connected provider IDs for faster lookup
@@ -877,7 +877,7 @@ func (b *Bot) handleText(c telebot.Context) error {
 	sessionID, err := b.sessionManager.GetOrCreateSession(b.ctx, userID)
 	if err != nil {
 		log.Errorf("Failed to get/create session: %v", err)
-		return c.Send(fmt.Sprintf("会话错误: %v", err))
+		return c.Send(fmt.Sprintf("Session error: %v", err))
 	}
 
 	// Send initial "processing" message
@@ -913,7 +913,7 @@ func (b *Bot) handleText(c telebot.Context) error {
 	if err != nil {
 		log.Errorf("Failed to send message: %v", err)
 		// Update with error message
-		errorMsg := fmt.Sprintf("处理错误: %v", err)
+		errorMsg := fmt.Sprintf("Processing error: %v", err)
 		if len(errorMsg) > 4000 {
 			errorMsg = errorMsg[:4000]
 		}
@@ -978,7 +978,7 @@ func (b *Bot) handleFiles(c telebot.Context) error {
 		for _, file := range fileList {
 			ignored := ""
 			if file.Ignored {
-				ignored = " [已忽略]"
+				ignored = " [Ignored]"
 			}
 			sb.WriteString(fmt.Sprintf("  • %s%s\n", file.Name, ignored))
 		}
@@ -1021,7 +1021,7 @@ func (b *Bot) handleSearch(c telebot.Context) error {
 	// Limit results to prevent message overflow
 	maxResults := 10
 	if len(results) > maxResults {
-		sb.WriteString(fmt.Sprintf("找到 %d 个结果，显示前 %d 个:\n\n", len(results), maxResults))
+		sb.WriteString(fmt.Sprintf("Found %d results, showing first %d:\n\n", len(results), maxResults))
 		results = results[:maxResults]
 	}
 
