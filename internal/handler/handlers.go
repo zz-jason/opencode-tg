@@ -109,70 +109,70 @@ func (b *Bot) Start() {
 // handleStart handles the /start command
 func (b *Bot) handleStart(c telebot.Context) error {
 	user := c.Sender()
-	message := fmt.Sprintf(`👋 你好 %s!
+	message := fmt.Sprintf(`👋 Hello %s!
 
-欢迎使用 OpenCode Telegram Bot。
+Welcome to OpenCode Telegram Bot.
 
-我是一个 AI 编程助手，可以帮助你：
-• 编写和重构代码
-• 回答编程问题
-• 浏览项目文件
-• 搜索代码和符号
+I am an AI programming assistant that can help you:
+• Write and refactor code
+• Answer programming questions
+• Browse project files
+• Search code and symbols
 
-基本命令：
-/start - 显示此帮助信息
-/help - 显示详细帮助
-/sessions - 列出你的会话
-/new [名称] - 创建新会话
-/switch <会话ID> - 切换会话
-/current - 显示当前会话
-/status - 查看当前任务状态
+Basic commands:
+/start - Show this help message
+/help - Show detailed help
+/sessions - List your sessions
+/new [name] - Create a new session
+/switch <sessionID> - Switch session
+/current - Show current session
+/status - Check current task status
 
-发送任何非命令文本，我将将其作为指令发送给 OpenCode。
+Send any non-command text and I'll send it as an instruction to OpenCode.
 
-使用 /help 查看所有可用命令。`, user.FirstName)
+Use /help to see all available commands.`, user.FirstName)
 
 	return c.Send(message)
 }
 
 // handleHelp handles the /help command
 func (b *Bot) handleHelp(c telebot.Context) error {
-	helpText := `📚 OpenCode Bot 帮助
+	helpText := `📚 OpenCode Bot Help
 
-核心命令：
-• /start - 显示欢迎信息
-• /help - 显示此帮助
-• /sessions - 列出所有会话
-• /new [名称] - 创建新会话
-• /switch <会话ID> - 切换当前会话
-• /current - 显示当前会话信息
-• /abort - 中止当前任务
-• /status - 查看当前任务状态
+Core Commands:
+• /start - Show welcome message
+• /help - Show this help
+• /sessions - List all sessions
+• /new [name] - Create new session
+• /switch <sessionID> - Switch current session
+• /current - Show current session information
+• /abort - Abort current task
+• /status - Check current task status
 
-文件操作：
-• /files [路径] - 浏览项目文件（默认当前目录）
-• /search <模式> - 搜索代码文本
-• /findfile <模式> - 搜索文件
-• /symbol <符号> - 搜索符号（函数、类等）
+File Operations:
+• /files [path] - Browse project files (default: current directory)
+• /search <pattern> - Search code text
+• /findfile <pattern> - Search for files
+• /symbol <symbol> - Search symbols (functions, classes, etc.)
 
-系统信息：
-• /agent - 列出可用 AI 代理
-• /command - 列出可用命令
+System Information:
+• /agent - List available AI agents
+• /command - List available commands
 
-	模型选择：
-• /models - 列出可用 AI 模型（显示编号）
-• /providers - 列出 AI 提供商
-• /setmodel <编号> - 设置当前会话模型
-• /newmodel <名称> <编号> - 创建新会话并指定模型
+Model Selection:
+• /models - List available AI models (with numbers)
+• /providers - List AI providers
+• /setmodel <number> - Set model for current session
+• /newmodel <name> <number> - Create new session with specified model
 
-交互模式：
-发送任何非命令文本，我会将其作为指令发送给 OpenCode 并流式返回响应。
+Interactive Mode:
+Send any non-command text and I'll send it as an instruction to OpenCode and stream back the response.
 
-注意事项：
-• 每个用户默认有一个会话
-• 使用 /new 创建多个会话用于不同任务
-• 使用 /abort 可以中止长时间运行的任务
-• 发送新消息会自动中止之前的流式响应`
+Notes:
+• Each user has one default session
+• Use /new to create multiple sessions for different tasks
+• Use /abort to abort long-running tasks
+• Sending a new message automatically aborts previous streaming response`
 
 	return c.Send(helpText)
 }
@@ -183,15 +183,15 @@ func (b *Bot) handleSessions(c telebot.Context) error {
 	sessions, err := b.sessionManager.ListUserSessions(b.ctx, userID)
 	if err != nil {
 		log.Errorf("Failed to list sessions: %v", err)
-		return c.Send(fmt.Sprintf("获取会话列表失败: %v", err))
+		return c.Send(fmt.Sprintf("Failed to get session list: %v", err))
 	}
 
 	if len(sessions) == 0 {
-		return c.Send("你还没有任何会话。使用 /new 创建一个新会话。")
+		return c.Send("You don't have any sessions yet. Use /new to create a new session.")
 	}
 
 	var sb strings.Builder
-	sb.WriteString("📋 你的会话：\n\n")
+	sb.WriteString("📋 Your sessions:\n\n")
 
 	currentSessionID, hasCurrent := b.sessionManager.GetUserSession(userID)
 
@@ -201,17 +201,17 @@ func (b *Bot) handleSessions(c telebot.Context) error {
 			prefix = "✅ "
 		}
 		sb.WriteString(fmt.Sprintf("%s%d. `%s`\n", prefix, i+1, sess.SessionID))
-		sb.WriteString(fmt.Sprintf("   名称: %s\n", sess.Name))
-		sb.WriteString(fmt.Sprintf("   创建: %s\n", sess.CreatedAt.Format("2006-01-02 15:04")))
-		sb.WriteString(fmt.Sprintf("   最后使用: %s\n", sess.LastUsedAt.Format("2006-01-02 15:04")))
-		sb.WriteString(fmt.Sprintf("   消息数: %d\n", sess.MessageCount))
+		sb.WriteString(fmt.Sprintf("   Name: %s\n", sess.Name))
+		sb.WriteString(fmt.Sprintf("   Created: %s\n", sess.CreatedAt.Format("2006-01-02 15:04")))
+		sb.WriteString(fmt.Sprintf("   Last used: %s\n", sess.LastUsedAt.Format("2006-01-02 15:04")))
+		sb.WriteString(fmt.Sprintf("   Messages: %d\n", sess.MessageCount))
 		if sess.ProviderID != "" && sess.ModelID != "" {
-			sb.WriteString(fmt.Sprintf("   模型: %s/%s\n", sess.ProviderID, sess.ModelID))
+			sb.WriteString(fmt.Sprintf("   Model: %s/%s\n", sess.ProviderID, sess.ModelID))
 		}
 		sb.WriteString("\n")
 	}
 
-	sb.WriteString("使用 /switch <会话ID> 切换会话，或 /new 创建新会话。")
+	sb.WriteString("Use /switch <sessionID> to switch sessions, or /new to create a new session.")
 
 	return c.Send(sb.String())
 }
@@ -221,7 +221,7 @@ func (b *Bot) handleNew(c telebot.Context) error {
 	userID := c.Sender().ID
 	args := c.Args()
 
-	name := "新会话"
+	name := "New session"
 	if len(args) > 0 {
 		name = strings.Join(args, " ")
 	}
@@ -229,13 +229,13 @@ func (b *Bot) handleNew(c telebot.Context) error {
 	sessionID, err := b.sessionManager.CreateNewSession(b.ctx, userID, name)
 	if err != nil {
 		log.Errorf("Failed to create session: %v", err)
-		return c.Send(fmt.Sprintf("创建会话失败: %v", err))
+		return c.Send(fmt.Sprintf("Failed to create session: %v", err))
 	}
 
 	// Set as current session
 	b.sessionManager.SetUserSession(userID, sessionID)
 
-	return c.Send(fmt.Sprintf("✅ 已创建新会话：%s\n会话ID: `%s`\n\n此会话已设置为当前会话。", name, sessionID))
+	return c.Send(fmt.Sprintf("✅ Created new session: %s\nSession ID: `%s`\n\nThis session has been set as your current session.", name, sessionID))
 }
 
 // handleSwitch handles the /switch command
@@ -244,7 +244,7 @@ func (b *Bot) handleSwitch(c telebot.Context) error {
 	args := c.Args()
 
 	if len(args) == 0 {
-		return c.Send("请指定要切换到的会话ID。\n用法: /switch <会话ID>\n使用 /sessions 查看你的会话列表。")
+		return c.Send("Please specify the session ID to switch to.\nUsage: /switch <sessionID>\nUse /sessions to see your session list.")
 	}
 
 	sessionID := args[0]
@@ -253,7 +253,7 @@ func (b *Bot) handleSwitch(c telebot.Context) error {
 	sessions, err := b.sessionManager.ListUserSessions(b.ctx, userID)
 	if err != nil {
 		log.Errorf("Failed to get user sessions: %v", err)
-		return c.Send(fmt.Sprintf("获取会话列表失败: %v", err))
+		return c.Send(fmt.Sprintf("Failed to get session list: %v", err))
 	}
 	found := false
 	for _, sess := range sessions {
@@ -264,15 +264,15 @@ func (b *Bot) handleSwitch(c telebot.Context) error {
 	}
 
 	if !found {
-		return c.Send("未找到该会话ID，或会话不属于你。\n使用 /sessions 查看你的会话列表。")
+		return c.Send("Session ID not found, or the session does not belong to you.\nUse /sessions to see your session list.")
 	}
 
 	if err := b.sessionManager.SetUserSession(userID, sessionID); err != nil {
 		log.Errorf("Failed to switch session: %v", err)
-		return c.Send(fmt.Sprintf("切换会话失败: %v", err))
+		return c.Send(fmt.Sprintf("Failed to switch session: %v", err))
 	}
 
-	return c.Send(fmt.Sprintf("✅ 已切换到会话：`%s`", sessionID))
+	return c.Send(fmt.Sprintf("✅ Switched to session: `%s`", sessionID))
 }
 
 // handleCurrent handles the /current command
@@ -286,7 +286,7 @@ func (b *Bot) handleCurrent(c telebot.Context) error {
 
 	meta, exists := b.sessionManager.GetSessionMeta(sessionID)
 	if !exists {
-		return c.Send("会话信息已丢失。使用 /new 创建一个新会话。")
+		return c.Send("Session information lost. Use /new to create a new session.")
 	}
 
 	// Get session details from OpenCode
@@ -297,26 +297,26 @@ func (b *Bot) handleCurrent(c telebot.Context) error {
 	}
 
 	var sb strings.Builder
-	sb.WriteString("📁 当前会话信息\n\n")
-	sb.WriteString(fmt.Sprintf("会话ID: `%s`\n", sessionID))
-	sb.WriteString(fmt.Sprintf("名称: %s\n", meta.Name))
-	sb.WriteString(fmt.Sprintf("创建时间: %s\n", meta.CreatedAt.Format("2006-01-02 15:04:05")))
-	sb.WriteString(fmt.Sprintf("最后使用: %s\n", meta.LastUsedAt.Format("2006-01-02 15:04:05")))
-	sb.WriteString(fmt.Sprintf("消息数: %d\n", meta.MessageCount))
+	sb.WriteString("📁 Current Session Information\n\n")
+	sb.WriteString(fmt.Sprintf("Session ID: `%s`\n", sessionID))
+	sb.WriteString(fmt.Sprintf("Name: %s\n", meta.Name))
+	sb.WriteString(fmt.Sprintf("Created: %s\n", meta.CreatedAt.Format("2006-01-02 15:04:05")))
+	sb.WriteString(fmt.Sprintf("Last used: %s\n", meta.LastUsedAt.Format("2006-01-02 15:04:05")))
+	sb.WriteString(fmt.Sprintf("Messages: %d\n", meta.MessageCount))
 	if meta.ProviderID != "" && meta.ModelID != "" {
-		sb.WriteString(fmt.Sprintf("当前模型: %s/%s\n", meta.ProviderID, meta.ModelID))
+		sb.WriteString(fmt.Sprintf("Current model: %s/%s\n", meta.ProviderID, meta.ModelID))
 	} else {
-		sb.WriteString("当前模型: 默认\n")
+		sb.WriteString("Current model: Default\n")
 	}
 
 	if session != nil {
 		createdAt := time.UnixMilli(session.Time.Created)
-		sb.WriteString(fmt.Sprintf("OpenCode 创建时间: %s\n", createdAt.Format("2006-01-02 15:04:05")))
+		sb.WriteString(fmt.Sprintf("OpenCode created: %s\n", createdAt.Format("2006-01-02 15:04:05")))
 		updatedAt := time.UnixMilli(session.Time.Updated)
-		sb.WriteString(fmt.Sprintf("OpenCode 更新时间: %s\n", updatedAt.Format("2006-01-02 15:04:05")))
+		sb.WriteString(fmt.Sprintf("OpenCode updated: %s\n", updatedAt.Format("2006-01-02 15:04:05")))
 	}
 
-	sb.WriteString("\n使用 /sessions 查看所有会话，或 /switch 切换会话。")
+	sb.WriteString("\nUse /sessions to see all sessions, or /switch to switch sessions.")
 
 	return c.Send(sb.String())
 }
@@ -327,21 +327,21 @@ func (b *Bot) handleAbort(c telebot.Context) error {
 	sessionID, exists := b.sessionManager.GetUserSession(userID)
 
 	if !exists {
-		return c.Send("你还没有当前会话。")
+		return c.Send("You don't have a current session. Use /new to create a new session.")
 	}
 
 	if err := b.opencodeClient.AbortSession(b.ctx, sessionID); err != nil {
 		log.Errorf("Failed to abort session: %v", err)
-		return c.Send(fmt.Sprintf("中止会话失败: %v", err))
+		return c.Send(fmt.Sprintf("Failed to abort session: %v", err))
 	}
 
-	return c.Send("🛑 已发送中止信号。当前任务将被中断。")
+	return c.Send("🛑 Abort signal sent. Current task will be interrupted.")
 }
 
 // formatMessageParts formats message parts for display
 func formatMessageParts(parts []interface{}) string {
 	if len(parts) == 0 {
-		return "无详细内容"
+		return "No detailed content"
 	}
 
 	var sb strings.Builder
@@ -367,24 +367,24 @@ func formatMessageParts(parts []interface{}) string {
 					if len(reasoningText) > 300 {
 						reasoningText = reasoningText[:300] + "..."
 					}
-					sb.WriteString(fmt.Sprintf("🤔 推理过程:\n%s\n", reasoningText))
+					sb.WriteString(fmt.Sprintf("🤔 Reasoning:\n%s\n", reasoningText))
 				} else {
-					sb.WriteString("🤔 推理过程: 已处理\n")
+					sb.WriteString("🤔 Reasoning: Processed\n")
 				}
 			case "step-start":
 				// Skip "任务开始" message as it's redundant
 				// sb.WriteString("🚀 任务开始\n")
 			case "step-finish":
-				finishMsg := fmt.Sprintf("✅ 任务完成")
+				finishMsg := fmt.Sprintf("✅ Task completed")
 				if partResp.Reason != "" {
-					finishMsg += fmt.Sprintf(" (原因: %s)", partResp.Reason)
+					finishMsg += fmt.Sprintf(" (Reason: %s)", partResp.Reason)
 				}
 				if partResp.Cost > 0 {
-					finishMsg += fmt.Sprintf(" [成本: %.4f]", partResp.Cost)
+					finishMsg += fmt.Sprintf(" [Cost: %.4f]", partResp.Cost)
 				}
 				sb.WriteString(finishMsg + "\n")
 			case "tool":
-				toolInfo := "🛠️ 工具调用"
+				toolInfo := "🛠️ Tool call"
 
 				// Try to parse snapshot as JSON for more details
 				if partResp.Snapshot != "" {
@@ -470,18 +470,18 @@ func formatMessageParts(parts []interface{}) string {
 						if len(reasoningText) > 300 {
 							reasoningText = reasoningText[:300] + "..."
 						}
-						sb.WriteString(fmt.Sprintf("🤔 推理过程:\n%s\n", reasoningText))
+						sb.WriteString(fmt.Sprintf("🤔 Reasoning:\n%s\n", reasoningText))
 					} else {
-						sb.WriteString("🤔 推理过程: 已处理\n")
+						sb.WriteString("🤔 Reasoning: Processed\n")
 					}
 				default:
 					sb.WriteString(fmt.Sprintf("🔹 %s\n", partType))
 				}
 			} else {
-				sb.WriteString(fmt.Sprintf("🔹 未知类型\n"))
+				sb.WriteString(fmt.Sprintf("🔹 Unknown type\n"))
 			}
 		} else {
-			sb.WriteString(fmt.Sprintf("🔹 未知部件\n"))
+			sb.WriteString(fmt.Sprintf("🔹 Unknown part\n"))
 		}
 	}
 
@@ -493,13 +493,13 @@ func formatMessageParts(parts []interface{}) string {
 			if len(text) > 1000 {
 				text = text[:1000] + "..."
 			}
-			sb.WriteString(fmt.Sprintf("\n💬 回复内容:\n%s\n", text))
+			sb.WriteString(fmt.Sprintf("\n💬 Reply content:\n%s\n", text))
 		}
 	}
 
 	result := strings.TrimSpace(sb.String())
 	if result == "" {
-		return "无详细内容"
+		return "No detailed content"
 	}
 	return result
 }
@@ -510,33 +510,33 @@ func (b *Bot) handleStatus(c telebot.Context) error {
 	sessionID, exists := b.sessionManager.GetUserSession(userID)
 
 	if !exists {
-		return c.Send("你还没有当前会话。使用 /new 创建一个新会话。")
+		return c.Send("You don't have a current session. Use /new to create a new session.")
 	}
 
 	// Get recent messages
 	messages, err := b.opencodeClient.GetMessages(b.ctx, sessionID)
 	if err != nil {
 		log.Errorf("Failed to get messages: %v", err)
-		return c.Send(fmt.Sprintf("获取消息失败: %v", err))
+		return c.Send(fmt.Sprintf("Failed to get messages: %v", err))
 	}
 
 	if len(messages) == 0 {
-		return c.Send("当前会话还没有消息。")
+		return c.Send("Current session has no messages yet.")
 	}
 
 	var sb strings.Builder
-	sb.WriteString("📊 会话状态\n\n")
+	sb.WriteString("📊 Session Status\n\n")
 
 	// Show session info
 	session, err := b.opencodeClient.GetSession(b.ctx, sessionID)
 	if err == nil && session != nil {
-		sb.WriteString(fmt.Sprintf("标题: %s\n", session.Title))
+		sb.WriteString(fmt.Sprintf("Title: %s\n", session.Title))
 		sb.WriteString(fmt.Sprintf("ID: `%s`\n", session.ID))
 		createdAt := time.UnixMilli(session.Time.Created)
-		sb.WriteString(fmt.Sprintf("创建: %s\n", createdAt.Format("2006-01-02 15:04")))
+		sb.WriteString(fmt.Sprintf("Created: %s\n", createdAt.Format("2006-01-02 15:04")))
 	}
 
-	sb.WriteString(fmt.Sprintf("消息数: %d\n\n", len(messages)))
+	sb.WriteString(fmt.Sprintf("Messages: %d\n\n", len(messages)))
 
 	// Show last 3 messages in a cleaner format
 	start := len(messages) - 3
@@ -544,16 +544,16 @@ func (b *Bot) handleStatus(c telebot.Context) error {
 		start = 0
 	}
 
-	sb.WriteString("最近消息:\n")
+	sb.WriteString("Recent messages:\n")
 	sb.WriteString("═══════════════════════════════\n")
 
 	for i := start; i < len(messages); i++ {
 		msg := messages[i]
-		role := "👤 你"
+		role := "👤 You"
 		if msg.Role == "assistant" {
-			role = "🤖 助手"
+			role = "🤖 Assistant"
 		} else if msg.Role == "system" {
-			role = "⚙️ 系统"
+			role = "⚙️ System"
 		}
 		timeStr := msg.CreatedAt.Format("15:04")
 
@@ -570,19 +570,19 @@ func (b *Bot) handleStatus(c telebot.Context) error {
 		} else if len(msg.Parts) > 0 {
 			// If no direct content, try to extract from parts
 			partsStr := formatMessageParts(msg.Parts)
-			if partsStr != "无详细内容" {
+			if partsStr != "No detailed content" {
 				sb.WriteString(fmt.Sprintf("%s\n", partsStr))
 			} else {
-				sb.WriteString("（无内容）\n")
+				sb.WriteString("(No content)\n")
 			}
 		} else {
-			sb.WriteString("（无内容）\n")
+			sb.WriteString("(No content)\n")
 		}
 
 		// Only show detailed process for assistant messages with multiple parts
 		if msg.Role == "assistant" && len(msg.Parts) > 1 {
 			partsStr := formatMessageParts(msg.Parts)
-			if partsStr != "无详细内容" && !strings.Contains(partsStr, "💬 回复内容:") {
+			if partsStr != "No detailed content" && !strings.Contains(partsStr, "💬 Reply content:") {
 				// Already included in formatMessageParts output
 			}
 		}
@@ -593,18 +593,18 @@ func (b *Bot) handleStatus(c telebot.Context) error {
 	if len(messages) > 0 {
 		lastMsg := messages[len(messages)-1]
 		if lastMsg.Role == "assistant" && lastMsg.Finish != "" {
-			sb.WriteString("📊 状态: 等待你的输入\n")
+			sb.WriteString("📊 Status: Waiting for your input\n")
 		} else {
-			sb.WriteString("📊 状态: 助手正在处理中...\n")
+			sb.WriteString("📊 Status: Assistant is processing...\n")
 		}
 	}
 
-	sb.WriteString(fmt.Sprintf("\n使用 /current 查看会话详情，/sessions 管理会话。"))
+	sb.WriteString(fmt.Sprintf("\nUse /current to see session details, /sessions to manage sessions."))
 
 	// Truncate if too long
 	result := sb.String()
 	if len(result) > 4000 {
-		result = result[:4000] + "\n...（内容过长，已截断）"
+		result = result[:4000] + "\n... (content too long, truncated)"
 	}
 
 	return c.Send(result)
@@ -615,11 +615,11 @@ func (b *Bot) handleModels(c telebot.Context) error {
 	providersResp, err := b.opencodeClient.GetProviders(b.ctx)
 	if err != nil {
 		log.Errorf("Failed to get providers: %v", err)
-		return c.Send(fmt.Sprintf("获取模型列表失败: %v", err))
+		return c.Send(fmt.Sprintf("Failed to get model list: %v", err))
 	}
 
 	var sb strings.Builder
-	sb.WriteString("🤖 可用 AI 模型\n\n")
+	sb.WriteString("🤖 Available AI Models\n\n")
 
 	// Create a set of connected provider IDs for faster lookup
 	connectedSet := make(map[string]bool)
@@ -663,15 +663,15 @@ func (b *Bot) handleModels(c telebot.Context) error {
 
 	// If no connected providers, show a message
 	if !foundAnyModels {
-		sb.WriteString("⚠️ 没有已连接的 AI 提供商。\n")
-		sb.WriteString("请先配置至少一个 AI 提供商的 API 密钥。\n\n")
+		sb.WriteString("⚠️ No connected AI providers.\n")
+		sb.WriteString("Please configure API keys for at least one AI provider first.\n\n")
 
 		// Show all available providers for reference
-		sb.WriteString("可配置的 AI 提供商:\n")
+		sb.WriteString("Configurable AI providers:\n")
 		for _, provider := range providersResp.All {
 			sb.WriteString(fmt.Sprintf("  • %s (%s)\n", provider.Name, provider.ID))
 			if len(provider.Env) > 0 {
-				sb.WriteString(fmt.Sprintf("    需要环境变量: %s\n", strings.Join(provider.Env, ", ")))
+				sb.WriteString(fmt.Sprintf("    Environment variables required: %s\n", strings.Join(provider.Env, ", ")))
 			}
 		}
 		sb.WriteString("\n")
@@ -685,9 +685,9 @@ func (b *Bot) handleModels(c telebot.Context) error {
 		}
 
 		// Add usage instructions
-		sb.WriteString("\n📝 使用说明:\n")
-		sb.WriteString("• 使用 /setmodel <编号> 设置当前会话模型\n")
-		sb.WriteString("• 使用 /newmodel <名称> <编号> 创建新会话并指定模型\n")
+		sb.WriteString("\n📝 Usage Instructions:\n")
+		sb.WriteString("• Use /setmodel <number> to set model for current session\n")
+		sb.WriteString("• Use /newmodel <name> <number> to create new session with specified model\n")
 	}
 
 	// Store the model mapping in the bot context (for this user)
@@ -696,7 +696,7 @@ func (b *Bot) handleModels(c telebot.Context) error {
 
 	result := sb.String()
 	if len(result) > 4000 {
-		result = result[:4000] + "\n...（内容过长，已截断）"
+		result = result[:4000] + "\n...(content too long, truncated)"
 	}
 	return c.Send(result)
 }
@@ -716,24 +716,24 @@ func (b *Bot) handleProviders(c telebot.Context) error {
 	}
 
 	var sb strings.Builder
-	sb.WriteString("🏢 AI 提供商\n\n")
+	sb.WriteString("🏢 AI Providers\n\n")
 
 	// Show connected providers first
 	hasConnected := false
 	for _, provider := range providersResp.All {
 		if connectedSet[provider.ID] {
 			if !hasConnected {
-				sb.WriteString("✅ 已连接提供商:\n\n")
+				sb.WriteString("✅ Connected Providers:\n\n")
 				hasConnected = true
 			}
 			sb.WriteString(fmt.Sprintf("✅ %s\n", provider.Name))
 			sb.WriteString(fmt.Sprintf("  ID: %s\n", provider.ID))
-			sb.WriteString(fmt.Sprintf("  来源: %s\n", provider.Source))
+			sb.WriteString(fmt.Sprintf("  Source: %s\n", provider.Source))
 			if len(provider.Env) > 0 {
-				sb.WriteString(fmt.Sprintf("  环境变量: %s\n", strings.Join(provider.Env, ", ")))
+				sb.WriteString(fmt.Sprintf("  Environment Variables: %s\n", strings.Join(provider.Env, ", ")))
 			}
 			if len(provider.Models) > 0 {
-				sb.WriteString(fmt.Sprintf("  模型数: %d\n", len(provider.Models)))
+				sb.WriteString(fmt.Sprintf("  Models: %d\n", len(provider.Models)))
 			}
 			sb.WriteString("\n")
 		}
@@ -744,33 +744,33 @@ func (b *Bot) handleProviders(c telebot.Context) error {
 	for _, provider := range providersResp.All {
 		if !connectedSet[provider.ID] {
 			if !hasUnconnected {
-				sb.WriteString("⚠️ 未连接提供商 (需要配置API密钥):\n\n")
+				sb.WriteString("⚠️ Unconnected Providers (API key required):\n\n")
 				hasUnconnected = true
 			}
 			sb.WriteString(fmt.Sprintf("⚪ %s\n", provider.Name))
 			sb.WriteString(fmt.Sprintf("  ID: %s\n", provider.ID))
-			sb.WriteString(fmt.Sprintf("  来源: %s\n", provider.Source))
+			sb.WriteString(fmt.Sprintf("  Source: %s\n", provider.Source))
 			if len(provider.Env) > 0 {
-				sb.WriteString(fmt.Sprintf("  需要环境变量: %s\n", strings.Join(provider.Env, ", ")))
+				sb.WriteString(fmt.Sprintf("  Required Environment Variables: %s\n", strings.Join(provider.Env, ", ")))
 			}
 			if len(provider.Models) > 0 {
-				sb.WriteString(fmt.Sprintf("  可用模型数: %d\n", len(provider.Models)))
+				sb.WriteString(fmt.Sprintf("  Available Models: %d\n", len(provider.Models)))
 			}
 			sb.WriteString("\n")
 		}
 	}
 
 	// Summary
-	sb.WriteString("📊 摘要:\n")
-	sb.WriteString(fmt.Sprintf("  • 已连接: %d 个提供商\n", len(providersResp.Connected)))
-	sb.WriteString(fmt.Sprintf("  • 总共: %d 个提供商\n", len(providersResp.All)))
+	sb.WriteString("📊 Summary:\n")
+	sb.WriteString(fmt.Sprintf("  • Connected: %d providers\n", len(providersResp.Connected)))
+	sb.WriteString(fmt.Sprintf("  • Total: %d providers\n", len(providersResp.All)))
 	sb.WriteString("\n")
 
-	sb.WriteString("使用 /models 查看已连接提供商的可用模型。")
+	sb.WriteString("Use /models to view available models from connected providers.")
 
 	result := sb.String()
 	if len(result) > 4000 {
-		result = result[:4000] + "\n...（内容过长，已截断）"
+		result = result[:4000] + "\n...(content too long, truncated)"
 	}
 	return c.Send(result)
 }
@@ -783,20 +783,20 @@ func (b *Bot) handleSetModel(c telebot.Context) error {
 
 	if len(args) != 1 {
 		log.Warnf("Invalid arguments count: %d", len(args))
-		return c.Send("请指定模型编号。\n用法: /setmodel <编号>\n使用 /models 查看可用模型和编号。")
+		return c.Send("Please specify the model number.\nUsage: /setmodel <number>\nUse /models to view available models and their numbers.")
 	}
 
 	sessionID, exists := b.sessionManager.GetUserSession(userID)
 	if !exists {
 		log.Warnf("User %d has no current session", userID)
-		return c.Send("你还没有当前会话。使用 /new 创建一个新会话。")
+		return c.Send("You don't have a current session. Use /new to create a new session.")
 	}
 	log.Debugf("User %d current session: %s", userID, sessionID)
 
 	modelNum, err := strconv.Atoi(args[0])
 	if err != nil {
 		log.Warnf("Invalid model number: %s", args[0])
-		return c.Send(fmt.Sprintf("无效的模型编号: %s。编号必须是整数。\n使用 /models 查看可用模型和编号。", args[0]))
+		return c.Send(fmt.Sprintf("Invalid model number: %s. Number must be an integer.\nUse /models to view available models and their numbers.", args[0]))
 	}
 	log.Debugf("Model number: %d", modelNum)
 
@@ -804,7 +804,7 @@ func (b *Bot) handleSetModel(c telebot.Context) error {
 	selection, exists := b.getModelSelection(userID, modelNum)
 	if !exists {
 		log.Warnf("Model mapping not found for user %d, model %d", userID, modelNum)
-		return c.Send(fmt.Sprintf("未找到编号为 %d 的模型。请先使用 /models 查看最新模型列表。", modelNum))
+		return c.Send(fmt.Sprintf("Model with number %d not found. Please use /models to view the latest model list first.", modelNum))
 	}
 	log.Debugf("Model selection found: %s/%s (%s)", selection.ProviderID, selection.ModelID, selection.ModelName)
 
@@ -817,13 +817,13 @@ func (b *Bot) handleSetModel(c telebot.Context) error {
 		log.Errorf("Failed to set session model: %v", err)
 		// Check if it's a timeout error
 		if strings.Contains(err.Error(), "context deadline exceeded") || strings.Contains(err.Error(), "timeout") {
-			return c.Send(fmt.Sprintf("设置模型超时: 模型初始化可能需要更长时间。请稍后重试或使用默认模型。"))
+			return c.Send(fmt.Sprintf("Model setting timeout: Model initialization may take longer. Please try again later or use the default model."))
 		}
-		return c.Send(fmt.Sprintf("设置模型失败: %v", err))
+		return c.Send(fmt.Sprintf("Failed to set model: %v", err))
 	}
 
 	log.Infof("Successfully set model for user %d session %s to %s/%s", userID, sessionID, selection.ProviderID, selection.ModelID)
-	return c.Send(fmt.Sprintf("✅ 已设置当前会话模型为 %s (%s/%s)", selection.ModelName, selection.ProviderID, selection.ModelID))
+	return c.Send(fmt.Sprintf("✅ Current session model set to %s (%s/%s)", selection.ModelName, selection.ProviderID, selection.ModelID))
 }
 
 // handleNewModel creates a new session with a specific model
@@ -832,19 +832,19 @@ func (b *Bot) handleNewModel(c telebot.Context) error {
 	args := c.Args()
 
 	if len(args) != 2 {
-		return c.Send("请指定会话名称和模型编号。\n用法: /newmodel <名称> <编号>\n使用 /models 查看可用模型和编号。")
+		return c.Send("Please specify session name and model number.\nUsage: /newmodel <name> <number>\nUse /models to view available models and their numbers.")
 	}
 
 	name := args[0]
 	modelNum, err := strconv.Atoi(args[1])
 	if err != nil {
-		return c.Send(fmt.Sprintf("无效的模型编号: %s。编号必须是整数。\n使用 /models 查看可用模型和编号。", args[1]))
+		return c.Send(fmt.Sprintf("Invalid model number: %s. Number must be an integer.\nUse /models to view available models and their numbers.", args[1]))
 	}
 
 	// Get model selection from mapping
 	selection, exists := b.getModelSelection(userID, modelNum)
 	if !exists {
-		return c.Send(fmt.Sprintf("未找到编号为 %d 的模型。请先使用 /models 查看最新模型列表。", modelNum))
+		return c.Send(fmt.Sprintf("Model with number %d not found. Please use /models to view the latest model list first.", modelNum))
 	}
 
 	// Create session with timeout
@@ -854,13 +854,13 @@ func (b *Bot) handleNewModel(c telebot.Context) error {
 	sessionID, err := b.sessionManager.CreateNewSessionWithModel(ctx, userID, name, selection.ProviderID, selection.ModelID)
 	if err != nil {
 		log.Errorf("Failed to create session with model: %v", err)
-		return c.Send(fmt.Sprintf("创建会话失败: %v", err))
+		return c.Send(fmt.Sprintf("Failed to create session: %v", err))
 	}
 
 	// Set as current session
 	b.sessionManager.SetUserSession(userID, sessionID)
 
-	return c.Send(fmt.Sprintf("✅ 已创建新会话 '%s' 并使用模型 %s (%s/%s)\n会话ID: `%s`", name, selection.ModelName, selection.ProviderID, selection.ModelID, sessionID))
+	return c.Send(fmt.Sprintf("✅ Created new session '%s' with model %s (%s/%s)\nSession ID: `%s`", name, selection.ModelName, selection.ProviderID, selection.ModelID, sessionID))
 }
 
 // handleText handles plain text messages (non-commands) with periodic updates
@@ -881,7 +881,7 @@ func (b *Bot) handleText(c telebot.Context) error {
 	}
 
 	// Send initial "processing" message
-	processingMsg, err := c.Bot().Send(c.Chat(), "🤖 处理中...")
+	processingMsg, err := c.Bot().Send(c.Chat(), "🤖 Processing...")
 	if err != nil {
 		return err
 	}
@@ -937,15 +937,15 @@ func (b *Bot) handleFiles(c telebot.Context) error {
 	files, err := b.opencodeClient.ListFiles(b.ctx, path)
 	if err != nil {
 		log.Errorf("Failed to list files: %v", err)
-		return c.Send(fmt.Sprintf("列出文件失败: %v", err))
+		return c.Send(fmt.Sprintf("Failed to list files: %v", err))
 	}
 
 	if len(files) == 0 {
-		return c.Send(fmt.Sprintf("目录 '%s' 为空或不存在。", path))
+		return c.Send(fmt.Sprintf("Directory '%s' is empty or does not exist.", path))
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("📁 文件列表: %s\n\n", path))
+	sb.WriteString(fmt.Sprintf("📁 File List: %s\n\n", path))
 
 	// Separate directories and files
 	var dirs []opencode.FileInfo
@@ -961,11 +961,11 @@ func (b *Bot) handleFiles(c telebot.Context) error {
 
 	// Show directories first
 	if len(dirs) > 0 {
-		sb.WriteString("📂 目录:\n")
+		sb.WriteString("📂 Directories:\n")
 		for _, dir := range dirs {
 			ignored := ""
 			if dir.Ignored {
-				ignored = " [已忽略]"
+				ignored = " [Ignored]"
 			}
 			sb.WriteString(fmt.Sprintf("  • %s%s\n", dir.Name, ignored))
 		}
@@ -974,7 +974,7 @@ func (b *Bot) handleFiles(c telebot.Context) error {
 
 	// Then files
 	if len(fileList) > 0 {
-		sb.WriteString("📄 文件:\n")
+		sb.WriteString("📄 Files:\n")
 		for _, file := range fileList {
 			ignored := ""
 			if file.Ignored {
@@ -985,11 +985,11 @@ func (b *Bot) handleFiles(c telebot.Context) error {
 		sb.WriteString("\n")
 	}
 
-	sb.WriteString(fmt.Sprintf("总计: %d 个项目 (%d 目录, %d 文件)", len(files), len(dirs), len(fileList)))
+	sb.WriteString(fmt.Sprintf("Total: %d items (%d directories, %d files)", len(files), len(dirs), len(fileList)))
 
 	result := sb.String()
 	if len(result) > 4000 {
-		result = result[:4000] + "\n...（内容过长，已截断）"
+		result = result[:4000] + "\n...(content too long, truncated)"
 	}
 
 	return c.Send(result)
@@ -998,7 +998,7 @@ func (b *Bot) handleFiles(c telebot.Context) error {
 func (b *Bot) handleSearch(c telebot.Context) error {
 	args := c.Args()
 	if len(args) == 0 {
-		return c.Send("请指定搜索内容。\n用法: /search <搜索模式>")
+		return c.Send("Please specify search content.\nUsage: /search <search pattern>")
 	}
 
 	query := strings.Join(args, " ")
@@ -1008,15 +1008,15 @@ func (b *Bot) handleSearch(c telebot.Context) error {
 	if err != nil {
 		// API not available, provide helpful message
 		log.Debugf("Search API not available: %v", err)
-		return c.Send(fmt.Sprintf("🔍 搜索功能当前不可用。\n\n原因: %v\n\n您可以直接向助手发送消息请求搜索，例如:\n\"搜索包含 '%s' 的代码\"", err, query))
+		return c.Send(fmt.Sprintf("🔍 Search functionality is currently unavailable.\n\nReason: %v\n\nYou can directly send a message to the assistant to request a search, for example:\n\"Search for code containing '%s'\"", err, query))
 	}
 
 	if len(results) == 0 {
-		return c.Send(fmt.Sprintf("未找到包含 '%s' 的代码。", query))
+		return c.Send(fmt.Sprintf("No code containing '%s' was found.", query))
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("🔍 搜索结果: '%s'\n\n", query))
+	sb.WriteString(fmt.Sprintf("🔍 Search Results: '%s'\n\n", query))
 
 	// Limit results to prevent message overflow
 	maxResults := 10
@@ -1032,7 +1032,7 @@ func (b *Bot) handleSearch(c telebot.Context) error {
 
 	resultStr := sb.String()
 	if len(resultStr) > 4000 {
-		resultStr = resultStr[:4000] + "\n...（内容过长，已截断）"
+		resultStr = resultStr[:4000] + "\n...(content too long, truncated)"
 	}
 
 	return c.Send(resultStr)
@@ -1041,7 +1041,7 @@ func (b *Bot) handleSearch(c telebot.Context) error {
 func (b *Bot) handleFindFile(c telebot.Context) error {
 	args := c.Args()
 	if len(args) == 0 {
-		return c.Send("请指定文件模式。\n用法: /findfile <文件模式>")
+		return c.Send("Please specify file pattern.\nUsage: /findfile <file pattern>")
 	}
 
 	pattern := strings.Join(args, " ")
@@ -1051,15 +1051,15 @@ func (b *Bot) handleFindFile(c telebot.Context) error {
 	if err != nil {
 		// API not available, provide helpful message
 		log.Debugf("Find file API not available: %v", err)
-		return c.Send(fmt.Sprintf("🔍 文件搜索功能当前不可用。\n\n原因: %v\n\n您可以使用 /files 命令浏览目录，或直接向助手发送消息请求查找文件。", err))
+		return c.Send(fmt.Sprintf("🔍 File search functionality is currently unavailable.\n\nReason: %v\n\nYou can use the /files command to browse directories, or directly send a message to the assistant to request file search.", err))
 	}
 
 	if len(files) == 0 {
-		return c.Send(fmt.Sprintf("未找到匹配 '%s' 的文件。", pattern))
+		return c.Send(fmt.Sprintf("No files matching '%s' were found.", pattern))
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("🔍 文件搜索结果: '%s'\n\n", pattern))
+	sb.WriteString(fmt.Sprintf("🔍 File Search Results: '%s'\n\n", pattern))
 
 	// Separate directories and files
 	var dirs []opencode.FileInfo
@@ -1077,7 +1077,7 @@ func (b *Bot) handleFindFile(c telebot.Context) error {
 	maxResults := 15
 	totalResults := len(files)
 	if totalResults > maxResults {
-		sb.WriteString(fmt.Sprintf("找到 %d 个结果，显示前 %d 个:\n\n", totalResults, maxResults))
+		sb.WriteString(fmt.Sprintf("Found %d results, showing first %d:\n\n", totalResults, maxResults))
 		if len(dirs) > maxResults/2 {
 			dirs = dirs[:maxResults/2]
 		}
@@ -1087,11 +1087,11 @@ func (b *Bot) handleFindFile(c telebot.Context) error {
 	}
 
 	if len(dirs) > 0 {
-		sb.WriteString("📂 目录:\n")
+		sb.WriteString("📂 Directories:\n")
 		for _, dir := range dirs {
 			ignored := ""
 			if dir.Ignored {
-				ignored = " [已忽略]"
+				ignored = " [Ignored]"
 			}
 			sb.WriteString(fmt.Sprintf("  • %s%s\n", dir.Path, ignored))
 		}
@@ -1099,22 +1099,22 @@ func (b *Bot) handleFindFile(c telebot.Context) error {
 	}
 
 	if len(fileList) > 0 {
-		sb.WriteString("📄 文件:\n")
+		sb.WriteString("📄 Files:\n")
 		for _, file := range fileList {
 			ignored := ""
 			if file.Ignored {
-				ignored = " [已忽略]"
+				ignored = " [Ignored]"
 			}
 			sb.WriteString(fmt.Sprintf("  • %s%s\n", file.Path, ignored))
 		}
 		sb.WriteString("\n")
 	}
 
-	sb.WriteString(fmt.Sprintf("总计: %d 个项目", totalResults))
+	sb.WriteString(fmt.Sprintf("Total: %d items", totalResults))
 
 	resultStr := sb.String()
 	if len(resultStr) > 4000 {
-		resultStr = resultStr[:4000] + "\n...（内容过长，已截断）"
+		resultStr = resultStr[:4000] + "\n...(content too long, truncated)"
 	}
 
 	return c.Send(resultStr)
@@ -1123,7 +1123,7 @@ func (b *Bot) handleFindFile(c telebot.Context) error {
 func (b *Bot) handleSymbol(c telebot.Context) error {
 	args := c.Args()
 	if len(args) == 0 {
-		return c.Send("请指定符号名称。\n用法: /symbol <符号名称>")
+		return c.Send("Please specify symbol name.\nUsage: /symbol <symbol name>")
 	}
 
 	symbol := strings.Join(args, " ")
@@ -1133,35 +1133,35 @@ func (b *Bot) handleSymbol(c telebot.Context) error {
 	if err != nil {
 		// API not available, provide helpful message
 		log.Debugf("Symbol search API not available: %v", err)
-		return c.Send(fmt.Sprintf("🔍 符号搜索功能当前不可用。\n\n原因: %v\n\n您可以直接向助手发送消息请求查找符号，例如:\n\"查找函数 %s\"", err, symbol))
+		return c.Send(fmt.Sprintf("🔍 Symbol search functionality is currently unavailable.\n\nReason: %v\n\nYou can directly send a message to the assistant to request symbol search, for example:\n\"Find function %s\"", err, symbol))
 	}
 
 	if len(results) == 0 {
-		return c.Send(fmt.Sprintf("未找到符号 '%s'。", symbol))
+		return c.Send(fmt.Sprintf("Symbol '%s' not found.", symbol))
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("🔍 符号搜索结果: '%s'\n\n", symbol))
+	sb.WriteString(fmt.Sprintf("🔍 Symbol Search Results: '%s'\n\n", symbol))
 
 	// Limit results
 	maxResults := 10
 	if len(results) > maxResults {
-		sb.WriteString(fmt.Sprintf("找到 %d 个结果，显示前 %d 个:\n\n", len(results), maxResults))
+		sb.WriteString(fmt.Sprintf("Found %d results, showing first %d:\n\n", len(results), maxResults))
 		results = results[:maxResults]
 	}
 
 	for i, result := range results {
 		sb.WriteString(fmt.Sprintf("%d. %s (%s)\n", i+1, result.Name, result.Kind))
-		sb.WriteString(fmt.Sprintf("   位置: %s:%d\n", result.Path, result.Line))
+		sb.WriteString(fmt.Sprintf("   Location: %s:%d\n", result.Path, result.Line))
 		if result.Signature != "" {
-			sb.WriteString(fmt.Sprintf("   签名: %s\n", result.Signature))
+			sb.WriteString(fmt.Sprintf("   Signature: %s\n", result.Signature))
 		}
 		sb.WriteString("\n")
 	}
 
 	resultStr := sb.String()
 	if len(resultStr) > 4000 {
-		resultStr = resultStr[:4000] + "\n...（内容过长，已截断）"
+		resultStr = resultStr[:4000] + "\n...(content too long, truncated)"
 	}
 
 	return c.Send(resultStr)
@@ -1173,36 +1173,36 @@ func (b *Bot) handleAgent(c telebot.Context) error {
 	if err != nil {
 		// API not available, provide helpful message
 		log.Debugf("Agents API not available: %v", err)
-		return c.Send(fmt.Sprintf("🤖 代理列表功能当前不可用。\n\n原因: %v\n\n您可以使用 /models 和 /providers 命令查看可用的 AI 模型和提供商。", err))
+		return c.Send(fmt.Sprintf("🤖 Agent list functionality is currently unavailable.\n\nReason: %v\n\nYou can use /models and /providers commands to view available AI models and providers.", err))
 	}
 
 	if len(agents) == 0 {
-		return c.Send("当前没有可用的 AI 代理。")
+		return c.Send("No AI agents are currently available.")
 	}
 
 	var sb strings.Builder
-	sb.WriteString("🤖 可用 AI 代理:\n\n")
+	sb.WriteString("🤖 Available AI Agents:\n\n")
 
 	for i, agent := range agents {
 		sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, agent.Name))
 		if agent.Description != "" {
-			sb.WriteString(fmt.Sprintf("   描述: %s\n", agent.Description))
+			sb.WriteString(fmt.Sprintf("   Description: %s\n", agent.Description))
 		}
 		sb.WriteString(fmt.Sprintf("   ID: %s\n\n", agent.ID))
 	}
 
-	sb.WriteString(fmt.Sprintf("总计: %d 个代理", len(agents)))
+	sb.WriteString(fmt.Sprintf("Total: %d agents", len(agents)))
 
 	resultStr := sb.String()
 	if len(resultStr) > 4000 {
-		resultStr = resultStr[:4000] + "\n...（内容过长，已截断）"
+		resultStr = resultStr[:4000] + "\n...(content too long, truncated)"
 	}
 
 	return c.Send(resultStr)
 }
 
 func (b *Bot) handleCommand(c telebot.Context) error {
-	return c.Send("命令列表功能暂未实现。")
+	return c.Send("Command list functionality is not yet implemented.")
 }
 
 // storeModelMapping stores the model mapping for a user
@@ -1285,7 +1285,7 @@ func (b *Bot) periodicMessageUpdates(ctx context.Context, c telebot.Context, msg
 			if !foundAssistantMsg {
 				log.Debugf("No assistant message found yet for session %s, showing processing", sessionID)
 				// No assistant message yet, just show processing
-				b.updateTelegramMessage(c, msg, "🤖 处理中...\n\n模型正在思考中，请稍候...")
+				b.updateTelegramMessage(c, msg, "🤖 Processing...\n\nModel is thinking, please wait...")
 				continue
 			}
 
@@ -1335,14 +1335,14 @@ func (b *Bot) formatMessageForDisplay(msg opencode.Message, isCompleted bool) st
 
 	// Add header only for completed tasks
 	if isCompleted {
-		sb.WriteString("✅ 任务完成\n\n")
+		sb.WriteString("✅ Task completed\n\n")
 	}
 
 	// Add message content if available
 	if msg.Content != "" {
 		content := msg.Content
 		if len(content) > 3000 {
-			content = content[:3000] + "...\n\n(内容过长，已截断)"
+			content = content[:3000] + "...\n\n(content too long, truncated)"
 		}
 		sb.WriteString(content)
 		sb.WriteString("\n\n")
@@ -1351,8 +1351,8 @@ func (b *Bot) formatMessageForDisplay(msg opencode.Message, isCompleted bool) st
 	// Add detailed parts information
 	if len(msg.Parts) > 0 {
 		partsStr := formatMessageParts(msg.Parts)
-		if partsStr != "无详细内容" {
-			sb.WriteString("📋 处理过程:\n")
+		if partsStr != "No detailed content" {
+			sb.WriteString("📋 Processing Details:\n")
 			sb.WriteString(partsStr)
 			sb.WriteString("\n\n")
 		}
@@ -1360,21 +1360,21 @@ func (b *Bot) formatMessageForDisplay(msg opencode.Message, isCompleted bool) st
 
 	// Add status
 	if isCompleted {
-		sb.WriteString("📊 状态: 任务已完成")
+		sb.WriteString("📊 Status: Task completed")
 		if msg.Finish != "" {
-			sb.WriteString(fmt.Sprintf(" (原因: %s)", msg.Finish))
+			sb.WriteString(fmt.Sprintf(" (Reason: %s)", msg.Finish))
 		}
 		if msg.ModelID != "" {
-			sb.WriteString(fmt.Sprintf("\n🤖 模型: %s", msg.ModelID))
+			sb.WriteString(fmt.Sprintf("\n🤖 Model: %s", msg.ModelID))
 		}
 	} else {
 		// For ongoing tasks, only show the auto-update indicator at the end
 		// Don't show redundant status lines
 		if msg.Content == "" && len(msg.Parts) == 0 {
 			// If no content yet, show minimal status
-			sb.WriteString("🤖 处理中...")
+			sb.WriteString("🤖 Processing...")
 		}
-		sb.WriteString("\n\n⏳ 自动更新中...")
+		sb.WriteString("\n\n⏳ Auto-updating...")
 	}
 
 	return sb.String()
@@ -1390,7 +1390,7 @@ func (b *Bot) updateTelegramMessage(c telebot.Context, msg *telebot.Message, con
 	// Ensure content is not too long for Telegram
 	if len(content) > 4000 {
 		log.Debugf("Message content too long (%d chars), truncating to 4000", len(content))
-		content = content[:4000] + "\n...（内容过长，已截断）"
+		content = content[:4000] + "\n...(content too long, truncated)"
 	}
 
 	// Try to update the message
