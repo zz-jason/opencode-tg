@@ -17,9 +17,28 @@ A Telegram bot for interacting with OpenCode AI programming assistant deployed i
 
 ## System Architecture
 
+```mermaid
+flowchart TD
+    User[Telegram User] -->|Sends messages| TelegramAPI[Telegram API]
+    TelegramAPI -->|Via HTTP Proxy| TelegramBot[Telegram Bot Go Application]
+    
+    TelegramBot -->|Internal HTTP API| OpenCode[OpenCode Server]
+    OpenCode -->|AI Processing| AIProviders[AI Providers: OpenAI, Anthropic, etc.]
+    
+    subgraph "Internal Network"
+        TelegramBot
+        OpenCode
+    end
+    
+    subgraph "External Services"
+        TelegramAPI
+        AIProviders
+    end
+    
+    Proxy[HTTP Proxy] -.->|Optional| TelegramAPI
 ```
-Telegram API <--[HTTP Proxy]--> Telegram Bot (Golang) <--[Internal HTTP]--> OpenCode Server
-```
+
+**Simplified View:** `Telegram API <--[HTTP Proxy]--> Telegram Bot (Golang) <--[Internal HTTP]--> OpenCode Server`
 
 ## Quick Start
 
