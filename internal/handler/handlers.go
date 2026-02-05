@@ -14,6 +14,7 @@ import (
 	"tg-bot/internal/config"
 	"tg-bot/internal/opencode"
 	"tg-bot/internal/session"
+	"tg-bot/internal/storage"
 )
 
 // Bot represents the Telegram bot with all dependencies
@@ -45,6 +46,14 @@ type modelSelection struct {
 func NewBot(cfg *config.Config) (*Bot, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// Ensure cancel is called if we return with an error
+	var returnErr error
+	defer func() {
+		if returnErr != nil {
+			cancel()
+		}
+	}()
+
 	// Create OpenCode client
 	client := opencode.NewClient(cfg.OpenCode.URL, cfg.OpenCode.Timeout)
 
@@ -52,15 +61,25 @@ func NewBot(cfg *config.Config) (*Bot, error) {
 	healthCtx, healthCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer healthCancel()
 
-	if err := client.HealthCheck(healthCtx); err != nil {
-		log.Warnf("OpenCode health check failed: %v", err)
+	if healthErr := client.HealthCheck(healthCtx); healthErr != nil {
+		log.Warnf("OpenCode health check failed: %v", healthErr)
 		// Continue anyway, as the server might become available later
 	} else {
 		log.Info("OpenCode connection successful")
 	}
 
-	// Create session manager
-	sessionManager := session.NewManager(client)
+	// Create storage
+	store, err := storage.NewStore(storage.Options{
+		Type:     cfg.Storage.Type,
+		FilePath: cfg.Storage.FilePath,
+	})
+	if err != nil {
+		returnErr = fmt.Errorf("failed to create storage: %w", err)
+		return nil, returnErr
+	}
+
+	// Create session manager with storage
+	sessionManager := session.NewManagerWithStore(client, store)
 
 	bot := &Bot{
 		config:         cfg,
@@ -1768,4 +1787,12 @@ func (b *Bot) handleDelete(c telebot.Context) error {
 	b.sessionMappingMu.Unlock()
 
 	return c.Send("🗑️ Session deleted successfully.")
+}
+
+// Close closes the bot and releases resources
+func (b *Bot) Close() error {
+	if b.sessionManager != nil {
+		return b.sessionManager.Close()
+	}
+	return nil
 }

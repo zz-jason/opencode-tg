@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"tg-bot/internal/opencode"
+	"tg-bot/internal/storage"
 )
 
 // mockOpenCodeServer creates a test HTTP server that simulates OpenCode API
@@ -96,24 +98,26 @@ func mockOpenCodeServer(t *testing.T) *httptest.Server {
 	}))
 }
 
+// createTestManager creates a manager with file storage in a temporary directory
+func createTestManager(t *testing.T, client *opencode.Client) *Manager {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "sessions.json")
+	store, err := storage.NewStore(storage.Options{
+		Type:     "file",
+		FilePath: path,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create test store: %v", err)
+	}
+	return NewManagerWithStore(client, store)
+}
+
 func TestNewManager(t *testing.T) {
 	server := mockOpenCodeServer(t)
 	defer server.Close()
 
 	client := opencode.NewClient(server.URL, 5)
-	manager := NewManager(client)
-
-	if manager == nil {
-		t.Fatal("NewManager should return a non-nil manager")
-	}
-}
-
-func TestGetOrCreateSession(t *testing.T) {
-	server := mockOpenCodeServer(t)
-	defer server.Close()
-
-	client := opencode.NewClient(server.URL, 5)
-	manager := NewManager(client)
+	manager := createTestManager(t, client)
 
 	// First call should create a new session
 	sessionID1, err := manager.GetOrCreateSession(context.Background(), 12345)
@@ -151,7 +155,7 @@ func TestGetUserSession(t *testing.T) {
 	defer server.Close()
 
 	client := opencode.NewClient(server.URL, 5)
-	manager := NewManager(client)
+	manager := createTestManager(t, client)
 
 	// Initially no session
 	sessionID, exists := manager.GetUserSession(12345)
@@ -180,7 +184,7 @@ func TestSetUserSession(t *testing.T) {
 	defer server.Close()
 
 	client := opencode.NewClient(server.URL, 5)
-	manager := NewManager(client)
+	manager := createTestManager(t, client)
 
 	// Set a session for user
 	err := manager.SetUserSession(12345, "custom-session-123")
@@ -203,7 +207,7 @@ func TestListUserSessions(t *testing.T) {
 	defer server.Close()
 
 	client := opencode.NewClient(server.URL, 5)
-	manager := NewManager(client)
+	manager := createTestManager(t, client)
 
 	// Create multiple sessions for same user
 	_, err := manager.CreateNewSession(context.Background(), 12345, "Session 1")
@@ -301,7 +305,7 @@ func TestCreateNewSession(t *testing.T) {
 	defer server.Close()
 
 	client := opencode.NewClient(server.URL, 5)
-	manager := NewManager(client)
+	manager := createTestManager(t, client)
 
 	sessionID, err := manager.CreateNewSession(context.Background(), 12345, "Test Session Name")
 	if err != nil {
@@ -330,7 +334,7 @@ func TestGetSessionMeta(t *testing.T) {
 	defer server.Close()
 
 	client := opencode.NewClient(server.URL, 5)
-	manager := NewManager(client)
+	manager := createTestManager(t, client)
 
 	// Create a session
 	sessionID, err := manager.GetOrCreateSession(context.Background(), 12345)
@@ -365,7 +369,7 @@ func TestGetSessionCount(t *testing.T) {
 	defer server.Close()
 
 	client := opencode.NewClient(server.URL, 5)
-	manager := NewManager(client)
+	manager := createTestManager(t, client)
 
 	// Initially zero
 	count := manager.GetSessionCount()
@@ -401,7 +405,7 @@ func TestCleanupInactiveSessions(t *testing.T) {
 	defer server.Close()
 
 	client := opencode.NewClient(server.URL, 5)
-	manager := NewManager(client)
+	manager := createTestManager(t, client)
 
 	// Create a session
 	_, err := manager.GetOrCreateSession(context.Background(), 12345)
