@@ -17,18 +17,18 @@ tags = ["telegram", "token", "api-key"]
 [allowlist]
 description = "Exclude example configs, docs, and logs"
 paths = [
-  "config.example.toml",
-  "docs/**",
-  "*.log",
-  "*.log.old",
-  "bot.log",
-  "bot.log.old",
-  "*_test.go",
-  "vendor/**",
-  ".vscode/**",
-  ".idea/**",
-  ".gitignore",
-  ".git/**",
+  "config\\.example\\.toml",
+  "docs/.*",
+  ".*\\.log",
+  ".*\\.log\\.old",
+  "bot\\.log",
+  "bot\\.log\\.old",
+  ".*_test\\.go",
+  "vendor/.*",
+  "\\.vscode/.*",
+  "\\.idea/.*",
+  "\\.gitignore",
+  "\\.git/.*",
 ]
 
 # Exclude commits
