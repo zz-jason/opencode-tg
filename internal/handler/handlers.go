@@ -524,19 +524,93 @@ func (b *Bot) handleStatus(c telebot.Context) error {
 		return c.Send("Current session has no messages yet.")
 	}
 
+	// Helper function to format duration
+	formatDuration := func(d time.Duration) string {
+		if d < time.Minute {
+			return fmt.Sprintf("%.0fs", d.Seconds())
+		} else if d < time.Hour {
+			minutes := int(d.Minutes())
+			seconds := int(d.Seconds()) % 60
+			return fmt.Sprintf("%dm %ds", minutes, seconds)
+		} else {
+			hours := int(d.Hours())
+			minutes := int(d.Minutes()) % 60
+			return fmt.Sprintf("%dh %dm", hours, minutes)
+		}
+	}
+
 	var sb strings.Builder
 	sb.WriteString("📊 Session Status\n\n")
 
 	// Show session info
+	now := time.Now()
 	session, err := b.opencodeClient.GetSession(b.ctx, sessionID)
 	if err == nil && session != nil {
 		sb.WriteString(fmt.Sprintf("Title: %s\n", session.Title))
 		sb.WriteString(fmt.Sprintf("ID: `%s`\n", session.ID))
 		createdAt := time.UnixMilli(session.Time.Created)
 		sb.WriteString(fmt.Sprintf("Created: %s\n", createdAt.Format("2006-01-02 15:04")))
+
+		// Show session age
+		sessionAge := now.Sub(createdAt)
+		if sessionAge > time.Hour {
+			sb.WriteString(fmt.Sprintf("Age: %s\n", formatDuration(sessionAge)))
+		}
+
+		// Show metadata if available
+		if len(session.Metadata) > 0 {
+			if agent, ok := session.Metadata["agent"].(string); ok && agent != "" {
+				sb.WriteString(fmt.Sprintf("Agent: %s\n", agent))
+			}
+			if mode, ok := session.Metadata["mode"].(string); ok && mode != "" {
+				sb.WriteString(fmt.Sprintf("Mode: %s\n", mode))
+			}
+		}
 	}
 
-	sb.WriteString(fmt.Sprintf("Messages: %d\n\n", len(messages)))
+	// Show last activity time
+	if len(messages) > 0 {
+		lastMsgTime := messages[len(messages)-1].CreatedAt
+		sb.WriteString(fmt.Sprintf("Last activity: %s (%s ago)\n",
+			lastMsgTime.Format("15:04"),
+			formatDuration(now.Sub(lastMsgTime))))
+	}
+
+	sb.WriteString(fmt.Sprintf("Messages: %d\n", len(messages)))
+
+	// Calculate message statistics
+	var userCount, assistantCount, systemCount int
+	for _, msg := range messages {
+		switch msg.Role {
+		case "user":
+			userCount++
+		case "assistant":
+			assistantCount++
+		case "system":
+			systemCount++
+		}
+	}
+	sb.WriteString(fmt.Sprintf("• User: %d, Assistant: %d, System: %d\n\n", userCount, assistantCount, systemCount))
+
+	// Show current model information
+	currentModel := "Default"
+	currentProvider := ""
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg := messages[i]
+		if msg.Role == "assistant" && msg.ModelID != "" {
+			currentModel = msg.ModelID
+			if msg.ProviderID != "" {
+				currentProvider = msg.ProviderID
+			}
+			break
+		}
+	}
+	if currentProvider != "" {
+		sb.WriteString(fmt.Sprintf("Current model: %s (%s)\n", currentModel, currentProvider))
+	} else {
+		sb.WriteString(fmt.Sprintf("Current model: %s\n", currentModel))
+	}
+	sb.WriteString("\n")
 
 	// Show last 3 messages in a cleaner format
 	start := len(messages) - 3
@@ -591,11 +665,53 @@ func (b *Bot) handleStatus(c telebot.Context) error {
 	// Show current status
 	sb.WriteString("\n═══════════════════════════════\n")
 	if len(messages) > 0 {
-		lastMsg := messages[len(messages)-1]
-		if lastMsg.Role == "assistant" && lastMsg.Finish != "" {
-			sb.WriteString("📊 Status: Waiting for your input\n")
-		} else {
+		// Find the last assistant message
+		var lastAssistant *opencode.Message
+		for i := len(messages) - 1; i >= 0; i-- {
+			if messages[i].Role == "assistant" {
+				lastAssistant = &messages[i]
+				break
+			}
+		}
+
+		if lastAssistant == nil {
+			// No assistant messages yet
+			sb.WriteString("📊 Status: Ready for your input\n")
+		} else if lastAssistant.Finish == "" {
+			// Assistant message is not finished (still processing)
 			sb.WriteString("📊 Status: Assistant is processing...\n")
+			// Show how long it's been processing
+			elapsed := time.Since(lastAssistant.CreatedAt)
+			if elapsed > time.Minute {
+				sb.WriteString(fmt.Sprintf("⏱️ Processing for: %s\n", formatDuration(elapsed)))
+			}
+		} else {
+			// Assistant message is finished
+			status := "📊 Status: Waiting for your input"
+			if lastAssistant.Finish != "" && lastAssistant.Finish != "stop" {
+				// Map finish reason to friendly description
+				finishReason := lastAssistant.Finish
+				switch finishReason {
+				case "length":
+					finishReason = "max tokens reached"
+				case "tool_calls":
+					finishReason = "tool calls completed"
+				case "content_filter":
+					finishReason = "content filtered"
+				case "function_call":
+					finishReason = "function call"
+				}
+				status += fmt.Sprintf(" (Finished: %s)", finishReason)
+			}
+			sb.WriteString(status + "\n")
+
+			// Show completion time if available
+			if !lastAssistant.CreatedAt.IsZero() {
+				elapsed := time.Since(lastAssistant.CreatedAt)
+				if elapsed < time.Hour {
+					sb.WriteString(fmt.Sprintf("⏱️ Last response time: %s\n", formatDuration(elapsed)))
+				}
+			}
 		}
 	}
 
