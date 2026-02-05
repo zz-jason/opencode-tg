@@ -35,9 +35,9 @@ deps:
 	go mod download
 	go mod tidy
 
-# Run with specific config
+# Run with specific config file
 run-with-config:
-	CONFIG_PATH=$(config) ./tg-bot
+	./tg-bot --config $(config)
 
 # Build for production
 release: test

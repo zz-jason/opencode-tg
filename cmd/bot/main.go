@@ -2,6 +2,8 @@ package main
 
 import (
 	"crypto/tls"
+	"flag"
+	"fmt"
 	"net/http"
 	"net/url"
 	"os"
@@ -16,9 +18,37 @@ import (
 	"tg-bot/internal/logging"
 )
 
+const (
+	// Version is the current version of the bot
+	Version = "1.0.0"
+	// BuildDate is the date when the binary was built (set during build)
+	BuildDate = "unknown"
+)
+
 func main() {
-	// Load configuration
-	configPath := os.Getenv("CONFIG_PATH")
+	// Parse command line arguments
+	var configPath string
+	var showHelp bool
+	var showVersion bool
+
+	flag.StringVar(&configPath, "config", "", "Path to configuration file (default: config.toml)")
+	flag.BoolVar(&showHelp, "help", false, "Show this help message")
+	flag.BoolVar(&showHelp, "h", false, "Show this help message (shorthand)")
+	flag.BoolVar(&showVersion, "version", false, "Show version information")
+	flag.BoolVar(&showVersion, "v", false, "Show version information (shorthand)")
+	flag.Parse()
+
+	if showHelp {
+		printUsage()
+		return
+	}
+
+	if showVersion {
+		fmt.Printf("OpenCode Telegram Bot v%s (Built: %s)\n", Version, BuildDate)
+		return
+	}
+
+	// Load configuration: command line argument or default
 	if configPath == "" {
 		configPath = "config.toml"
 	}
@@ -102,4 +132,22 @@ func main() {
 	tgBot.Stop()
 
 	logger.Info("Bot shutdown complete")
+}
+
+// printUsage displays command line usage information
+func printUsage() {
+	fmt.Println("OpenCode Telegram Bot")
+	fmt.Println()
+	fmt.Println("Usage:")
+	fmt.Println("  tg-bot [options]")
+	fmt.Println()
+	fmt.Println("Options:")
+	fmt.Println("  --config <path>    Path to configuration file")
+	fmt.Println("                     (default: config.toml)")
+	fmt.Println("  --help, -h         Show this help message")
+	fmt.Println("  --version, -v      Show version information")
+	fmt.Println()
+	fmt.Println("Examples:")
+	fmt.Println("  tg-bot --config /path/to/config.toml")
+	fmt.Println("  tg-bot                         # Uses config.toml in current directory")
 }
