@@ -6,56 +6,39 @@ title = "OpenCode Telegram Bot Secrets Detection"
 [extend]
 useDefault = true
 
-# Custom rules
+# Custom rule for Telegram bot tokens
 [[rules]]
 id = "telegram-bot-token"
 description = "Telegram Bot API Token"
 regex = '''[0-9]{8,10}:[A-Za-z0-9_-]{35}'''
 tags = ["telegram", "token", "api-key"]
-entropy = 3.5
-path = '''(?i).*\.(toml|env|yml|yaml|json|txt|log)$'''
 
-# Exclude files and paths
-[[exclude]]
+# Exclude specific files and paths
+[allowlist]
+description = "Exclude example configs, docs, and logs"
 paths = [
-  # Example configuration files
   "config.example.toml",
-  # Documentation files
   "docs/**",
-  # Log files (should not be in repo anyway)
   "*.log",
   "*.log.old",
   "bot.log",
   "bot.log.old",
-  # Test files
   "*_test.go",
-  # Vendor directory
   "vendor/**",
-  # IDE files
   ".vscode/**",
   ".idea/**",
-  # Git files
   ".gitignore",
   ".git/**",
 ]
 
-# Exclude commits (by hash)
-[[exclude]]
+# Exclude commits
 commits = [
-  # Initial commit contains example tokens
   "508008eba0514b2565aa01044908526b2e2130aa",
 ]
 
-# Allowlist specific strings (false positives)
-[[allowlist]]
-description = "Example token placeholder"
+# Allowlist specific patterns (false positives)
 regexes = [
   '''YOUR_BOT_TOKEN_HERE''',
-]
-
-[[allowlist]]
-description = "Configuration variable references"
-regexes = [
   '''cfg\.Telegram\.Token''',
   '''cfg\.Telegram\.token''',
 ]
@@ -63,5 +46,3 @@ regexes = [
 # Global settings
 [settings]
 exitCode = 1
-verbose = false
-redact = true
