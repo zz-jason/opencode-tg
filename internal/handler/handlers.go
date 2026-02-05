@@ -191,16 +191,33 @@ func (b *Bot) handleSessions(c telebot.Context) error {
 	}
 
 	var sb strings.Builder
-	sb.WriteString("📋 Your sessions:\n\n")
+	sb.WriteString("📋 Available sessions:\n\n")
 
 	currentSessionID, hasCurrent := b.sessionManager.GetUserSession(userID)
 
 	for i, sess := range sessions {
-		prefix := "  "
+		// Determine icon based on status and current session
+		icon := "  "
+		statusNote := ""
+
 		if hasCurrent && sess.SessionID == currentSessionID {
-			prefix = "✅ "
+			icon = "✅ "
+		} else {
+			switch sess.Status {
+			case "owned":
+				icon = "✅ "
+			case "orphaned":
+				icon = "🆓 "
+				statusNote = " (Orphaned – use /switch to claim)"
+			case "other":
+				icon = "🔒 "
+				statusNote = " (Belongs to another user)"
+			default:
+				icon = "  "
+			}
 		}
-		sb.WriteString(fmt.Sprintf("%s%d. `%s`\n", prefix, i+1, sess.SessionID))
+
+		sb.WriteString(fmt.Sprintf("%s%d. `%s`%s\n", icon, i+1, sess.SessionID, statusNote))
 		sb.WriteString(fmt.Sprintf("   Name: %s\n", sess.Name))
 		sb.WriteString(fmt.Sprintf("   Created: %s\n", sess.CreatedAt.Format("2006-01-02 15:04")))
 		sb.WriteString(fmt.Sprintf("   Last used: %s\n", sess.LastUsedAt.Format("2006-01-02 15:04")))
@@ -264,7 +281,7 @@ func (b *Bot) handleSwitch(c telebot.Context) error {
 	}
 
 	if !found {
-		return c.Send("Session ID not found, or the session does not belong to you.\nUse /sessions to see your session list.")
+		return c.Send("Session ID not found.\nUse /sessions to see available sessions.")
 	}
 
 	if err := b.sessionManager.SetUserSession(userID, sessionID); err != nil {

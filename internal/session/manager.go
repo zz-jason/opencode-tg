@@ -31,6 +31,7 @@ type SessionMeta struct {
 	MessageCount int
 	ProviderID   string
 	ModelID      string
+	Status       string // "owned", "orphaned", "other"
 }
 
 // NewManager creates a new session manager
@@ -84,20 +85,20 @@ func (m *Manager) GetOrCreateSession(ctx context.Context, userID int64) (string,
 				meta = &SessionMeta{
 					SessionID:  ocSession.ID,
 					UserID:     userID,
+					Status:     "owned",
 					CreatedAt:  time.Now(),
 					LastUsedAt: time.Now(),
 				}
 
-				// Extract name from metadata or OpenCode session title
-				if ocSession.Metadata != nil {
+				// Extract name from OpenCode session title, metadata, or use default
+				if ocSession.Title != "" {
+					meta.Name = ocSession.Title
+				} else if ocSession.Metadata != nil {
 					if sessionName, ok := ocSession.Metadata["session_name"].(string); ok && sessionName != "" {
 						meta.Name = sessionName
-					} else if title, ok := ocSession.Metadata["title"].(string); ok && title != "" {
-						meta.Name = title
+					} else if metadataTitle, ok := ocSession.Metadata["title"].(string); ok && metadataTitle != "" {
+						meta.Name = metadataTitle
 					}
-				}
-				if meta.Name == "" && ocSession.Title != "" {
-					meta.Name = ocSession.Title
 				}
 				if meta.Name == "" {
 					meta.Name = "Telegram Session"
@@ -117,7 +118,8 @@ func (m *Manager) GetOrCreateSession(ctx context.Context, userID int64) (string,
 			} else {
 				// Update existing metadata
 				meta.LastUsedAt = time.Now()
-				meta.UserID = userID // Ensure user ID is correct
+				meta.UserID = userID  // Ensure user ID is correct
+				meta.Status = "owned" // Ensure status is correct
 			}
 
 			meta.MessageCount++
@@ -175,18 +177,19 @@ func (m *Manager) SetUserSession(userID int64, sessionID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Check if session exists in OpenCode (optional)
-	// For now, just update the mapping
+	// Update user session mapping
 	m.userSessions[userID] = sessionID
 
 	// Update or create metadata
 	if meta, exists := m.sessions[sessionID]; exists {
 		meta.LastUsedAt = time.Now()
 		meta.UserID = userID
+		meta.Status = "owned"
 	} else {
 		m.sessions[sessionID] = &SessionMeta{
 			SessionID:    sessionID,
 			UserID:       userID,
+			Status:       "owned",
 			CreatedAt:    time.Now(),
 			LastUsedAt:   time.Now(),
 			MessageCount: 0,
@@ -197,7 +200,7 @@ func (m *Manager) SetUserSession(userID int64, sessionID string) error {
 	return nil
 }
 
-// ListUserSessions lists all sessions for a user from OpenCode
+// ListUserSessions lists all sessions from OpenCode, categorized by ownership
 func (m *Manager) ListUserSessions(ctx context.Context, userID int64) ([]*SessionMeta, error) {
 	// Get all sessions from OpenCode
 	opencodeSessions, err := m.client.ListSessions(ctx)
@@ -207,18 +210,12 @@ func (m *Manager) ListUserSessions(ctx context.Context, userID int64) ([]*Sessio
 		return m.listLocalUserSessions(userID), nil
 	}
 
-	var userSessions []*SessionMeta
+	var allSessions []*SessionMeta
 
-	// Filter sessions that belong to this user
+	// Process all OpenCode sessions
 	for _, ocSession := range opencodeSessions {
-		// Check metadata for telegram_user_id
-		if ocSession.Metadata != nil {
-			if tgUserID, ok := ocSession.Metadata["telegram_user_id"].(float64); ok && int64(tgUserID) == userID {
-				// Found a session belonging to this user
-				meta := m.getOrCreateSessionMeta(ocSession.ID, userID, ocSession.Metadata)
-				userSessions = append(userSessions, meta)
-			}
-		}
+		meta := m.getOrCreateSessionMeta(ocSession.ID, userID, ocSession.Metadata, ocSession.Title)
+		allSessions = append(allSessions, meta)
 	}
 
 	// Also include any local sessions that might not be in OpenCode (for backward compatibility)
@@ -226,18 +223,26 @@ func (m *Manager) ListUserSessions(ctx context.Context, userID int64) ([]*Sessio
 	for _, local := range localSessions {
 		// Check if already included from OpenCode
 		found := false
-		for _, opencodeSession := range userSessions {
+		for _, opencodeSession := range allSessions {
 			if opencodeSession.SessionID == local.SessionID {
 				found = true
 				break
 			}
 		}
 		if !found {
-			userSessions = append(userSessions, local)
+			// Ensure local session has correct status
+			if local.UserID == userID {
+				local.Status = "owned"
+			} else if local.UserID == 0 {
+				local.Status = "orphaned"
+			} else {
+				local.Status = "other"
+			}
+			allSessions = append(allSessions, local)
 		}
 	}
 
-	return userSessions, nil
+	return allSessions, nil
 }
 
 // CreateNewSession creates a new session for a user
@@ -270,6 +275,7 @@ func (m *Manager) CreateNewSessionWithModel(ctx context.Context, userID int64, n
 		SessionID:    session.ID,
 		UserID:       userID,
 		Name:         name,
+		Status:       "owned",
 		CreatedAt:    time.Now(),
 		LastUsedAt:   time.Now(),
 		MessageCount: 0,
@@ -398,30 +404,48 @@ func (m *Manager) listLocalUserSessions(userID int64) []*SessionMeta {
 }
 
 // getOrCreateSessionMeta gets or creates session metadata for an OpenCode session
-func (m *Manager) getOrCreateSessionMeta(sessionID string, userID int64, metadata map[string]interface{}) *SessionMeta {
+func (m *Manager) getOrCreateSessionMeta(sessionID string, currentUserID int64, metadata map[string]interface{}, title string) *SessionMeta {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	// Check if we already have metadata for this session
 	if meta, exists := m.sessions[sessionID]; exists {
-		// Update last used time
+		// Update last used time and recalculate status based on current user
 		meta.LastUsedAt = time.Now()
+		// Recalculate status based on owner ID and current user
+		if meta.UserID == 0 {
+			meta.Status = "orphaned"
+		} else if meta.UserID == currentUserID {
+			meta.Status = "owned"
+		} else {
+			meta.Status = "other"
+		}
 		return meta
+	}
+
+	// Determine owner ID from metadata
+	ownerID := int64(0) // 0 means orphaned
+	if metadata != nil {
+		if tgUserID, ok := metadata["telegram_user_id"].(float64); ok {
+			ownerID = int64(tgUserID)
+		}
 	}
 
 	// Create new metadata
 	meta := &SessionMeta{
 		SessionID:  sessionID,
-		UserID:     userID,
+		UserID:     ownerID,
 		CreatedAt:  time.Now(),
 		LastUsedAt: time.Now(),
 	}
 
-	// Extract name from metadata or OpenCode session title
-	if sessionName, ok := metadata["session_name"].(string); ok && sessionName != "" {
-		meta.Name = sessionName
-	} else if title, ok := metadata["title"].(string); ok && title != "" {
+	// Extract name from provided title, metadata, or use default
+	if title != "" {
 		meta.Name = title
+	} else if sessionName, ok := metadata["session_name"].(string); ok && sessionName != "" {
+		meta.Name = sessionName
+	} else if metadataTitle, ok := metadata["title"].(string); ok && metadataTitle != "" {
+		meta.Name = metadataTitle
 	} else {
 		meta.Name = "Telegram Session"
 	}
@@ -434,13 +458,24 @@ func (m *Manager) getOrCreateSessionMeta(sessionID string, userID int64, metadat
 		meta.ModelID = modelID
 	}
 
+	// Determine session status
+	if ownerID == 0 {
+		meta.Status = "orphaned"
+	} else if ownerID == currentUserID {
+		meta.Status = "owned"
+	} else {
+		meta.Status = "other"
+	}
+
 	// Store in local cache
 	m.sessions[sessionID] = meta
 
-	// Also update user session mapping if not already set
-	currentSessionID, exists := m.userSessions[userID]
-	if !exists || currentSessionID != sessionID {
-		m.userSessions[userID] = sessionID
+	// Update user session mapping only if this session belongs to the current user
+	if meta.Status == "owned" {
+		currentSessionID, exists := m.userSessions[currentUserID]
+		if !exists || currentSessionID != sessionID {
+			m.userSessions[currentUserID] = sessionID
+		}
 	}
 
 	return meta

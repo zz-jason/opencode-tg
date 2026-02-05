@@ -13,7 +13,9 @@ bot.log.old
 
 # Design documents
 DESIGN.md
+AGENTS.md
 .AGENTS/templates/DESIGN.md
+.AGENTS/
 
 # IDE
 .vscode/
