@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.25'
+
+    - name: Install dependencies
+      run: go mod download
+
+    - name: Run tests
+      run: make test
+
+  commit-message-check:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Check commit messages
+      run: |
+        # Check commit messages for conventional format
+        # This checks the commits in the push or PR
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          # For PRs, check all commits in the PR
+          COMMITS=$(git log --oneline --no-merges origin/main..HEAD | wc -l)
+          if [ "$COMMITS" -eq 0 ]; then
+            echo "No new commits to check"
+            exit 0
+          fi
+          git log --format=%B --no-merges origin/main..HEAD | while read -r line; do
+            if echo "$line" | grep -qE '^(feat|fix|docs|style|refactor|test|chore|perf|build|ci|revert)(\([a-z0-9-]+\))?: .+'; then
+              echo "✅ Valid commit message: $line"
+            else
+              echo "❌ Invalid commit message: $line"
+              echo "Commit messages must follow Conventional Commits format: <type>(<scope>): <description>"
+              echo "Allowed types: feat, fix, docs, style, refactor, test, chore, perf, build, ci, revert"
+              exit 1
+            fi
+          done
+        else
+          # For direct pushes, check the latest commit
+          git log --format=%B -n 1 HEAD | while read -r line; do
+            if echo "$line" | grep -qE '^(feat|fix|docs|style|refactor|test|chore|perf|build|ci|revert)(\([a-z0-9-]+\))?: .+'; then
+              echo "✅ Valid commit message: $line"
+            else
+              echo "❌ Invalid commit message: $line"
+              echo "Commit messages must follow Conventional Commits format: <type>(<scope>): <description>"
+              echo "Allowed types: feat, fix, docs, style, refactor, test, chore, perf, build, ci, revert"
+              exit 1
+            fi
+          done
+        fi
