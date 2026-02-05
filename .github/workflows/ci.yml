@@ -49,9 +49,39 @@ jobs:
     
     - name: Scan for secrets in new commits
       run: |
-        echo "Scanning git repository for secrets..."
-        gitleaks git \
-          --log-level=info \
-          --exit-code=1 \
-          --redact \
-          --config=.gitleaks.toml
+        echo "GitHub event: ${{ github.event_name }}"
+        
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          echo "Scanning PR changes from ${{ github.event.pull_request.base.sha }} to ${{ github.event.pull_request.head.sha }}"
+          gitleaks git \
+            --log-level=info \
+            --exit-code=1 \
+            --redact \
+            --config=.gitleaks.toml \
+            --log-opts="--full-history ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+        elif [ "${{ github.event_name }}" = "push" ]; then
+          echo "Scanning push changes from ${{ github.event.before }} to ${{ github.sha }}"
+          if [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
+            echo "Initial push, scanning all commits"
+            gitleaks git \
+              --log-level=info \
+              --exit-code=1 \
+              --redact \
+              --config=.gitleaks.toml
+          else
+            gitleaks git \
+              --log-level=info \
+              --exit-code=1 \
+              --redact \
+              --config=.gitleaks.toml \
+              --log-opts="--full-history ${{ github.event.before }}..${{ github.sha }}"
+          fi
+        else
+          # workflow_dispatch or other events - scan entire repository
+          echo "Scanning entire git repository..."
+          gitleaks git \
+            --log-level=info \
+            --exit-code=1 \
+            --redact \
+            --config=.gitleaks.toml
+        fi
