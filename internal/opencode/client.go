@@ -138,6 +138,9 @@ type MessagePartResponse struct {
 	Reason    string      `json:"reason,omitempty"`
 	Cost      float64     `json:"cost,omitempty"`
 	Tokens    interface{} `json:"tokens,omitempty"`
+	CallID    string      `json:"callID,omitempty"`
+	Tool      string      `json:"tool,omitempty"`
+	State     interface{} `json:"state,omitempty"`
 }
 
 // CreateSessionRequest represents a request to create a session
@@ -719,4 +722,46 @@ func (c *Client) ListFiles(ctx context.Context, path string) ([]FileInfo, error)
 		return nil, err
 	}
 	return files, nil
+}
+
+// RenameSession renames a session by updating its title and metadata
+func (c *Client) RenameSession(ctx context.Context, sessionID string, newName string) error {
+	// Prepare update request
+	reqBody := map[string]interface{}{
+		"title": newName,
+		"metadata": map[string]interface{}{
+			"session_name": newName,
+		},
+	}
+
+	resp, err := c.request(ctx, "PUT", fmt.Sprintf("/session/%s", sessionID), reqBody)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("failed to rename session: status %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+// DeleteSession deletes a session
+func (c *Client) DeleteSession(ctx context.Context, sessionID string) error {
+	resp, err := c.request(ctx, "DELETE", fmt.Sprintf("/session/%s", sessionID), nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 404 {
+		// 404 means session not found, which is acceptable for delete operation
+		return nil
+	}
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("failed to delete session: status %d", resp.StatusCode)
+	}
+
+	return nil
 }

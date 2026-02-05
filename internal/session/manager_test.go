@@ -222,13 +222,29 @@ func TestListUserSessions(t *testing.T) {
 		t.Fatalf("Failed to create session for other user: %v", err)
 	}
 
-	// List sessions for user 12345
+	// List sessions for user 12345 (should get all 3 sessions with appropriate status)
 	sessions, err := manager.ListUserSessions(context.Background(), 12345)
 	if err != nil {
 		t.Fatalf("Failed to list sessions: %v", err)
 	}
-	if len(sessions) != 2 {
-		t.Errorf("Expected 2 sessions for user 12345, got %d", len(sessions))
+	if len(sessions) != 3 {
+		t.Errorf("Expected 3 sessions for user 12345, got %d", len(sessions))
+	}
+	// Check status distribution
+	ownedCount := 0
+	otherCount := 0
+	for _, sess := range sessions {
+		if sess.Status == "owned" {
+			ownedCount++
+		} else if sess.Status == "other" {
+			otherCount++
+		}
+	}
+	if ownedCount != 2 {
+		t.Errorf("Expected 2 owned sessions for user 12345, got %d", ownedCount)
+	}
+	if otherCount != 1 {
+		t.Errorf("Expected 1 other session for user 12345, got %d", otherCount)
 	}
 
 	// List sessions for user 67890
@@ -236,17 +252,47 @@ func TestListUserSessions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to list sessions: %v", err)
 	}
-	if len(sessions) != 1 {
-		t.Errorf("Expected 1 session for user 67890, got %d", len(sessions))
+	if len(sessions) != 3 {
+		t.Errorf("Expected 3 sessions for user 67890, got %d", len(sessions))
+	}
+	ownedCount = 0
+	otherCount = 0
+	for _, sess := range sessions {
+		if sess.Status == "owned" {
+			ownedCount++
+		} else if sess.Status == "other" {
+			otherCount++
+		}
+	}
+	if ownedCount != 1 {
+		t.Errorf("Expected 1 owned session for user 67890, got %d", ownedCount)
+	}
+	if otherCount != 2 {
+		t.Errorf("Expected 2 other sessions for user 67890, got %d", otherCount)
 	}
 
-	// List sessions for non-existent user
+	// List sessions for non-existent user 99999
 	sessions, err = manager.ListUserSessions(context.Background(), 99999)
 	if err != nil {
 		t.Fatalf("Failed to list sessions: %v", err)
 	}
-	if len(sessions) != 0 {
-		t.Errorf("Expected 0 sessions for non-existent user, got %d", len(sessions))
+	if len(sessions) != 3 {
+		t.Errorf("Expected 3 sessions for non-existent user, got %d", len(sessions))
+	}
+	ownedCount = 0
+	otherCount = 0
+	for _, sess := range sessions {
+		if sess.Status == "owned" {
+			ownedCount++
+		} else if sess.Status == "other" {
+			otherCount++
+		}
+	}
+	if ownedCount != 0 {
+		t.Errorf("Expected 0 owned sessions for non-existent user, got %d", ownedCount)
+	}
+	if otherCount != 3 {
+		t.Errorf("Expected 3 other sessions for non-existent user, got %d", otherCount)
 	}
 }
 
