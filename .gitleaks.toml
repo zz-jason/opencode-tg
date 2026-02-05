@@ -1,0 +1,48 @@
+# Gitleaks configuration for OpenCode Telegram Bot
+
+title = "OpenCode Telegram Bot Secrets Detection"
+
+# Enable default rules
+[extend]
+useDefault = true
+
+# Custom rule for Telegram bot tokens
+[[rules]]
+id = "telegram-bot-token"
+description = "Telegram Bot API Token"
+regex = '''[0-9]{8,10}:[A-Za-z0-9_-]{35}'''
+tags = ["telegram", "token", "api-key"]
+
+# Exclude specific files and paths
+[allowlist]
+description = "Exclude example configs, docs, and logs"
+paths = [
+  "config.example.toml",
+  "docs/**",
+  "*.log",
+  "*.log.old",
+  "bot.log",
+  "bot.log.old",
+  "*_test.go",
+  "vendor/**",
+  ".vscode/**",
+  ".idea/**",
+  ".gitignore",
+  ".git/**",
+]
+
+# Exclude commits
+commits = [
+  "508008eba0514b2565aa01044908526b2e2130aa",
+]
+
+# Allowlist specific patterns (false positives)
+regexes = [
+  '''YOUR_BOT_TOKEN_HERE''',
+  '''cfg\.Telegram\.Token''',
+  '''cfg\.Telegram\.token''',
+]
+
+# Global settings
+[settings]
+exitCode = 1

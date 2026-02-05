@@ -5,6 +5,7 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   test:
@@ -32,3 +33,52 @@ jobs:
       with:
         task_types: '["feat","fix","perf","chore","revert","test","docs","style","refactor","build","ci"]'
         add_label: 'false'
+
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Install gitleaks
+      run: |
+        curl -sSL https://github.com/zricethezav/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz | tar xz
+        sudo mv gitleaks /usr/local/bin/
+        gitleaks version
+    
+    - name: Scan for secrets in new commits
+      run: |
+        # For PRs, scan commits between origin/main and HEAD
+        # For pushes to main, scan the latest commit
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          echo "Scanning commits in PR..."
+          gitleaks detect \
+            --source=. \
+            --log-level=info \
+            --exit-code=1 \
+            --redact \
+            --exclude-path="config.example.toml" \
+            --exclude-path="docs/" \
+            --exclude-path="*.log" \
+            --exclude-path="*.log.old" \
+            --exclude-path="vendor/" \
+            --exclude-path=".git/" \
+            --exclude-path=".vscode/" \
+            --exclude-path=".idea/"
+        else
+          echo "Scanning latest commit..."
+          gitleaks detect \
+            --source=. \
+            --log-level=info \
+            --exit-code=1 \
+            --redact \
+            --exclude-path="config.example.toml" \
+            --exclude-path="docs/" \
+            --exclude-path="*.log" \
+            --exclude-path="*.log.old" \
+            --exclude-path="vendor/" \
+            --exclude-path=".git/" \
+            --exclude-path=".vscode/" \
+            --exclude-path=".idea/"
+        fi
