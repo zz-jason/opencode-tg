@@ -32,3 +32,17 @@ jobs:
       with:
         task_types: '["feat","fix","perf","chore","revert","test","docs","style","refactor","build","ci"]'
         add_label: 'false'
+
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Detect secrets in codebase
+      uses: gitleaks/gitleaks-action@v2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        config-path: .gitleaks.toml

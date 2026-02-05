@@ -1,0 +1,43 @@
+# Gitleaks configuration for OpenCode Telegram Bot
+
+# Title for the configuration file
+title = "OpenCode Telegram Bot Secrets Detection"
+
+# Extend the default configuration
+[[rules]]
+id = "telegram-bot-token"
+description = "Telegram Bot API Token"
+regex = '''[0-9]{8,10}:[A-Za-z0-9_-]{35}'''
+tags = ["telegram", "token", "api-key"]
+
+[[rules]]
+id = "generic-api-key"
+description = "Generic API Key"
+regex = '''(?i)(api[_-]?key|secret|token)[\s]*[=:][\s]*["']?[A-Za-z0-9_\-\.]{16,}["']?'''
+tags = ["api-key", "secret"]
+
+# Exclude example configuration files
+[[rules.excludedPaths]]
+path = '''config\.example\.toml'''
+
+[[rules.excludedPaths]]
+path = '''\.gitignore'''
+
+# Global exclusions for test files and dependencies
+excludePaths = [
+  # Go vendor directory
+  "**/vendor/**",
+  # Test files
+  "**_test.go",
+  # Go module files
+  "**/go.mod",
+  "**/go.sum",
+  # Log files
+  "**/*.log",
+  # IDE files
+  "**/.vscode/**",
+  "**/.idea/**",
+]
+
+# Exit code behavior
+exitCode = 1
