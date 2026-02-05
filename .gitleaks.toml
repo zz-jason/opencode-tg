@@ -1,43 +1,67 @@
 # Gitleaks configuration for OpenCode Telegram Bot
 
-# Title for the configuration file
 title = "OpenCode Telegram Bot Secrets Detection"
 
-# Extend the default configuration
+# Enable default rules
+[extend]
+useDefault = true
+
+# Custom rules
 [[rules]]
 id = "telegram-bot-token"
 description = "Telegram Bot API Token"
 regex = '''[0-9]{8,10}:[A-Za-z0-9_-]{35}'''
 tags = ["telegram", "token", "api-key"]
+entropy = 3.5
+path = '''(?i).*\.(toml|env|yml|yaml|json|txt|log)$'''
 
-[[rules]]
-id = "generic-api-key"
-description = "Generic API Key"
-regex = '''(?i)(api[_-]?key|secret|token)[\s]*[=:][\s]*["']?[A-Za-z0-9_\-\.]{16,}["']?'''
-tags = ["api-key", "secret"]
-
-# Exclude example configuration files
-[[rules.excludedPaths]]
-path = '''config\.example\.toml'''
-
-[[rules.excludedPaths]]
-path = '''\.gitignore'''
-
-# Global exclusions for test files and dependencies
-excludePaths = [
-  # Go vendor directory
-  "**/vendor/**",
+# Exclude files and paths
+[[exclude]]
+paths = [
+  # Example configuration files
+  "config.example.toml",
+  # Documentation files
+  "docs/**",
+  # Log files (should not be in repo anyway)
+  "*.log",
+  "*.log.old",
+  "bot.log",
+  "bot.log.old",
   # Test files
-  "**_test.go",
-  # Go module files
-  "**/go.mod",
-  "**/go.sum",
-  # Log files
-  "**/*.log",
+  "*_test.go",
+  # Vendor directory
+  "vendor/**",
   # IDE files
-  "**/.vscode/**",
-  "**/.idea/**",
+  ".vscode/**",
+  ".idea/**",
+  # Git files
+  ".gitignore",
+  ".git/**",
 ]
 
-# Exit code behavior
+# Exclude commits (by hash)
+[[exclude]]
+commits = [
+  # Initial commit contains example tokens
+  "508008eba0514b2565aa01044908526b2e2130aa",
+]
+
+# Allowlist specific strings (false positives)
+[[allowlist]]
+description = "Example token placeholder"
+regexes = [
+  '''YOUR_BOT_TOKEN_HERE''',
+]
+
+[[allowlist]]
+description = "Configuration variable references"
+regexes = [
+  '''cfg\.Telegram\.Token''',
+  '''cfg\.Telegram\.token''',
+]
+
+# Global settings
+[settings]
 exitCode = 1
+verbose = false
+redact = true
