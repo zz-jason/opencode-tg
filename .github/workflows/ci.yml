@@ -24,6 +24,7 @@ jobs:
       run: make test
 
   commit-message-check:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
     - name: Conventional Commits Validation
