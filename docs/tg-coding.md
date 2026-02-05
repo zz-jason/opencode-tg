@@ -195,11 +195,21 @@ The bot uses TOML format configuration file, mainly including the following sect
 - `storage`: Session storage configuration (memory or SQLite)
 - `logging`: Logging configuration
 
-The default configuration file path is `config.toml`, can also be specified via environment variable `CONFIG_PATH`.
+The default configuration file path is `config.toml`. A custom configuration file can be specified using the `--config` command line argument.
 
-#### Environment Variables (Optional)
+#### Command Line Usage
 ```bash
-CONFIG_PATH=/path/to/config.toml  # Specify configuration file path
+# Run with default configuration file
+./tg-bot
+
+# Run with custom configuration file
+./tg-bot --config /path/to/config.toml
+
+# Show version information
+./tg-bot --version
+
+# Show help message
+./tg-bot --help
 ```
 
 #### Dependencies
@@ -225,7 +235,7 @@ go build -o tg-bot cmd/bot/main.go
 ./tg-bot
 
 # Run (specify configuration file)
-CONFIG_PATH=/path/to/config.toml ./tg-bot
+./tg-bot --config /path/to/config.toml
 ```
 
 ### Security Considerations

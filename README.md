@@ -76,6 +76,24 @@ level = "info"
 output = "bot.log"
 ```
 
+**Configuration Loading:**
+- Command line: `--config <path>` (specify custom configuration file)
+- Default: `config.toml` (in current directory)
+
+The configuration file path must be specified either via the `--config` argument or by using the default `config.toml` file.
+
+**Command Line Options:**
+```bash
+# Run with custom configuration file
+./tg-bot --config /path/to/config.toml
+
+# Show version information
+./tg-bot --version
+
+# Show help message
+./tg-bot --help
+```
+
 ### Build and Run
 
 ```bash
