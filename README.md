@@ -78,8 +78,9 @@ output = "bot.log"
 
 **Configuration Loading Priority:**
 1. Command line argument: `--config <path>`
-2. Environment variable: `CONFIG_PATH`
-3. Default: `config.toml` in current directory
+2. Default: `config.toml` in current directory
+
+*Note: Environment variable `CONFIG_PATH` is no longer supported.*
 
 **Command Line Options:**
 ```bash

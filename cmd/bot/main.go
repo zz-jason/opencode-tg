@@ -48,10 +48,7 @@ func main() {
 		return
 	}
 
-	// Load configuration with priority: command line > environment variable > default
-	if configPath == "" {
-		configPath = os.Getenv("CONFIG_PATH")
-	}
+	// Load configuration: command line argument or default
 	if configPath == "" {
 		configPath = "config.toml"
 	}
@@ -146,15 +143,11 @@ func printUsage() {
 	fmt.Println()
 	fmt.Println("Options:")
 	fmt.Println("  --config <path>    Path to configuration file")
-	fmt.Println("                     (default: CONFIG_PATH env var or config.toml)")
+	fmt.Println("                     (default: config.toml)")
 	fmt.Println("  --help, -h         Show this help message")
 	fmt.Println("  --version, -v      Show version information")
 	fmt.Println()
-	fmt.Println("Environment Variables:")
-	fmt.Println("  CONFIG_PATH        Path to configuration file")
-	fmt.Println()
 	fmt.Println("Examples:")
 	fmt.Println("  tg-bot --config /path/to/config.toml")
-	fmt.Println("  CONFIG_PATH=/path/to/config.toml tg-bot")
 	fmt.Println("  tg-bot                         # Uses config.toml in current directory")
 }
