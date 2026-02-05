@@ -344,6 +344,74 @@ func (m *Manager) SetSessionModel(ctx context.Context, sessionID, providerID, mo
 	return nil
 }
 
+// RenameSession renames a session (only allowed for owned sessions)
+func (m *Manager) RenameSession(ctx context.Context, sessionID string, newName string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	meta, exists := m.sessions[sessionID]
+	if !exists {
+		return fmt.Errorf("session not found: %s", sessionID)
+	}
+
+	// Check if session belongs to current user (owned)
+	if meta.Status != "owned" {
+		return fmt.Errorf("cannot rename session: session status is %s (must be owned)", meta.Status)
+	}
+
+	// Rename in OpenCode
+	if err := m.client.RenameSession(ctx, sessionID, newName); err != nil {
+		return fmt.Errorf("failed to rename session in OpenCode: %w", err)
+	}
+
+	// Update local metadata
+	meta.Name = newName
+	meta.LastUsedAt = time.Now()
+
+	log.Infof("Renamed session %s to '%s'", sessionID, newName)
+	return nil
+}
+
+// DeleteSession deletes a session (allowed for owned or orphaned sessions)
+func (m *Manager) DeleteSession(ctx context.Context, sessionID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	meta, exists := m.sessions[sessionID]
+	if !exists {
+		// Session not in local cache, still try to delete from OpenCode
+		if err := m.client.DeleteSession(ctx, sessionID); err != nil {
+			return fmt.Errorf("failed to delete session from OpenCode: %w", err)
+		}
+		log.Infof("Deleted session %s (not in local cache)", sessionID)
+		return nil
+	}
+
+	// Check if session can be deleted (owned or orphaned, not other)
+	if meta.Status == "other" {
+		return fmt.Errorf("cannot delete session: session belongs to another user")
+	}
+
+	// Delete from OpenCode
+	if err := m.client.DeleteSession(ctx, sessionID); err != nil {
+		return fmt.Errorf("failed to delete session from OpenCode: %w", err)
+	}
+
+	// Remove from user mapping if this is their current session
+	for userID, userSessionID := range m.userSessions {
+		if userSessionID == sessionID {
+			delete(m.userSessions, userID)
+			break
+		}
+	}
+
+	// Remove from local cache
+	delete(m.sessions, sessionID)
+
+	log.Infof("Deleted session %s ('%s')", sessionID, meta.Name)
+	return nil
+}
+
 // GetSessionMeta gets metadata for a session
 func (m *Manager) GetSessionMeta(sessionID string) (*SessionMeta, bool) {
 	m.mu.RLock()

@@ -28,6 +28,10 @@ type Bot struct {
 	// Model mapping for each user (userID -> map[int]modelSelection)
 	modelMappingMu sync.RWMutex
 	modelMapping   map[int64]map[int]modelSelection
+
+	// Session mapping for each user (userID -> map[int]sessionID)
+	sessionMappingMu sync.RWMutex
+	sessionMapping   map[int64]map[int]string
 }
 
 // modelSelection represents a model selection with provider and model IDs
@@ -65,6 +69,7 @@ func NewBot(cfg *config.Config) (*Bot, error) {
 		ctx:            ctx,
 		cancel:         cancel,
 		modelMapping:   make(map[int64]map[int]modelSelection),
+		sessionMapping: make(map[int64]map[int]string),
 	}
 
 	return bot, nil
@@ -101,6 +106,8 @@ func (b *Bot) Start() {
 	b.tgBot.Handle("/providers", b.handleProviders)
 	b.tgBot.Handle("/setmodel", b.handleSetModel)
 	b.tgBot.Handle("/newmodel", b.handleNewModel)
+	b.tgBot.Handle("/rename", b.handleRename)
+	b.tgBot.Handle("/delete", b.handleDelete)
 
 	// Handle plain text messages (non-commands)
 	b.tgBot.Handle(telebot.OnText, b.handleText)
@@ -144,7 +151,9 @@ Core Commands:
 • /help - Show this help
 • /sessions - List all sessions
 • /new [name] - Create new session
-• /switch <sessionID> - Switch current session
+• /switch <number> - Switch current session
+• /rename <number> <name> - Rename a session
+• /delete <number> - Delete a session
 • /current - Show current session information
 • /abort - Abort current task
 • /status - Check current task status
@@ -190,45 +199,48 @@ func (b *Bot) handleSessions(c telebot.Context) error {
 		return c.Send("You don't have any sessions yet. Use /new to create a new session.")
 	}
 
+	// Update session mapping for this user
+	b.sessionMappingMu.Lock()
+	b.sessionMapping[userID] = make(map[int]string)
+	for i, sess := range sessions {
+		b.sessionMapping[userID][i+1] = sess.SessionID
+	}
+	b.sessionMappingMu.Unlock()
+
 	var sb strings.Builder
-	sb.WriteString("📋 Available sessions:\n\n")
+	sb.WriteString("📋 Available Sessions\n\n")
 
 	currentSessionID, hasCurrent := b.sessionManager.GetUserSession(userID)
 
 	for i, sess := range sessions {
-		// Determine icon based on status and current session
-		icon := "  "
-		statusNote := ""
+		// Determine if this is the current session
+		isCurrent := hasCurrent && sess.SessionID == currentSessionID
 
-		if hasCurrent && sess.SessionID == currentSessionID {
-			icon = "✅ "
+		// Format the header line
+		if isCurrent {
+			sb.WriteString(fmt.Sprintf("[✅ CURRENT] %d. %s\n", i+1, sess.Name))
 		} else {
-			switch sess.Status {
-			case "owned":
-				icon = "✅ "
-			case "orphaned":
-				icon = "🆓 "
-				statusNote = " (Orphaned – use /switch to claim)"
-			case "other":
-				icon = "🔒 "
-				statusNote = " (Belongs to another user)"
-			default:
-				icon = "  "
-			}
+			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, sess.Name))
 		}
 
-		sb.WriteString(fmt.Sprintf("%s%d. `%s`%s\n", icon, i+1, sess.SessionID, statusNote))
-		sb.WriteString(fmt.Sprintf("   Name: %s\n", sess.Name))
-		sb.WriteString(fmt.Sprintf("   Created: %s\n", sess.CreatedAt.Format("2006-01-02 15:04")))
-		sb.WriteString(fmt.Sprintf("   Last used: %s\n", sess.LastUsedAt.Format("2006-01-02 15:04")))
-		sb.WriteString(fmt.Sprintf("   Messages: %d\n", sess.MessageCount))
+		// Add separator line (fixed length)
+		sb.WriteString("════════════════\n")
+
+		// Add session details with bullet points
+		sb.WriteString(fmt.Sprintf("• Created: %s\n", sess.CreatedAt.Format("2006-01-02 15:04")))
+		sb.WriteString(fmt.Sprintf("• Last used: %s\n", sess.LastUsedAt.Format("2006-01-02 15:04")))
+		sb.WriteString(fmt.Sprintf("• Messages: %d\n", sess.MessageCount))
+
+		// Add model information if available
 		if sess.ProviderID != "" && sess.ModelID != "" {
-			sb.WriteString(fmt.Sprintf("   Model: %s/%s\n", sess.ProviderID, sess.ModelID))
+			sb.WriteString(fmt.Sprintf("• Model: %s/%s\n", sess.ProviderID, sess.ModelID))
 		}
+
+		// Add empty line between sessions
 		sb.WriteString("\n")
 	}
 
-	sb.WriteString("Use /switch <sessionID> to switch sessions, or /new to create a new session.")
+	sb.WriteString("Use /switch <number> to switch sessions, /rename <number> <name> to rename, or /delete <number> to delete.")
 
 	return c.Send(sb.String())
 }
@@ -252,7 +264,7 @@ func (b *Bot) handleNew(c telebot.Context) error {
 	// Set as current session
 	b.sessionManager.SetUserSession(userID, sessionID)
 
-	return c.Send(fmt.Sprintf("✅ Created new session: %s\nSession ID: `%s`\n\nThis session has been set as your current session.", name, sessionID))
+	return c.Send(fmt.Sprintf("✅ Created new session: %s\n\nThis session has been set as your current session.", name))
 }
 
 // handleSwitch handles the /switch command
@@ -261,27 +273,51 @@ func (b *Bot) handleSwitch(c telebot.Context) error {
 	args := c.Args()
 
 	if len(args) == 0 {
-		return c.Send("Please specify the session ID to switch to.\nUsage: /switch <sessionID>\nUse /sessions to see your session list.")
+		return c.Send("Please specify the session number to switch to.\nUsage: /switch <number>\nUse /sessions to see available sessions.")
 	}
 
-	sessionID := args[0]
+	input := args[0]
+	var sessionID string
 
-	// Check if session exists for this user
+	// Check if input is a number
+	if num, err := strconv.Atoi(input); err == nil {
+		// Input is a number, get session ID from mapping
+		b.sessionMappingMu.RLock()
+		userMapping, exists := b.sessionMapping[userID]
+		b.sessionMappingMu.RUnlock()
+
+		if !exists {
+			return c.Send("Session mapping not found. Please use /sessions first to see available sessions.")
+		}
+
+		mappedSessionID, found := userMapping[num]
+		if !found {
+			return c.Send(fmt.Sprintf("Session number %d not found. Use /sessions to see available sessions.", num))
+		}
+		sessionID = mappedSessionID
+	} else {
+		// Input is not a number, treat as session ID
+		sessionID = input
+	}
+
+	// Check if session exists for this user and get session details
 	sessions, err := b.sessionManager.ListUserSessions(b.ctx, userID)
 	if err != nil {
 		log.Errorf("Failed to get user sessions: %v", err)
 		return c.Send(fmt.Sprintf("Failed to get session list: %v", err))
 	}
-	found := false
-	for _, sess := range sessions {
+	var foundSession *session.SessionMeta
+	var sessionNumber int
+	for i, sess := range sessions {
 		if sess.SessionID == sessionID {
-			found = true
+			foundSession = sess
+			sessionNumber = i + 1
 			break
 		}
 	}
 
-	if !found {
-		return c.Send("Session ID not found.\nUse /sessions to see available sessions.")
+	if foundSession == nil {
+		return c.Send("Session not found.\nUse /sessions to see available sessions.")
 	}
 
 	if err := b.sessionManager.SetUserSession(userID, sessionID); err != nil {
@@ -289,7 +325,7 @@ func (b *Bot) handleSwitch(c telebot.Context) error {
 		return c.Send(fmt.Sprintf("Failed to switch session: %v", err))
 	}
 
-	return c.Send(fmt.Sprintf("✅ Switched to session: `%s`", sessionID))
+	return c.Send(fmt.Sprintf("✅ Session switched to:\n\n%d. %s", sessionNumber, foundSession.Name))
 }
 
 // handleCurrent handles the /current command
@@ -306,6 +342,13 @@ func (b *Bot) handleCurrent(c telebot.Context) error {
 		return c.Send("Session information lost. Use /new to create a new session.")
 	}
 
+	// Get recent messages
+	messages, err := b.opencodeClient.GetMessages(b.ctx, sessionID)
+	if err != nil {
+		log.Errorf("Failed to get messages: %v", err)
+		return c.Send(fmt.Sprintf("Failed to get messages: %v", err))
+	}
+
 	// Get session details from OpenCode
 	session, err := b.opencodeClient.GetSession(b.ctx, sessionID)
 	if err != nil {
@@ -313,29 +356,91 @@ func (b *Bot) handleCurrent(c telebot.Context) error {
 		// Continue with basic info
 	}
 
-	var sb strings.Builder
-	sb.WriteString("📁 Current Session Information\n\n")
-	sb.WriteString(fmt.Sprintf("Session ID: `%s`\n", sessionID))
-	sb.WriteString(fmt.Sprintf("Name: %s\n", meta.Name))
-	sb.WriteString(fmt.Sprintf("Created: %s\n", meta.CreatedAt.Format("2006-01-02 15:04:05")))
-	sb.WriteString(fmt.Sprintf("Last used: %s\n", meta.LastUsedAt.Format("2006-01-02 15:04:05")))
-	sb.WriteString(fmt.Sprintf("Messages: %d\n", meta.MessageCount))
-	if meta.ProviderID != "" && meta.ModelID != "" {
-		sb.WriteString(fmt.Sprintf("Current model: %s/%s\n", meta.ProviderID, meta.ModelID))
-	} else {
-		sb.WriteString("Current model: Default\n")
+	// Determine current status
+	statusStr := "Waiting For Your Input"
+	if len(messages) > 0 {
+		lastMsg := messages[len(messages)-1]
+		if !(lastMsg.Role == "assistant" && lastMsg.Finish != "") {
+			statusStr = "Assistant is processing..."
+		}
 	}
+
+	var sb strings.Builder
+	sb.WriteString("📁 Current Session\n")
+	sb.WriteString("════════════════\n")
+
+	// Show session info in bullet points (same format as /status)
+	sb.WriteString(fmt.Sprintf("• Name: %s\n", meta.Name))
+	sb.WriteString(fmt.Sprintf("• Created: %s\n", meta.CreatedAt.Format("2006-01-02 15:04")))
+	sb.WriteString(fmt.Sprintf("• Last used: %s\n", meta.LastUsedAt.Format("2006-01-02 15:04")))
+	sb.WriteString(fmt.Sprintf("• Messages: %d\n", meta.MessageCount))
+	if meta.ProviderID != "" && meta.ModelID != "" {
+		sb.WriteString(fmt.Sprintf("• Current model: %s/%s\n", meta.ProviderID, meta.ModelID))
+	} else {
+		sb.WriteString("• Current model: Default\n")
+	}
+	sb.WriteString(fmt.Sprintf("• Status: %s\n", statusStr))
 
 	if session != nil {
 		createdAt := time.UnixMilli(session.Time.Created)
-		sb.WriteString(fmt.Sprintf("OpenCode created: %s\n", createdAt.Format("2006-01-02 15:04:05")))
+		sb.WriteString(fmt.Sprintf("• OpenCode created: %s\n", createdAt.Format("2006-01-02 15:04")))
 		updatedAt := time.UnixMilli(session.Time.Updated)
-		sb.WriteString(fmt.Sprintf("OpenCode updated: %s\n", updatedAt.Format("2006-01-02 15:04:05")))
+		sb.WriteString(fmt.Sprintf("• OpenCode updated: %s\n", updatedAt.Format("2006-01-02 15:04")))
 	}
 
-	sb.WriteString("\nUse /sessions to see all sessions, or /switch to switch sessions.")
+	sb.WriteString("\n")
 
-	return c.Send(sb.String())
+	// Show latest message if available
+	if len(messages) > 0 {
+		msg := messages[len(messages)-1]
+		role := "👤 You"
+		if msg.Role == "assistant" {
+			role = "🤖 Assistant"
+		} else if msg.Role == "system" {
+			role = "⚙️ System"
+		}
+		timeStr := msg.CreatedAt.Format("15:04")
+
+		sb.WriteString(fmt.Sprintf("[Message 0] %s [%s]\n", role, timeStr))
+		sb.WriteString("════════════════\n")
+
+		// Show message content
+		if len(msg.Parts) > 0 {
+			// Always show detailed parts if available, especially for tool calls
+			partsStr := formatMessageParts(msg.Parts)
+			if partsStr != "No detailed content" {
+				sb.WriteString(fmt.Sprintf("%s\n", partsStr))
+			} else if msg.Content != "" {
+				// Fallback to content if parts don't provide details
+				content := msg.Content
+				if len(content) > 400 {
+					content = content[:400] + "..."
+				}
+				sb.WriteString(fmt.Sprintf("%s\n", content))
+			} else {
+				sb.WriteString("(No content)\n")
+			}
+		} else if msg.Content != "" {
+			// No parts, just show content
+			content := msg.Content
+			if len(content) > 400 {
+				content = content[:400] + "..."
+			}
+			sb.WriteString(fmt.Sprintf("%s\n", content))
+		} else {
+			sb.WriteString("(No content)\n")
+		}
+	} else {
+		sb.WriteString("No messages yet.\n")
+	}
+
+	// Truncate if too long
+	result := sb.String()
+	if len(result) > 4000 {
+		result = result[:4000] + "\n... (content too long, truncated)"
+	}
+
+	return c.Send(result)
 }
 
 // handleAbort handles the /abort command
@@ -381,91 +486,123 @@ func formatMessageParts(parts []interface{}) string {
 				// Show reasoning text if available
 				if partResp.Text != "" {
 					reasoningText := partResp.Text
-					if len(reasoningText) > 300 {
-						reasoningText = reasoningText[:300] + "..."
+					if len(reasoningText) > 2000 {
+						reasoningText = reasoningText[:2000] + "..."
 					}
-					sb.WriteString(fmt.Sprintf("🤔 Reasoning:\n%s\n", reasoningText))
+					sb.WriteString(fmt.Sprintf("• Thinking: %s\n", reasoningText))
 				} else {
-					sb.WriteString("🤔 Reasoning: Processed\n")
+					sb.WriteString("• Thinking: Processed\n")
 				}
 			case "step-start":
 				// Skip "Task start" message as it's redundant
 				// sb.WriteString("🚀 Task start\n")
 			case "step-finish":
-				finishMsg := fmt.Sprintf("✅ Task completed")
-				if partResp.Reason != "" {
-					finishMsg += fmt.Sprintf(" (Reason: %s)", partResp.Reason)
-				}
-				if partResp.Cost > 0 {
-					finishMsg += fmt.Sprintf(" [Cost: %.4f]", partResp.Cost)
-				}
-				sb.WriteString(finishMsg + "\n")
+				// Skip step-finish in status display as it's redundant
+				// finishMsg := fmt.Sprintf("✅ Task completed")
+				// if partResp.Reason != "" {
+				// 	finishMsg += fmt.Sprintf(" (Reason: %s)", partResp.Reason)
+				// }
+				// if partResp.Cost > 0 {
+				// 	finishMsg += fmt.Sprintf(" [Cost: %.4f]", partResp.Cost)
+				// }
+				// sb.WriteString(finishMsg + "\n")
 			case "tool":
-				toolInfo := "🛠️ Tool call"
+				// Get tool name
+				toolName := partResp.Tool
 
-				// Try to parse snapshot as JSON for more details
-				if partResp.Snapshot != "" {
-					var snapshotData map[string]interface{}
+				// Try to parse snapshot as JSON for backward compatibility
+				var snapshotData map[string]interface{}
+				if toolName == "" && partResp.Snapshot != "" {
 					if err := json.Unmarshal([]byte(partResp.Snapshot), &snapshotData); err == nil {
 						// Extract tool name/type from various possible fields
-						toolName := ""
 						if name, ok := snapshotData["name"].(string); ok && name != "" {
 							toolName = name
 						} else if toolType, ok := snapshotData["type"].(string); ok && toolType != "" {
 							toolName = toolType
 						} else if tool, ok := snapshotData["tool"].(string); ok && tool != "" {
 							toolName = tool
+						} else if function, ok := snapshotData["function"].(string); ok && function != "" {
+							toolName = function
 						}
-
-						if toolName != "" {
-							toolInfo += fmt.Sprintf(": %s", toolName)
-
-							// Try to show arguments if available
-							if args, ok := snapshotData["args"].(map[string]interface{}); ok && len(args) > 0 {
-								// Show first few args
-								var argStrs []string
-								for k, v := range args {
-									argStr := fmt.Sprintf("%s", v)
-									if len(argStr) > 30 {
-										argStr = argStr[:30] + "..."
-									}
-									argStrs = append(argStrs, fmt.Sprintf("%s=%s", k, argStr))
-								}
-								if len(argStrs) > 0 {
-									// Show at most 2 arguments
-									maxArgs := 2
-									if maxArgs > len(argStrs) {
-										maxArgs = len(argStrs)
-									}
-									toolInfo += fmt.Sprintf(" (%s)", strings.Join(argStrs[:maxArgs], ", "))
-								}
-							} else if input, ok := snapshotData["input"].(string); ok && input != "" {
-								// Show truncated input
-								if len(input) > 50 {
-									input = input[:50] + "..."
-								}
-								toolInfo += fmt.Sprintf(" (%s)", input)
-							}
-						} else {
-							// Fallback to showing first 100 chars of snapshot
-							snapshot := partResp.Snapshot
-							if len(snapshot) > 100 {
-								snapshot = snapshot[:100] + "..."
-							}
-							toolInfo += fmt.Sprintf(": %s", snapshot)
-						}
-					} else {
-						// Not JSON, show truncated snapshot
-						snapshot := partResp.Snapshot
-						if len(snapshot) > 100 {
-							snapshot = snapshot[:100] + "..."
-						}
-						toolInfo += fmt.Sprintf(": %s", snapshot)
 					}
-				} else if partResp.Reason != "" {
-					toolInfo += fmt.Sprintf(" (%s)", partResp.Reason)
 				}
-				sb.WriteString(toolInfo + "\n")
+
+				// Default tool name if still empty
+				if toolName == "" {
+					toolName = "tool"
+				}
+
+				// Get state data
+				var stateData map[string]interface{}
+				if partResp.State != nil {
+					if stateMap, ok := partResp.State.(map[string]interface{}); ok {
+						stateData = stateMap
+					}
+				}
+
+				// Use state data if available, otherwise fall back to snapshot data
+				sourceData := stateData
+				if sourceData == nil {
+					sourceData = snapshotData
+				}
+
+				// Determine emoji based on status
+				emoji := "🛠️"
+				if sourceData != nil {
+					if status, ok := sourceData["status"].(string); ok && status == "completed" {
+						emoji = "✅"
+					}
+				}
+
+				// Build description
+				description := ""
+				if sourceData != nil {
+					// Try to get description from input.description
+					if input, ok := sourceData["input"].(map[string]interface{}); ok {
+						if desc, ok := input["description"].(string); ok && desc != "" {
+							description = desc
+						} else if cmd, ok := input["command"].(string); ok && cmd != "" {
+							// Use command as description, truncated
+							cmdDisplay := cmd
+							if len(cmdDisplay) > 100 {
+								cmdDisplay = cmdDisplay[:100] + "..."
+							}
+							cmdDisplay = strings.ReplaceAll(cmdDisplay, "\n", "\\n")
+							description = cmdDisplay
+						}
+					} else if input, ok := sourceData["input"].(string); ok && input != "" {
+						// Input as string
+						inputDisplay := input
+						if len(inputDisplay) > 100 {
+							inputDisplay = inputDisplay[:100] + "..."
+						}
+						inputDisplay = strings.ReplaceAll(inputDisplay, "\n", "\\n")
+						description = inputDisplay
+					} else if content, ok := sourceData["content"].(string); ok && content != "" {
+						contentDisplay := content
+						if len(contentDisplay) > 100 {
+							contentDisplay = contentDisplay[:100] + "..."
+						}
+						contentDisplay = strings.ReplaceAll(contentDisplay, "\n", "\\n")
+						description = contentDisplay
+					}
+				}
+
+				// If no description, use tool text or default
+				if description == "" && partResp.Text != "" {
+					toolText := partResp.Text
+					if len(toolText) > 100 {
+						toolText = toolText[:100] + "..."
+					}
+					toolText = strings.ReplaceAll(toolText, "\n", "\\n")
+					description = toolText
+				}
+				if description == "" {
+					description = "executed"
+				}
+
+				// Output formatted tool info
+				sb.WriteString(fmt.Sprintf("• %s %s: %s\n", emoji, toolName, description))
 			default:
 				sb.WriteString(fmt.Sprintf("🔹 %s\n", partResp.Type))
 			}
@@ -487,10 +624,112 @@ func formatMessageParts(parts []interface{}) string {
 						if len(reasoningText) > 300 {
 							reasoningText = reasoningText[:300] + "..."
 						}
-						sb.WriteString(fmt.Sprintf("🤔 Reasoning:\n%s\n", reasoningText))
+						sb.WriteString(fmt.Sprintf("• Thinking: %s\n", reasoningText))
 					} else {
-						sb.WriteString("🤔 Reasoning: Processed\n")
+						sb.WriteString("• Thinking: Processed\n")
 					}
+				case "tool":
+					// Get tool name
+					toolName := ""
+					if tool, ok := partMap["tool"].(string); ok && tool != "" {
+						toolName = tool
+					}
+
+					// Try to parse snapshot as JSON for backward compatibility
+					var snapshotData map[string]interface{}
+					if snapshot, ok := partMap["snapshot"].(string); ok && snapshot != "" {
+						if err := json.Unmarshal([]byte(snapshot), &snapshotData); err == nil {
+							// Extract tool name if not already found
+							if toolName == "" {
+								if name, ok := snapshotData["name"].(string); ok && name != "" {
+									toolName = name
+								} else if toolType, ok := snapshotData["type"].(string); ok && toolType != "" {
+									toolName = toolType
+								} else if tool, ok := snapshotData["tool"].(string); ok && tool != "" {
+									toolName = tool
+								}
+							}
+						}
+					}
+
+					// Default tool name if still empty
+					if toolName == "" {
+						toolName = "tool"
+					}
+
+					// Get state data
+					var stateData map[string]interface{}
+					if state, ok := partMap["state"]; ok {
+						if stateMap, ok := state.(map[string]interface{}); ok {
+							stateData = stateMap
+						}
+					}
+
+					// Use state data if available, otherwise fall back to snapshot data
+					sourceData := stateData
+					if sourceData == nil {
+						sourceData = snapshotData
+					}
+
+					// Determine emoji based on status
+					emoji := "🛠️"
+					if sourceData != nil {
+						if status, ok := sourceData["status"].(string); ok && status == "completed" {
+							emoji = "✅"
+						}
+					}
+
+					// Build description
+					description := ""
+					if sourceData != nil {
+						// Try to get description from input.description
+						if input, ok := sourceData["input"].(map[string]interface{}); ok {
+							if desc, ok := input["description"].(string); ok && desc != "" {
+								description = desc
+							} else if cmd, ok := input["command"].(string); ok && cmd != "" {
+								// Use command as description, truncated
+								cmdDisplay := cmd
+								if len(cmdDisplay) > 100 {
+									cmdDisplay = cmdDisplay[:100] + "..."
+								}
+								cmdDisplay = strings.ReplaceAll(cmdDisplay, "\n", "\\n")
+								description = cmdDisplay
+							}
+						} else if input, ok := sourceData["input"].(string); ok && input != "" {
+							// Input as string
+							inputDisplay := input
+							if len(inputDisplay) > 100 {
+								inputDisplay = inputDisplay[:100] + "..."
+							}
+							inputDisplay = strings.ReplaceAll(inputDisplay, "\n", "\\n")
+							description = inputDisplay
+						} else if content, ok := sourceData["content"].(string); ok && content != "" {
+							contentDisplay := content
+							if len(contentDisplay) > 100 {
+								contentDisplay = contentDisplay[:100] + "..."
+							}
+							contentDisplay = strings.ReplaceAll(contentDisplay, "\n", "\\n")
+							description = contentDisplay
+						}
+					}
+
+					// If no description, use tool text or default
+					if description == "" {
+						if text, ok := partMap["text"].(string); ok && text != "" {
+							toolText := text
+							if len(toolText) > 100 {
+								toolText = toolText[:100] + "..."
+							}
+							toolText = strings.ReplaceAll(toolText, "\n", "\\n")
+							description = toolText
+						}
+					}
+					if description == "" {
+						description = "executed"
+					}
+
+					// Output formatted tool info
+					sb.WriteString(fmt.Sprintf("• %s %s: %s\n", emoji, toolName, description))
 				default:
 					sb.WriteString(fmt.Sprintf("🔹 %s\n", partType))
 				}
@@ -506,11 +745,11 @@ func formatMessageParts(parts []interface{}) string {
 	if hasTextContent {
 		text := strings.TrimSpace(textContent.String())
 		if text != "" {
-			// Truncate if too long
-			if len(text) > 1000 {
-				text = text[:1000] + "..."
+			// Truncate if too long, but be generous for important content
+			if len(text) > 3000 {
+				text = text[:3000] + "...\n(Reply content too long, truncated)"
 			}
-			sb.WriteString(fmt.Sprintf("\n💬 Reply content:\n%s\n", text))
+			sb.WriteString(fmt.Sprintf("\n• ✅ Reply content:\n%s\n", text))
 		}
 	}
 
@@ -541,19 +780,29 @@ func (b *Bot) handleStatus(c telebot.Context) error {
 		return c.Send("Current session has no messages yet.")
 	}
 
+	// Determine current status
+	statusStr := "Waiting For Your Input"
+	if len(messages) > 0 {
+		lastMsg := messages[len(messages)-1]
+		if !(lastMsg.Role == "assistant" && lastMsg.Finish != "") {
+			statusStr = "Assistant is processing..."
+		}
+	}
+
 	var sb strings.Builder
-	sb.WriteString("📊 Session Status\n\n")
+	sb.WriteString("📊 Session Status\n")
+	sb.WriteString("════════════════\n")
 
 	// Show session info
 	session, err := b.opencodeClient.GetSession(b.ctx, sessionID)
 	if err == nil && session != nil {
-		sb.WriteString(fmt.Sprintf("Title: %s\n", session.Title))
-		sb.WriteString(fmt.Sprintf("ID: `%s`\n", session.ID))
+		sb.WriteString(fmt.Sprintf("• Name: %s\n", session.Title))
 		createdAt := time.UnixMilli(session.Time.Created)
-		sb.WriteString(fmt.Sprintf("Created: %s\n", createdAt.Format("2006-01-02 15:04")))
+		sb.WriteString(fmt.Sprintf("• Created: %s\n", createdAt.Format("2006-01-02 15:04")))
 	}
 
-	sb.WriteString(fmt.Sprintf("Messages: %d\n\n", len(messages)))
+	sb.WriteString(fmt.Sprintf("• Messages: %d\n", len(messages)))
+	sb.WriteString(fmt.Sprintf("• Status: %s\n\n", statusStr))
 
 	// Show last 3 messages in a cleaner format
 	start := len(messages) - 3
@@ -561,11 +810,10 @@ func (b *Bot) handleStatus(c telebot.Context) error {
 		start = 0
 	}
 
-	sb.WriteString("Recent messages:\n")
-	sb.WriteString("═══════════════════════════════\n")
-
 	for i := start; i < len(messages); i++ {
 		msg := messages[i]
+		// Compute relative index (0 = latest, -1 = previous, -2 = older)
+		relIndex := i - (len(messages) - 1)
 		role := "👤 You"
 		if msg.Role == "assistant" {
 			role = "🤖 Assistant"
@@ -574,49 +822,37 @@ func (b *Bot) handleStatus(c telebot.Context) error {
 		}
 		timeStr := msg.CreatedAt.Format("15:04")
 
-		sb.WriteString(fmt.Sprintf("\n%s [%s]\n", role, timeStr))
-		sb.WriteString("───────────────────────────────\n")
+		sb.WriteString(fmt.Sprintf("\n[Message %d] %s [%s]\n", relIndex, role, timeStr))
+		sb.WriteString("════════════════\n")
 
 		// Show message content
-		if msg.Content != "" {
+		if len(msg.Parts) > 0 {
+			// Always show detailed parts if available, especially for tool calls
+			partsStr := formatMessageParts(msg.Parts)
+			if partsStr != "No detailed content" {
+				sb.WriteString(fmt.Sprintf("%s\n", partsStr))
+			} else if msg.Content != "" {
+				// Fallback to content if parts don't provide details
+				content := msg.Content
+				if len(content) > 400 {
+					content = content[:400] + "..."
+				}
+				sb.WriteString(fmt.Sprintf("%s\n", content))
+			} else {
+				sb.WriteString("(No content)\n")
+			}
+		} else if msg.Content != "" {
+			// No parts, just show content
 			content := msg.Content
 			if len(content) > 400 {
 				content = content[:400] + "..."
 			}
 			sb.WriteString(fmt.Sprintf("%s\n", content))
-		} else if len(msg.Parts) > 0 {
-			// If no direct content, try to extract from parts
-			partsStr := formatMessageParts(msg.Parts)
-			if partsStr != "No detailed content" {
-				sb.WriteString(fmt.Sprintf("%s\n", partsStr))
-			} else {
-				sb.WriteString("(No content)\n")
-			}
 		} else {
 			sb.WriteString("(No content)\n")
 		}
 
-		// Only show detailed process for assistant messages with multiple parts
-		if msg.Role == "assistant" && len(msg.Parts) > 1 {
-			partsStr := formatMessageParts(msg.Parts)
-			if partsStr != "No detailed content" && !strings.Contains(partsStr, "💬 Reply content:") {
-				// Already included in formatMessageParts output
-			}
-		}
 	}
-
-	// Show current status
-	sb.WriteString("\n═══════════════════════════════\n")
-	if len(messages) > 0 {
-		lastMsg := messages[len(messages)-1]
-		if lastMsg.Role == "assistant" && lastMsg.Finish != "" {
-			sb.WriteString("📊 Status: Waiting for your input\n")
-		} else {
-			sb.WriteString("📊 Status: Assistant is processing...\n")
-		}
-	}
-
-	sb.WriteString(fmt.Sprintf("\nUse /current to see session details, /sessions to manage sessions."))
 
 	// Truncate if too long
 	result := sb.String()
@@ -877,7 +1113,7 @@ func (b *Bot) handleNewModel(c telebot.Context) error {
 	// Set as current session
 	b.sessionManager.SetUserSession(userID, sessionID)
 
-	return c.Send(fmt.Sprintf("✅ Created new session '%s' with model %s (%s/%s)\nSession ID: `%s`", name, selection.ModelName, selection.ProviderID, selection.ModelID, sessionID))
+	return c.Send(fmt.Sprintf("✅ Created new session '%s' with model %s (%s/%s)", name, selection.ModelName, selection.ProviderID, selection.ModelID))
 }
 
 // handleText handles plain text messages (non-commands) with periodic updates
@@ -1425,4 +1661,111 @@ func (b *Bot) updateTelegramMessage(c telebot.Context, msg *telebot.Message, con
 	} else {
 		log.Debugf("Successfully edited message ID %d", msg.ID)
 	}
+}
+
+// handleRename handles the /rename command
+func (b *Bot) handleRename(c telebot.Context) error {
+	userID := c.Sender().ID
+	args := c.Args()
+
+	if len(args) < 2 {
+		return c.Send("Usage: /rename <number> <new name>\nExample: /rename 2 \"My New Session Name\"")
+	}
+
+	sessionInput := args[0]
+	newName := strings.Join(args[1:], " ")
+
+	// Validate new name
+	if strings.TrimSpace(newName) == "" {
+		return c.Send("Session name cannot be empty.")
+	}
+
+	// Resolve session ID from input (number or session ID)
+	var sessionID string
+	if num, err := strconv.Atoi(sessionInput); err == nil {
+		// Input is a number, get session ID from mapping
+		b.sessionMappingMu.RLock()
+		userMapping, exists := b.sessionMapping[userID]
+		b.sessionMappingMu.RUnlock()
+
+		if !exists {
+			return c.Send("Session mapping not found. Please use /sessions first to see available sessions.")
+		}
+
+		mappedSessionID, found := userMapping[num]
+		if !found {
+			return c.Send(fmt.Sprintf("Session number %d not found. Use /sessions to see available sessions.", num))
+		}
+		sessionID = mappedSessionID
+	} else {
+		// Input is not a number, treat as session ID
+		sessionID = sessionInput
+	}
+
+	// Rename session
+	if err := b.sessionManager.RenameSession(b.ctx, sessionID, newName); err != nil {
+		log.Errorf("Failed to rename session: %v", err)
+		return c.Send(fmt.Sprintf("Failed to rename session: %v", err))
+	}
+
+	return c.Send(fmt.Sprintf("✅ Session renamed to '%s'", newName))
+}
+
+// handleDelete handles the /delete command
+func (b *Bot) handleDelete(c telebot.Context) error {
+	userID := c.Sender().ID
+	args := c.Args()
+
+	if len(args) == 0 {
+		return c.Send("Usage: /delete <number>\nExample: /delete 2")
+	}
+
+	sessionInput := args[0]
+
+	// Resolve session ID from input (number or session ID)
+	var sessionID string
+	if num, err := strconv.Atoi(sessionInput); err == nil {
+		// Input is a number, get session ID from mapping
+		b.sessionMappingMu.RLock()
+		userMapping, exists := b.sessionMapping[userID]
+		b.sessionMappingMu.RUnlock()
+
+		if !exists {
+			return c.Send("Session mapping not found. Please use /sessions first to see available sessions.")
+		}
+
+		mappedSessionID, found := userMapping[num]
+		if !found {
+			return c.Send(fmt.Sprintf("Session number %d not found. Use /sessions to see available sessions.", num))
+		}
+		sessionID = mappedSessionID
+	} else {
+		// Input is not a number, treat as session ID
+		sessionID = sessionInput
+	}
+
+	// Delete session
+	if err := b.sessionManager.DeleteSession(b.ctx, sessionID); err != nil {
+		log.Errorf("Failed to delete session: %v", err)
+		return c.Send(fmt.Sprintf("Failed to delete session: %v", err))
+	}
+
+	// Remove from session mapping if present
+	b.sessionMappingMu.Lock()
+	if userMapping, exists := b.sessionMapping[userID]; exists {
+		// Find and remove the mapping entry for this session
+		for num, mappedID := range userMapping {
+			if mappedID == sessionID {
+				delete(userMapping, num)
+				break
+			}
+		}
+		// If mapping becomes empty, remove it
+		if len(userMapping) == 0 {
+			delete(b.sessionMapping, userID)
+		}
+	}
+	b.sessionMappingMu.Unlock()
+
+	return c.Send("🗑️ Session deleted successfully.")
 }
