@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.25'
+
+    - name: Install dependencies
+      run: go mod download
+
+    - name: Run tests
+      run: make test
+
+  commit-message-check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+    - name: Conventional Commits Validation
+      uses: ytanikin/PRConventionalCommits@1.1.0
+      with:
+        task_types: '["feat","fix","perf","chore","revert","test","docs","style","refactor","build","ci"]'
+        add_label: 'false'
+
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Install gitleaks
+      run: |
+        curl -sSL https://github.com/zricethezav/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz | tar xz
+        sudo mv gitleaks /usr/local/bin/
+        gitleaks version
+    
+    - name: Scan for secrets in new commits
+      run: |
+        echo "Scanning git repository for secrets..."
+        gitleaks git \
+          --log-level=info \
+          --exit-code=1 \
+          --redact \
+          --config=.gitleaks.toml

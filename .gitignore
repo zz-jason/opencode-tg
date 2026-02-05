@@ -1,0 +1,28 @@
+# Binaries
+tg-bot
+bot
+bin/
+
+# Configurations
+config.toml
+
+# Logs
+bot.log
+bot.log.old
+*.log
+
+# Design documents
+DESIGN.md
+AGENTS.md
+.AGENTS/templates/DESIGN.md
+.AGENTS/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Dependency directories
+vendor/
