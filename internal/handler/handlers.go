@@ -1295,6 +1295,22 @@ func (b *Bot) handleText(c telebot.Context) error {
 	// Handle final content (may need to split into multiple messages)
 	b.handleFinalResponse(c, processingMsg, finalContent)
 
+	// Send latest message details if available (thinking, tool calls, etc.)
+	latestMsgDetails, err := b.formatLatestMessage(sessionID, userID)
+	if err != nil {
+		log.Warnf("Failed to get latest message details: %v", err)
+		// Continue without latest message details
+	} else if latestMsgDetails != "" {
+		// Small delay to ensure message order
+		time.Sleep(500 * time.Millisecond)
+
+		// Send the latest message details as a separate update
+		_, err := c.Bot().Send(c.Chat(), latestMsgDetails)
+		if err != nil {
+			log.Errorf("Failed to send latest message details: %v", err)
+		}
+	}
+
 	return nil
 }
 
@@ -2148,6 +2164,54 @@ func (b *Bot) splitLongContent(content string) []string {
 	}
 
 	return chunks
+}
+
+// formatLatestMessage formats the latest message from a session for display
+func (b *Bot) formatLatestMessage(sessionID string, userID int64) (string, error) {
+	// Get recent messages
+	messages, err := b.opencodeClient.GetMessages(b.ctx, sessionID)
+	if err != nil {
+		log.Errorf("Failed to get messages for latest update: %v", err)
+		return "", err
+	}
+
+	if len(messages) == 0 {
+		return "No messages in session.", nil
+	}
+
+	// Get the latest message
+	latestMsg := messages[len(messages)-1]
+
+	// Check if this is an assistant message with detailed parts
+	hasDetailedParts := len(latestMsg.Parts) > 0 && formatMessageParts(latestMsg.Parts) != "No detailed content"
+
+	// If it's not an assistant message or doesn't have detailed parts, no need for separate update
+	if latestMsg.Role != "assistant" || !hasDetailedParts {
+		return "", nil
+	}
+
+	// Format the message similar to /status command
+	role := "🤖 Assistant"
+	timeStr := latestMsg.CreatedAt.Format("15:04")
+
+	var sb strings.Builder
+	sb.WriteString("📋 Latest Message Details\n")
+	sb.WriteString("════════════════\n")
+	sb.WriteString(fmt.Sprintf("[Message 0] %s [%s]\n", role, timeStr))
+	sb.WriteString("════════════════\n")
+
+	// Show detailed parts
+	partsStr := formatMessageParts(latestMsg.Parts)
+	sb.WriteString(fmt.Sprintf("%s\n", partsStr))
+
+	// Truncate if too long for Telegram
+	result := sb.String()
+	const maxTelegramLength = 3500
+	if len(result) > maxTelegramLength {
+		result = result[:maxTelegramLength] + "\n... (content too long, use /status or /current for full details)"
+	}
+
+	return result, nil
 }
 
 // Close closes the bot and releases resources
