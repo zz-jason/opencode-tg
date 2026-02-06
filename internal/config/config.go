@@ -39,7 +39,7 @@ type OpenCodeConfig struct {
 // StorageConfig contains session storage settings
 type StorageConfig struct {
 	Type     string `toml:"type"`
-	FilePath string `toml:"sqlite_path"` // path to JSON file for session storage
+	FilePath string `toml:"file_path"` // path to JSON file for session storage
 }
 
 // LoggingConfig contains logging settings
@@ -105,7 +105,7 @@ func setDefaults(cfg *Config) {
 		cfg.Storage.Type = "file"
 	}
 	if cfg.Storage.FilePath == "" && cfg.Storage.Type == "file" {
-		cfg.Storage.FilePath = "sessions.json"
+		cfg.Storage.FilePath = "bot-state.json"
 	}
 	if cfg.Logging.Level == "" {
 		cfg.Logging.Level = "info"

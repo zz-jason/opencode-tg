@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,7 +29,7 @@ type SessionMeta = storage.SessionMeta
 func NewManager(client *opencode.Client) *Manager {
 	store, err := storage.NewStore(storage.Options{
 		Type:     "file",
-		FilePath: "sessions.json",
+		FilePath: "bot-state.json",
 	})
 	if err != nil {
 		// Panic since this is a programming error - storage should always be available
@@ -357,6 +358,9 @@ func (m *Manager) ListUserSessions(ctx context.Context, userID int64) ([]*Sessio
 		}
 	}
 
+	// Sync message count and model info from OpenCode to avoid stale local counters.
+	m.syncSessionRuntimeInfo(ctx, allSessions)
+
 	return allSessions, nil
 }
 
@@ -632,8 +636,26 @@ func (m *Manager) getOrCreateSessionMeta(sessionID string, currentUserID int64, 
 		exists = false
 	}
 	if exists {
+		updated := false
+
 		// Update last used time and recalculate status based on current user
 		meta.LastUsedAt = time.Now()
+
+		// Keep local metadata in sync with upstream session metadata.
+		if title != "" && title != meta.Name {
+			meta.Name = title
+			updated = true
+		}
+
+		if providerID := getMetadataString(metadata, "provider_id", "providerID"); providerID != "" && providerID != meta.ProviderID {
+			meta.ProviderID = providerID
+			updated = true
+		}
+		if modelID := getMetadataString(metadata, "model_id", "modelID"); modelID != "" && modelID != meta.ModelID {
+			meta.ModelID = modelID
+			updated = true
+		}
+
 		// Recalculate status based on owner ID and current user
 		if meta.UserID == 0 {
 			meta.Status = "orphaned"
@@ -642,8 +664,12 @@ func (m *Manager) getOrCreateSessionMeta(sessionID string, currentUserID int64, 
 		} else {
 			meta.Status = "other"
 		}
-		if err := m.store.StoreSessionMeta(meta); err != nil {
-			log.Warnf("Failed to store updated session meta: %v", err)
+		updated = true // status/last used are refreshed on each list call.
+
+		if updated {
+			if err := m.store.StoreSessionMeta(meta); err != nil {
+				log.Warnf("Failed to store updated session meta: %v", err)
+			}
 		}
 		return meta
 	}
@@ -667,19 +693,19 @@ func (m *Manager) getOrCreateSessionMeta(sessionID string, currentUserID int64, 
 	// Extract name from provided title, metadata, or use default
 	if title != "" {
 		meta.Name = title
-	} else if sessionName, ok := metadata["session_name"].(string); ok && sessionName != "" {
+	} else if sessionName := getMetadataString(metadata, "session_name"); sessionName != "" {
 		meta.Name = sessionName
-	} else if metadataTitle, ok := metadata["title"].(string); ok && metadataTitle != "" {
+	} else if metadataTitle := getMetadataString(metadata, "title"); metadataTitle != "" {
 		meta.Name = metadataTitle
 	} else {
 		meta.Name = "Telegram Session"
 	}
 
 	// Extract model information if available
-	if providerID, ok := metadata["provider_id"].(string); ok {
+	if providerID := getMetadataString(metadata, "provider_id", "providerID"); providerID != "" {
 		meta.ProviderID = providerID
 	}
-	if modelID, ok := metadata["model_id"].(string); ok {
+	if modelID := getMetadataString(metadata, "model_id", "modelID"); modelID != "" {
 		meta.ModelID = modelID
 	}
 
@@ -710,6 +736,67 @@ func (m *Manager) getOrCreateSessionMeta(sessionID string, currentUserID int64, 
 	}
 
 	return meta
+}
+
+func getMetadataString(metadata map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		value, ok := metadata[key]
+		if !ok {
+			continue
+		}
+		str, ok := value.(string)
+		if !ok {
+			continue
+		}
+		str = strings.TrimSpace(str)
+		if str != "" {
+			return str
+		}
+	}
+	return ""
+}
+
+func (m *Manager) syncSessionRuntimeInfo(ctx context.Context, sessions []*SessionMeta) {
+	for _, meta := range sessions {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		messages, err := m.client.GetMessages(ctx, meta.SessionID)
+		if err != nil {
+			log.Warnf("Failed to fetch messages for session %s: %v", meta.SessionID, err)
+			continue
+		}
+
+		updated := false
+		if meta.MessageCount != len(messages) {
+			meta.MessageCount = len(messages)
+			updated = true
+		}
+
+		// Recover model info from the latest message when metadata is missing.
+		for i := len(messages) - 1; i >= 0 && (meta.ProviderID == "" || meta.ModelID == ""); i-- {
+			msg := messages[i]
+			if meta.ProviderID == "" && msg.ProviderID != "" {
+				meta.ProviderID = msg.ProviderID
+				updated = true
+			}
+			if meta.ModelID == "" && msg.ModelID != "" {
+				meta.ModelID = msg.ModelID
+				updated = true
+			}
+		}
+
+		if !updated {
+			continue
+		}
+
+		if err := m.store.StoreSessionMeta(meta); err != nil {
+			log.Warnf("Failed to store updated session meta: %v", err)
+		}
+	}
 }
 
 // Close closes the storage backend
