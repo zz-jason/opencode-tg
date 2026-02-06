@@ -50,8 +50,10 @@ type streamingState struct {
 	cancel      context.CancelFunc
 	stopUpdates chan struct{}
 
-	telegramMsg *telebot.Message
-	telegramCtx telebot.Context
+	telegramMsg      *telebot.Message
+	telegramMessages []*telebot.Message
+	lastRendered     []string
+	telegramCtx      telebot.Context
 
 	content     *strings.Builder
 	lastUpdate  time.Time
@@ -542,6 +544,10 @@ func (b *Bot) handleAbort(c telebot.Context) error {
 
 // formatMessageParts formats message parts for display
 func formatMessageParts(parts []interface{}) string {
+	return formatMessagePartsWithOptions(parts, true)
+}
+
+func formatMessagePartsWithOptions(parts []interface{}, includeReplyContent bool) string {
 	if len(parts) == 0 {
 		return "No detailed content"
 	}
@@ -577,112 +583,17 @@ func formatMessageParts(parts []interface{}) string {
 				// Skip "Task start" message as it's redundant
 				// sb.WriteString("🚀 Task start\n")
 			case "step-finish":
-				// Skip step-finish in status display as it's redundant
-				// finishMsg := fmt.Sprintf("✅ Task completed")
-				// if partResp.Reason != "" {
-				// 	finishMsg += fmt.Sprintf(" (Reason: %s)", partResp.Reason)
-				// }
-				// if partResp.Cost > 0 {
-				// 	finishMsg += fmt.Sprintf(" [Cost: %.4f]", partResp.Cost)
-				// }
-				// sb.WriteString(finishMsg + "\n")
+			// Skip step-finish in status display as it's redundant
+			// finishMsg := fmt.Sprintf("✅ Task completed")
+			// if partResp.Reason != "" {
+			// 	finishMsg += fmt.Sprintf(" (Reason: %s)", partResp.Reason)
+			// }
+			// if partResp.Cost > 0 {
+			// 	finishMsg += fmt.Sprintf(" [Cost: %.4f]", partResp.Cost)
+			// }
+			// sb.WriteString(finishMsg + "\n")
 			case "tool":
-				// Get tool name
-				toolName := partResp.Tool
-
-				// Try to parse snapshot as JSON for backward compatibility
-				var snapshotData map[string]interface{}
-				if toolName == "" && partResp.Snapshot != "" {
-					if err := json.Unmarshal([]byte(partResp.Snapshot), &snapshotData); err == nil {
-						// Extract tool name/type from various possible fields
-						if name, ok := snapshotData["name"].(string); ok && name != "" {
-							toolName = name
-						} else if toolType, ok := snapshotData["type"].(string); ok && toolType != "" {
-							toolName = toolType
-						} else if tool, ok := snapshotData["tool"].(string); ok && tool != "" {
-							toolName = tool
-						} else if function, ok := snapshotData["function"].(string); ok && function != "" {
-							toolName = function
-						}
-					}
-				}
-
-				// Default tool name if still empty
-				if toolName == "" {
-					toolName = "tool"
-				}
-
-				// Get state data
-				var stateData map[string]interface{}
-				if partResp.State != nil {
-					if stateMap, ok := partResp.State.(map[string]interface{}); ok {
-						stateData = stateMap
-					}
-				}
-
-				// Use state data if available, otherwise fall back to snapshot data
-				sourceData := stateData
-				if sourceData == nil {
-					sourceData = snapshotData
-				}
-
-				// Determine emoji based on status
-				emoji := "🛠️"
-				if sourceData != nil {
-					if status, ok := sourceData["status"].(string); ok && status == "completed" {
-						emoji = "✅"
-					}
-				}
-
-				// Build description
-				description := ""
-				if sourceData != nil {
-					// Try to get description from input.description
-					if input, ok := sourceData["input"].(map[string]interface{}); ok {
-						if desc, ok := input["description"].(string); ok && desc != "" {
-							description = desc
-						} else if cmd, ok := input["command"].(string); ok && cmd != "" {
-							// Use command as description, truncated
-							cmdDisplay := cmd
-							if len(cmdDisplay) > 100 {
-								cmdDisplay = cmdDisplay[:100] + "..."
-							}
-							cmdDisplay = strings.ReplaceAll(cmdDisplay, "\n", "\\n")
-							description = cmdDisplay
-						}
-					} else if input, ok := sourceData["input"].(string); ok && input != "" {
-						// Input as string
-						inputDisplay := input
-						if len(inputDisplay) > 100 {
-							inputDisplay = inputDisplay[:100] + "..."
-						}
-						inputDisplay = strings.ReplaceAll(inputDisplay, "\n", "\\n")
-						description = inputDisplay
-					} else if content, ok := sourceData["content"].(string); ok && content != "" {
-						contentDisplay := content
-						if len(contentDisplay) > 100 {
-							contentDisplay = contentDisplay[:100] + "..."
-						}
-						contentDisplay = strings.ReplaceAll(contentDisplay, "\n", "\\n")
-						description = contentDisplay
-					}
-				}
-
-				// If no description, use tool text or default
-				if description == "" && partResp.Text != "" {
-					toolText := partResp.Text
-					if len(toolText) > 100 {
-						toolText = toolText[:100] + "..."
-					}
-					toolText = strings.ReplaceAll(toolText, "\n", "\\n")
-					description = toolText
-				}
-				if description == "" {
-					description = "executed"
-				}
-
-				// Output formatted tool info
-				sb.WriteString(fmt.Sprintf("• %s %s: %s\n", emoji, toolName, description))
+				sb.WriteString(formatToolCallPart(partResp.Tool, partResp.Snapshot, partResp.State, partResp.Text))
 			default:
 				sb.WriteString(fmt.Sprintf("🔹 %s\n", partResp.Type))
 			}
@@ -709,107 +620,10 @@ func formatMessageParts(parts []interface{}) string {
 						sb.WriteString("• Thinking: Processed\n")
 					}
 				case "tool":
-					// Get tool name
-					toolName := ""
-					if tool, ok := partMap["tool"].(string); ok && tool != "" {
-						toolName = tool
-					}
-
-					// Try to parse snapshot as JSON for backward compatibility
-					var snapshotData map[string]interface{}
-					if snapshot, ok := partMap["snapshot"].(string); ok && snapshot != "" {
-						if err := json.Unmarshal([]byte(snapshot), &snapshotData); err == nil {
-							// Extract tool name if not already found
-							if toolName == "" {
-								if name, ok := snapshotData["name"].(string); ok && name != "" {
-									toolName = name
-								} else if toolType, ok := snapshotData["type"].(string); ok && toolType != "" {
-									toolName = toolType
-								} else if tool, ok := snapshotData["tool"].(string); ok && tool != "" {
-									toolName = tool
-								}
-							}
-						}
-					}
-
-					// Default tool name if still empty
-					if toolName == "" {
-						toolName = "tool"
-					}
-
-					// Get state data
-					var stateData map[string]interface{}
-					if state, ok := partMap["state"]; ok {
-						if stateMap, ok := state.(map[string]interface{}); ok {
-							stateData = stateMap
-						}
-					}
-
-					// Use state data if available, otherwise fall back to snapshot data
-					sourceData := stateData
-					if sourceData == nil {
-						sourceData = snapshotData
-					}
-
-					// Determine emoji based on status
-					emoji := "🛠️"
-					if sourceData != nil {
-						if status, ok := sourceData["status"].(string); ok && status == "completed" {
-							emoji = "✅"
-						}
-					}
-
-					// Build description
-					description := ""
-					if sourceData != nil {
-						// Try to get description from input.description
-						if input, ok := sourceData["input"].(map[string]interface{}); ok {
-							if desc, ok := input["description"].(string); ok && desc != "" {
-								description = desc
-							} else if cmd, ok := input["command"].(string); ok && cmd != "" {
-								// Use command as description, truncated
-								cmdDisplay := cmd
-								if len(cmdDisplay) > 100 {
-									cmdDisplay = cmdDisplay[:100] + "..."
-								}
-								cmdDisplay = strings.ReplaceAll(cmdDisplay, "\n", "\\n")
-								description = cmdDisplay
-							}
-						} else if input, ok := sourceData["input"].(string); ok && input != "" {
-							// Input as string
-							inputDisplay := input
-							if len(inputDisplay) > 100 {
-								inputDisplay = inputDisplay[:100] + "..."
-							}
-							inputDisplay = strings.ReplaceAll(inputDisplay, "\n", "\\n")
-							description = inputDisplay
-						} else if content, ok := sourceData["content"].(string); ok && content != "" {
-							contentDisplay := content
-							if len(contentDisplay) > 100 {
-								contentDisplay = contentDisplay[:100] + "..."
-							}
-							contentDisplay = strings.ReplaceAll(contentDisplay, "\n", "\\n")
-							description = contentDisplay
-						}
-					}
-
-					// If no description, use tool text or default
-					if description == "" {
-						if text, ok := partMap["text"].(string); ok && text != "" {
-							toolText := text
-							if len(toolText) > 100 {
-								toolText = toolText[:100] + "..."
-							}
-							toolText = strings.ReplaceAll(toolText, "\n", "\\n")
-							description = toolText
-						}
-					}
-					if description == "" {
-						description = "executed"
-					}
-
-					// Output formatted tool info
-					sb.WriteString(fmt.Sprintf("• %s %s: %s\n", emoji, toolName, description))
+					toolName, _ := partMap["tool"].(string)
+					snapshot, _ := partMap["snapshot"].(string)
+					text, _ := partMap["text"].(string)
+					sb.WriteString(formatToolCallPart(toolName, snapshot, partMap["state"], text))
 				default:
 					sb.WriteString(fmt.Sprintf("🔹 %s\n", partType))
 				}
@@ -821,8 +635,10 @@ func formatMessageParts(parts []interface{}) string {
 		}
 	}
 
-	// Add text content at the end if we have any
-	if hasTextContent {
+	// Add text content at the end if we have any.
+	// For realtime display where msg.Content is already shown, this can be disabled
+	// to avoid duplicate content blocks.
+	if hasTextContent && includeReplyContent {
 		text := strings.TrimSpace(textContent.String())
 		if text != "" {
 			// Truncate if too long, but be generous for important content
@@ -838,6 +654,182 @@ func formatMessageParts(parts []interface{}) string {
 		return "No detailed content"
 	}
 	return result
+}
+
+func formatToolCallPart(toolName, snapshot string, state interface{}, text string) string {
+	snapshotData := parseJSONMap(snapshot)
+	if toolName == "" {
+		toolName = extractToolName(snapshotData)
+	}
+	if toolName == "" {
+		toolName = "tool"
+	}
+
+	sourceData := toStringAnyMap(state)
+	if sourceData == nil {
+		sourceData = snapshotData
+	}
+
+	emoji := "🛠️"
+	if sourceData != nil {
+		if status, _ := sourceData["status"].(string); strings.EqualFold(status, "completed") {
+			emoji = "✅"
+		} else if status, _ := sourceData["status"].(string); strings.EqualFold(status, "error") || strings.EqualFold(status, "failed") {
+			emoji = "❌"
+		}
+	}
+
+	description := extractToolDescription(sourceData, text)
+	command := extractToolCommand(sourceData)
+	output := extractToolOutput(sourceData)
+	if output == "" && text != "" && text != description {
+		output = text
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("• %s %s: %s\n", emoji, toolName, description))
+	if command != "" {
+		sb.WriteString(fmt.Sprintf("  $ %s\n", truncateAndInline(command, 300)))
+	}
+	if output != "" {
+		outputText := truncateMultiline(output, 700)
+		outputText = strings.ReplaceAll(outputText, "\r\n", "\n")
+		outputText = strings.TrimSpace(outputText)
+		if outputText != "" {
+			sb.WriteString("  output:\n")
+			sb.WriteString("    " + strings.ReplaceAll(outputText, "\n", "\n    ") + "\n")
+		}
+	}
+	return sb.String()
+}
+
+func parseJSONMap(raw string) map[string]interface{} {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return nil
+	}
+	return m
+}
+
+func toStringAnyMap(v interface{}) map[string]interface{} {
+	if v == nil {
+		return nil
+	}
+	m, ok := v.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	return m
+}
+
+func extractToolName(source map[string]interface{}) string {
+	if source == nil {
+		return ""
+	}
+	for _, key := range []string{"name", "type", "tool", "function"} {
+		if value, ok := source[key].(string); ok && value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func extractToolDescription(source map[string]interface{}, text string) string {
+	description := ""
+	if source != nil {
+		if inputMap, ok := source["input"].(map[string]interface{}); ok {
+			if desc, ok := inputMap["description"].(string); ok && desc != "" {
+				description = desc
+			} else if cmd, ok := inputMap["command"].(string); ok && cmd != "" {
+				description = cmd
+			}
+		} else if input, ok := source["input"].(string); ok && input != "" {
+			description = input
+		} else if content, ok := source["content"].(string); ok && content != "" {
+			description = content
+		}
+	}
+	if description == "" && text != "" {
+		description = text
+	}
+	if description == "" {
+		return "executed"
+	}
+	return truncateAndInline(description, 100)
+}
+
+func extractToolCommand(source map[string]interface{}) string {
+	if source == nil {
+		return ""
+	}
+	if inputMap, ok := source["input"].(map[string]interface{}); ok {
+		if cmd, ok := inputMap["command"].(string); ok && cmd != "" {
+			return cmd
+		}
+		if argsMap, ok := inputMap["args"].(map[string]interface{}); ok {
+			if cmd, ok := argsMap["command"].(string); ok && cmd != "" {
+				return cmd
+			}
+		}
+	}
+	if cmd, ok := source["command"].(string); ok && cmd != "" {
+		return cmd
+	}
+	if argsMap, ok := source["args"].(map[string]interface{}); ok {
+		if cmd, ok := argsMap["command"].(string); ok && cmd != "" {
+			return cmd
+		}
+	}
+	return ""
+}
+
+func extractToolOutput(source map[string]interface{}) string {
+	if source == nil {
+		return ""
+	}
+	for _, key := range []string{"output", "result", "stderr", "stdout", "error"} {
+		if value, exists := source[key]; exists {
+			if text := stringifyToolValue(value); strings.TrimSpace(text) != "" {
+				return text
+			}
+		}
+	}
+	return ""
+}
+
+func stringifyToolValue(v interface{}) string {
+	switch value := v.(type) {
+	case string:
+		return value
+	case fmt.Stringer:
+		return value.String()
+	default:
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return ""
+		}
+		return string(encoded)
+	}
+}
+
+func truncateAndInline(text string, maxLen int) string {
+	if len(text) > maxLen {
+		text = text[:maxLen] + "..."
+	}
+	text = strings.ReplaceAll(text, "\n", "\\n")
+	return strings.TrimSpace(text)
+}
+
+func truncateMultiline(text string, maxLen int) string {
+	text = strings.TrimSpace(text)
+	if len(text) > maxLen {
+		return text[:maxLen] + "..."
+	}
+	return text
 }
 
 // handleStatus handles the /status command
@@ -1243,15 +1235,17 @@ func (b *Bot) handleText(c telebot.Context) error {
 
 	// Track streaming state
 	streamingState := &streamingState{
-		ctx:         ctx,
-		cancel:      cancel,
-		stopUpdates: stopUpdates,
-		telegramMsg: processingMsg,
-		telegramCtx: c,
-		content:     &strings.Builder{},
-		lastUpdate:  time.Now(),
-		updateMutex: &sync.Mutex{},
-		isStreaming: true,
+		ctx:              ctx,
+		cancel:           cancel,
+		stopUpdates:      stopUpdates,
+		telegramMsg:      processingMsg,
+		telegramMessages: []*telebot.Message{processingMsg},
+		lastRendered:     []string{"🤖 Processing..."},
+		telegramCtx:      c,
+		content:          &strings.Builder{},
+		lastUpdate:       time.Now(),
+		updateMutex:      &sync.Mutex{},
+		isStreaming:      true,
 	}
 
 	// Store streaming state for potential abort
@@ -1277,7 +1271,7 @@ func (b *Bot) handleText(c telebot.Context) error {
 	periodicDone := make(chan struct{})
 	go func() {
 		defer close(periodicDone)
-		b.periodicMessageUpdates(periodicCtx, c, processingMsg, sessionID, stopUpdates)
+		b.periodicMessageUpdates(periodicCtx, streamingState, sessionID, stopUpdates)
 	}()
 
 	// Start streaming the message
@@ -1313,38 +1307,21 @@ func (b *Bot) handleText(c telebot.Context) error {
 	// Mark streaming as complete
 	streamingState.isComplete = true
 
-	// Get final content
+	// Get final content. Prefer the most complete assistant content available:
+	// streamed chunks and periodically-polled message content may differ by timing.
 	finalContent := streamingState.content.String()
-	if finalContent == "" {
-		fallbackContent, fallbackErr := b.waitForLatestAssistantContent(sessionID, 10*time.Second)
-		if fallbackErr != nil {
-			log.Warnf("Failed to fetch latest assistant content for fallback: %v", fallbackErr)
-		} else if fallbackContent != "" {
-			finalContent = fallbackContent
-		}
+	fallbackContent, fallbackErr := b.waitForLatestAssistantContent(sessionID, 3*time.Second)
+	if fallbackErr != nil {
+		log.Warnf("Failed to fetch latest assistant content for fallback: %v", fallbackErr)
+	} else if len(strings.TrimSpace(fallbackContent)) > len(strings.TrimSpace(finalContent)) {
+		finalContent = fallbackContent
 	}
 	if finalContent == "" {
 		finalContent = "🤖 Response completed with no content."
 	}
 
 	// Handle final content (may need to split into multiple messages)
-	b.handleFinalResponse(c, processingMsg, finalContent)
-
-	// Send latest message details if available (thinking, tool calls, etc.)
-	latestMsgDetails, err := b.formatLatestMessage(sessionID, userID)
-	if err != nil {
-		log.Warnf("Failed to get latest message details: %v", err)
-		// Continue without latest message details
-	} else if latestMsgDetails != "" {
-		// Small delay to ensure message order
-		time.Sleep(500 * time.Millisecond)
-
-		// Send the latest message details as a separate update
-		_, err := c.Bot().Send(c.Chat(), latestMsgDetails)
-		if err != nil {
-			log.Errorf("Failed to send latest message details: %v", err)
-		}
-	}
+	b.handleFinalResponse(c, streamingState, finalContent)
 
 	return nil
 }
@@ -1771,16 +1748,17 @@ func (b *Bot) clearModelMapping(userID int64) {
 	delete(b.modelMapping, userID)
 }
 
-// periodicMessageUpdates periodically updates a message with the latest session status
-func (b *Bot) periodicMessageUpdates(ctx context.Context, c telebot.Context, msg *telebot.Message, sessionID string, stopCh <-chan struct{}) {
+// periodicMessageUpdates periodically polls OpenCode and updates streaming messages.
+// It serves as a fallback path when SSE text chunks are sparse or absent.
+func (b *Bot) periodicMessageUpdates(ctx context.Context, state *streamingState, sessionID string, stopCh <-chan struct{}) {
+	if state == nil {
+		return
+	}
+
 	// Ticker for periodic updates (every 2 seconds)
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
-	// Track the last message ID we've processed to avoid repeated updates
-	lastProcessedMsgID := ""
-	// Track if we've seen a completed message
-	hasCompletedMessage := false
 	// Count updates for logging
 	updateCount := 0
 
@@ -1795,23 +1773,18 @@ func (b *Bot) periodicMessageUpdates(ctx context.Context, c telebot.Context, msg
 		case <-ticker.C:
 			updateCount++
 			log.Debugf("Periodic update #%d for session %s", updateCount, sessionID)
-			// Get latest messages from the session
+
 			messages, err := b.opencodeClient.GetMessages(ctx, sessionID)
 			if err != nil {
 				log.Errorf("Failed to get messages for periodic update: %v", err)
 				continue
 			}
-
-			log.Debugf("Found %d total messages in session %s", len(messages), sessionID)
 			if len(messages) == 0 {
 				continue
 			}
 
-			// Find the latest assistant message
 			var latestAssistantMsg opencode.Message
 			foundAssistantMsg := false
-
-			// Search from newest to oldest
 			for i := len(messages) - 1; i >= 0; i-- {
 				if messages[i].Role == "assistant" {
 					latestAssistantMsg = messages[i]
@@ -1820,49 +1793,30 @@ func (b *Bot) periodicMessageUpdates(ctx context.Context, c telebot.Context, msg
 				}
 			}
 
+			state.updateMutex.Lock()
 			if !foundAssistantMsg {
-				log.Debugf("No assistant message found yet for session %s, showing processing", sessionID)
-				// No assistant message yet, just show processing
-				b.updateTelegramMessage(c, msg, "🤖 Processing...\n\nModel is thinking, please wait...")
+				b.updateStreamingTelegramMessages(state, []string{"🤖 Processing...\n\nModel is thinking, please wait..."})
+				state.updateMutex.Unlock()
 				continue
 			}
 
-			log.Debugf("Latest assistant message ID: %s, finish: %s, last processed: %s",
-				latestAssistantMsg.ID, latestAssistantMsg.Finish, lastProcessedMsgID)
-
-			// Check if this is the same message we already processed
-			if latestAssistantMsg.ID == lastProcessedMsgID && !hasCompletedMessage {
-				// Same message, no need to update unless it's now completed
-				if latestAssistantMsg.Finish == "" {
-					log.Debugf("Same incomplete message, skipping update")
-					continue
-				}
+			// Prefer the same content-driven stream layout whenever content exists.
+			// This guarantees page 2/page 3 can start updating before completion.
+			currentContent := state.content.String()
+			displayContent := currentContent
+			if len(strings.TrimSpace(latestAssistantMsg.Content)) > len(strings.TrimSpace(displayContent)) {
+				displayContent = latestAssistantMsg.Content
+			}
+			var displays []string
+			if strings.TrimSpace(displayContent) != "" {
+				displays = b.formatStreamingDisplays(displayContent)
+			} else {
+				displayText := b.formatMessageForDisplay(latestAssistantMsg, false)
+				displays = b.paginateDisplayText(displayText, true)
 			}
 
-			// Update last processed message ID
-			lastProcessedMsgID = latestAssistantMsg.ID
-
-			// Check if message is completed
-			if latestAssistantMsg.Finish != "" {
-				hasCompletedMessage = true
-				log.Debugf("Message marked as completed with finish reason: %s", latestAssistantMsg.Finish)
-			}
-
-			// Format the message for display
-			displayText := b.formatMessageForDisplay(latestAssistantMsg, hasCompletedMessage)
-			log.Debugf("Formatted display text length: %d chars", len(displayText))
-
-			// Update the Telegram message
-			b.updateTelegramMessage(c, msg, displayText)
-			log.Debugf("Telegram message updated for session %s (hasCompleted: %v)", sessionID, hasCompletedMessage)
-
-			// If message is completed and we've shown it, we can stop updates
-			// But wait a couple more cycles to ensure everything is shown
-			if hasCompletedMessage {
-				log.Debugf("Message completed, will continue for a few more updates")
-				// Continue for a few more updates to ensure final state is shown
-				// The stopCh or context will eventually stop this goroutine
-			}
+			b.updateStreamingTelegramMessages(state, displays)
+			state.updateMutex.Unlock()
 		}
 	}
 }
@@ -1888,7 +1842,7 @@ func (b *Bot) formatMessageForDisplay(msg opencode.Message, isCompleted bool) st
 
 	// Add detailed parts information
 	if len(msg.Parts) > 0 {
-		partsStr := formatMessageParts(msg.Parts)
+		partsStr := formatMessagePartsWithOptions(msg.Parts, msg.Content == "")
 		if partsStr != "No detailed content" {
 			sb.WriteString("📋 Processing Details:\n")
 			sb.WriteString(partsStr)
@@ -1930,9 +1884,18 @@ func (b *Bot) updateTelegramMessage(c telebot.Context, msg *telebot.Message, con
 		log.Debugf("Message content too long (%d chars), truncating to 4000", len(content))
 		content = content[:4000] + "\n...(content too long, truncated)"
 	}
+	if msg.Text == content {
+		log.Debug("Skipping Telegram edit because message content is unchanged")
+		return
+	}
 
 	// Try to update the message
 	if _, err := c.Bot().Edit(msg, content); err != nil {
+		if isMessageNotModifiedError(err) {
+			log.Debugf("Skipping no-op Telegram edit: %v", err)
+			msg.Text = content
+			return
+		}
 		log.Warnf("Failed to update Telegram message: %v", err)
 		// If editing fails, try to send a new message
 		newMsg, err := c.Bot().Send(c.Chat(), content)
@@ -1944,8 +1907,16 @@ func (b *Bot) updateTelegramMessage(c telebot.Context, msg *telebot.Message, con
 		*msg = *newMsg
 		log.Debugf("Sent new message due to edit failure, new message ID: %d", newMsg.ID)
 	} else {
+		msg.Text = content
 		log.Debugf("Successfully edited message ID %d", msg.ID)
 	}
+}
+
+func isMessageNotModifiedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "message is not modified")
 }
 
 // handleRename handles the /rename command
@@ -2060,8 +2031,14 @@ func (b *Bot) handleStreamChunk(state *streamingState, textChunk string) error {
 	state.updateMutex.Lock()
 	defer state.updateMutex.Unlock()
 
-	// Append the new chunk to our content
-	state.content.WriteString(textChunk)
+	// Some stream providers emit cumulative snapshots instead of pure deltas.
+	// Normalize to incremental append to avoid duplicated content growth.
+	currentBefore := state.content.String()
+	delta := streamChunkDelta(currentBefore, textChunk)
+	if delta == "" {
+		return nil
+	}
+	state.content.WriteString(delta)
 	currentContent := state.content.String()
 
 	// Track content length for update decisions
@@ -2075,14 +2052,23 @@ func (b *Bot) handleStreamChunk(state *streamingState, textChunk string) error {
 	now := time.Now()
 	timeSinceLastUpdate := now.Sub(state.lastUpdate)
 
-	// Estimate content growth since last update (rough)
-	contentGrowth := len(textChunk) // This chunk size
+	// Estimate content growth since last update
+	contentGrowth := len(delta)
 
 	shouldUpdate := false
-	if timeSinceLastUpdate >= 2*time.Second {
+	streamDisplayCount := len(b.formatStreamingDisplays(currentContent))
+	if streamDisplayCount > len(state.telegramMessages) {
+		// As soon as a new Telegram part is needed, update immediately so
+		// part 2/3... can begin streaming before completion.
+		shouldUpdate = true
+	} else if timeSinceLastUpdate >= 2*time.Second {
 		shouldUpdate = true
 	} else if timeSinceLastUpdate >= 500*time.Millisecond && contentGrowth >= 100 {
 		// Significant content growth, update more frequently
+		shouldUpdate = true
+	} else if len(state.telegramMessages) > 1 && timeSinceLastUpdate >= 500*time.Millisecond && contentGrowth > 0 {
+		// Once we are in multi-message streaming, keep incremental updates
+		// responsive for later parts.
 		shouldUpdate = true
 	} else if currentLength < 1000 && timeSinceLastUpdate >= 1*time.Second {
 		// For short content, update more frequently to show progress
@@ -2095,162 +2081,242 @@ func (b *Bot) handleStreamChunk(state *streamingState, textChunk string) error {
 
 	state.lastUpdate = now
 
-	// Format the content for display
-	displayContent := b.formatStreamingContent(currentContent)
-
-	// Update the Telegram message
-	b.updateTelegramMessage(state.telegramCtx, state.telegramMsg, displayContent)
+	streamDisplays := b.formatStreamingDisplays(currentContent)
+	b.updateStreamingTelegramMessages(state, streamDisplays)
 
 	return nil
 }
 
+func streamChunkDelta(existing, chunk string) string {
+	if chunk == "" {
+		return ""
+	}
+	if existing == "" {
+		return chunk
+	}
+
+	// Typical cumulative snapshot: chunk starts with all existing content.
+	if strings.HasPrefix(chunk, existing) {
+		return chunk[len(existing):]
+	}
+	// Stale or repeated shorter snapshot.
+	if strings.HasPrefix(existing, chunk) || strings.Contains(existing, chunk) {
+		return ""
+	}
+	// Chunk contains existing content in the middle (rare wrapper case).
+	if idx := strings.Index(chunk, existing); idx >= 0 {
+		return chunk[idx+len(existing):]
+	}
+
+	// Fallback to suffix/prefix overlap.
+	overlap := longestSuffixPrefixOverlap(existing, chunk)
+	if overlap > 0 {
+		return chunk[overlap:]
+	}
+	return chunk
+}
+
+func longestSuffixPrefixOverlap(left, right string) int {
+	max := len(left)
+	if len(right) < max {
+		max = len(right)
+	}
+	for i := max; i > 0; i-- {
+		if left[len(left)-i:] == right[:i] {
+			return i
+		}
+	}
+	return 0
+}
+
 // formatStreamingContent formats streaming content for display
-func (b *Bot) formatStreamingContent(content string) string {
+func (b *Bot) formatStreamingDisplays(content string) []string {
 	// Trim trailing whitespace
 	content = strings.TrimSpace(content)
 
 	if content == "" {
-		return "🤖 Processing..."
+		return []string{"🤖 Processing..."}
 	}
 
-	// Calculate approximate percentage complete based on content length
-	// This is a rough estimate since we don't know the total length
-	progressIndicator := "▌"
-	contentLength := len(content)
+	// Split full content into stable streaming pages so page 1 can keep updating
+	// until full, then page 2 starts streaming, and so on.
+	chunks := b.splitLongContent(content)
+	if len(chunks) == 0 {
+		return []string{"🤖 Processing..."}
+	}
 
-	// Simple heuristic: if content is getting long, show progress
-	var progressText string
+	displays := make([]string, 0, len(chunks))
+	progressText := b.streamingProgressText(len(content))
+	for i, chunk := range chunks {
+		if len(chunks) == 1 {
+			displays = append(displays, fmt.Sprintf("🤖▌\n%s%s", chunk, progressText))
+			continue
+		}
+		header := fmt.Sprintf("🤖 Part %d/%d", i+1, len(chunks))
+		if i == len(chunks)-1 {
+			displays = append(displays, fmt.Sprintf("%s ▌\n%s%s", header, chunk, progressText))
+		} else {
+			displays = append(displays, fmt.Sprintf("%s\n%s", header, chunk))
+		}
+	}
+	return displays
+}
+
+func (b *Bot) paginateDisplayText(content string, streaming bool) []string {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return []string{"🤖 Processing..."}
+	}
+
+	chunks := b.splitLongContent(content)
+	if len(chunks) <= 1 {
+		return []string{content}
+	}
+
+	displays := make([]string, 0, len(chunks))
+	for i, chunk := range chunks {
+		header := fmt.Sprintf("🤖 Part %d/%d", i+1, len(chunks))
+		if streaming && i == len(chunks)-1 {
+			displays = append(displays, fmt.Sprintf("%s ▌\n%s", header, chunk))
+		} else {
+			displays = append(displays, fmt.Sprintf("%s\n%s", header, chunk))
+		}
+	}
+	return displays
+}
+
+func (b *Bot) streamingProgressText(contentLength int) string {
+	// This is a rough estimate since we don't know total length.
 	if contentLength > 5000 {
-		progressText = " (streaming... ~80%)"
-	} else if contentLength > 3000 {
-		progressText = " (streaming... ~60%)"
-	} else if contentLength > 1500 {
-		progressText = " (streaming... ~40%)"
-	} else if contentLength > 500 {
-		progressText = " (streaming... ~20%)"
-	} else {
-		progressText = " (streaming...)"
+		return " (streaming... ~80%)"
+	}
+	if contentLength > 3000 {
+		return " (streaming... ~60%)"
+	}
+	if contentLength > 1500 {
+		return " (streaming... ~40%)"
+	}
+	if contentLength > 500 {
+		return " (streaming... ~20%)"
+	}
+	return " (streaming...)"
+}
+
+func (b *Bot) updateStreamingTelegramMessages(state *streamingState, displays []string) {
+	if len(displays) == 0 || state.telegramCtx == nil {
+		return
 	}
 
-	// If content is getting long, show a truncated version
-	displayContent := content
-	if len(displayContent) > 3000 {
-		// Show last 3000 characters to keep message readable
-		// Try to find a good truncation point (not in middle of line)
-		if len(displayContent) > 3000 {
-			truncated := displayContent
-			// Find the last newline before 3000 characters
-			cutPoint := 3000
-			if cutPoint < len(truncated) {
-				// Try to cut at a newline
-				newlineCut := strings.LastIndex(truncated[:cutPoint], "\n")
-				if newlineCut > 2500 { // Only use if it's not too far back
-					cutPoint = newlineCut
-				}
-			}
-			if cutPoint < len(truncated) {
-				displayContent = truncated[cutPoint:]
-				// Add ellipsis to show content was truncated
-				displayContent = "..." + displayContent
-			}
+	// Ensure we have enough Telegram messages.
+	for len(state.telegramMessages) < len(displays) {
+		idx := len(state.telegramMessages)
+		newMsg, err := state.telegramCtx.Bot().Send(state.telegramCtx.Chat(), displays[idx])
+		if err != nil {
+			log.Errorf("Failed to create additional streaming message #%d: %v", idx+1, err)
+			// Keep updating already-existing pages; we'll retry creating missing pages
+			// on the next update cycle.
+			displays = displays[:len(state.telegramMessages)]
+			break
+		}
+		state.telegramMessages = append(state.telegramMessages, newMsg)
+		state.lastRendered = append(state.lastRendered, displays[idx])
+	}
+
+	for i, display := range displays {
+		if i < len(state.lastRendered) && state.lastRendered[i] == display {
+			continue
+		}
+		b.updateTelegramMessage(state.telegramCtx, state.telegramMessages[i], display)
+		if i < len(state.lastRendered) {
+			state.lastRendered[i] = display
 		}
 	}
 
-	return fmt.Sprintf("🤖%s\n%s%s", progressIndicator, displayContent, progressText)
+	if len(state.telegramMessages) > 0 {
+		state.telegramMsg = state.telegramMessages[0]
+	}
 }
 
-// handleFinalResponse handles the final response after streaming is complete
-func (b *Bot) handleFinalResponse(c telebot.Context, msg *telebot.Message, content string) {
+// handleFinalResponse handles the final response after streaming is complete.
+func (b *Bot) handleFinalResponse(c telebot.Context, state *streamingState, content string) {
 	content = strings.TrimSpace(content)
 	if content == "" {
 		content = "🤖 Response completed."
 	}
 
-	// Check if content is too long for a single Telegram message
+	if state == nil || len(state.telegramMessages) == 0 {
+		msg, err := c.Bot().Send(c.Chat(), "🤖 Processing...")
+		if err != nil {
+			log.Errorf("Failed to create fallback message for final response: %v", err)
+			return
+		}
+		state = &streamingState{telegramMessages: []*telebot.Message{msg}}
+	}
+
+	// Check if content fits in one message.
 	if len(content) <= 3500 {
-		// Content fits in one message, just update it
 		finalMessage := fmt.Sprintf("✅ %s", content)
-		b.updateTelegramMessage(c, msg, finalMessage)
+		b.updateTelegramMessage(c, state.telegramMessages[0], finalMessage)
 		return
 	}
 
-	// Content is too long, we need to split it
-	// First, update the original message to indicate completion
-	b.updateTelegramMessage(c, msg, "✅ Response completed. Content is too long for one message, sending in parts...")
-
-	// Split the content into manageable chunks
+	// Content is too long: split and render all parts in-place.
 	chunks := b.splitLongContent(content)
+	if len(chunks) == 0 {
+		b.updateTelegramMessage(c, state.telegramMessages[0], "✅ Response completed.")
+		return
+	}
 
-	// Send each chunk as a separate message
+	// Ensure enough Telegram messages exist for all parts.
+	for len(state.telegramMessages) < len(chunks) {
+		newMsg, err := c.Bot().Send(c.Chat(), "🤖 Processing...")
+		if err != nil {
+			log.Errorf("Failed to create final response part message %d: %v", len(state.telegramMessages)+1, err)
+			return
+		}
+		state.telegramMessages = append(state.telegramMessages, newMsg)
+	}
+
 	for i, chunk := range chunks {
-		// Add header for multi-part messages
 		header := fmt.Sprintf("Part %d/%d:\n", i+1, len(chunks))
-		message := header + chunk
-
+		partText := header + chunk
 		if i == 0 {
-			// First chunk replaces the original message
-			b.updateTelegramMessage(c, msg, message)
-		} else {
-			// Subsequent chunks are new messages
-			_, err := c.Bot().Send(c.Chat(), message)
-			if err != nil {
-				log.Errorf("Failed to send message part %d: %v", i+1, err)
-				// Try to send error message
-				c.Bot().Send(c.Chat(), fmt.Sprintf("Failed to send part %d of response", i+1))
-			}
+			partText = "✅ " + partText
 		}
-
-		// Small delay between messages to avoid rate limiting
-		if i < len(chunks)-1 {
-			time.Sleep(500 * time.Millisecond)
-		}
+		b.updateTelegramMessage(c, state.telegramMessages[i], partText)
 	}
 }
 
 // splitLongContent splits long content into chunks that fit in Telegram messages
 func (b *Bot) splitLongContent(content string) []string {
 	const maxChunkSize = 3500
+	if content == "" {
+		return nil
+	}
+
 	var chunks []string
+	remaining := content
 
-	// Try to split at natural boundaries (paragraphs, code blocks)
-	lines := strings.Split(content, "\n")
-	currentChunk := strings.Builder{}
-	currentLength := 0
-
-	for _, line := range lines {
-		lineLength := len(line) + 1 // +1 for newline
-
-		// If adding this line would exceed the limit and we already have content,
-		// start a new chunk
-		if currentLength > 0 && currentLength+lineLength > maxChunkSize {
-			chunks = append(chunks, currentChunk.String())
-			currentChunk.Reset()
-			currentLength = 0
+	for len(remaining) > maxChunkSize {
+		window := remaining[:maxChunkSize]
+		splitAt := strings.LastIndex(window, "\n")
+		if splitAt <= 0 {
+			// No natural boundary in the window (or newline at position 0):
+			// hard-split to guarantee progress for long single-line content.
+			splitAt = maxChunkSize
 		}
 
-		// Add the line
-		if currentChunk.Len() > 0 {
-			currentChunk.WriteString("\n")
-			currentLength += 1
+		chunk := remaining[:splitAt]
+		chunks = append(chunks, chunk)
+
+		if splitAt < len(remaining) && remaining[splitAt] == '\n' {
+			splitAt++
 		}
-		currentChunk.WriteString(line)
-		currentLength += len(line)
+		remaining = remaining[splitAt:]
 	}
 
-	// Add the last chunk if there's any content
-	if currentChunk.Len() > 0 {
-		chunks = append(chunks, currentChunk.String())
-	}
-
-	// If we couldn't split nicely (e.g., one very long line), fall back to simple splitting
-	if len(chunks) == 0 && len(content) > 0 {
-		for i := 0; i < len(content); i += maxChunkSize {
-			end := i + maxChunkSize
-			if end > len(content) {
-				end = len(content)
-			}
-			chunks = append(chunks, content[i:end])
-		}
+	if remaining != "" {
+		chunks = append(chunks, remaining)
 	}
 
 	return chunks
