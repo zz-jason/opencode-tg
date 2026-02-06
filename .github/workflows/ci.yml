@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  test:
+  test-and-build:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -23,6 +23,26 @@ jobs:
 
     - name: Run tests
       run: make test
+
+    - name: Build bot
+      run: make build
+
+  integration-test:
+    runs-on: ubuntu-latest
+    needs: test-and-build
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.25'
+
+    - name: Install dependencies
+      run: go mod download
+
+    - name: Run integration test
+      run: make test-integration
 
   commit-message-check:
     if: github.event_name == 'pull_request'

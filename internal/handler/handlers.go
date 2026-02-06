@@ -2216,6 +2216,10 @@ func (b *Bot) formatLatestMessage(sessionID string, userID int64) (string, error
 
 // Close closes the bot and releases resources
 func (b *Bot) Close() error {
+	if b.cancel != nil {
+		b.cancel()
+	}
+
 	if b.sessionManager != nil {
 		return b.sessionManager.Close()
 	}

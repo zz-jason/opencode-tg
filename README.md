@@ -184,6 +184,13 @@ tg-bot/
 # Run all tests
 make test
 
+# Run integration tests for core bot commands.
+# If OPENCODE_BIN is unset, the test downloads and installs OpenCode automatically.
+make test-integration
+
+# Optional: use an existing OpenCode binary to skip install
+OPENCODE_BIN=/path/to/opencode make test-integration
+
 # Run specific package tests
 go test ./internal/config
 go test ./internal/opencode
