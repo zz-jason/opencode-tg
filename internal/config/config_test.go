@@ -27,7 +27,7 @@ timeout = 30
 
 [storage]
 type = "file"
-sqlite_path = "sessions.db"
+file_path = "bot-state.json"
 
 [logging]
 level = "info"
@@ -106,8 +106,8 @@ url = "http://192.168.50.100:8080"
 	if cfg.Storage.Type != "file" {
 		t.Errorf("Expected default storage type 'file', got %s", cfg.Storage.Type)
 	}
-	if cfg.Storage.FilePath != "sessions.json" {
-		t.Errorf("Expected default file path 'sessions.json', got %s", cfg.Storage.FilePath)
+	if cfg.Storage.FilePath != "bot-state.json" {
+		t.Errorf("Expected default file path 'bot-state.json', got %s", cfg.Storage.FilePath)
 	}
 	if cfg.Logging.Level != "info" {
 		t.Errorf("Expected default log level 'info', got %s", cfg.Logging.Level)

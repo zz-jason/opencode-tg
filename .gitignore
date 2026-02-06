@@ -13,6 +13,10 @@ bot.log
 bot.log.old
 *.log
 
+# Local runtime state
+bot-state.json
+sessions.json
+
 # Design documents
 DESIGN.md
 AGENTS.md

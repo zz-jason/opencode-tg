@@ -273,7 +273,7 @@ func TestIntegration_HandleCoreCommands(t *testing.T) {
 		},
 		Storage: config.StorageConfig{
 			Type:     "file",
-			FilePath: filepath.Join(tmpDir, "sessions.json"),
+			FilePath: filepath.Join(tmpDir, "bot-state.json"),
 		},
 		Logging: config.LoggingConfig{
 			Level:  "error",
@@ -440,7 +440,7 @@ func TestIntegration_HandleCoreCommandsTextFallback(t *testing.T) {
 		},
 		Storage: config.StorageConfig{
 			Type:     "file",
-			FilePath: filepath.Join(t.TempDir(), "sessions.json"),
+			FilePath: filepath.Join(t.TempDir(), "bot-state.json"),
 		},
 		Logging: config.LoggingConfig{
 			Level:  "error",
@@ -607,7 +607,7 @@ func TestIntegration_HandleCoreCommandsRealtimeUpdate(t *testing.T) {
 		},
 		Storage: config.StorageConfig{
 			Type:     "file",
-			FilePath: filepath.Join(t.TempDir(), "sessions.json"),
+			FilePath: filepath.Join(t.TempDir(), "bot-state.json"),
 		},
 		Logging: config.LoggingConfig{
 			Level:  "error",

@@ -16,7 +16,7 @@ timeout = 30
 
 [storage]
 type = "file"  # only "file" storage is supported
-sqlite_path = "sessions.json"  # path to JSON file for session storage
+file_path = "bot-state.json"  # path to JSON file for session storage
 
 [logging]
 level = "info"

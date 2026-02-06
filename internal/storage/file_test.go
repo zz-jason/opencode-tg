@@ -35,6 +35,46 @@ func TestNewFileStore(t *testing.T) {
 	}
 }
 
+func TestNewFileStore_MigratesLegacySessionsJSON(t *testing.T) {
+	tmpDir := t.TempDir()
+	legacyPath := filepath.Join(tmpDir, "sessions.json")
+	newPath := filepath.Join(tmpDir, "bot-state.json")
+
+	legacyStore, err := NewFileStore(legacyPath)
+	if err != nil {
+		t.Fatalf("failed to create legacy store: %v", err)
+	}
+	if err := legacyStore.StoreUserSession(7, "session-legacy"); err != nil {
+		t.Fatalf("failed to seed legacy store: %v", err)
+	}
+	legacyStore.Close()
+
+	if _, err := os.Stat(legacyPath); err != nil {
+		t.Fatalf("expected legacy file to exist before migration: %v", err)
+	}
+
+	store, err := NewFileStore(newPath)
+	if err != nil {
+		t.Fatalf("failed to create store on new path: %v", err)
+	}
+	defer store.Close()
+
+	if _, err := os.Stat(newPath); err != nil {
+		t.Fatalf("expected migrated file to exist at new path: %v", err)
+	}
+	if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
+		t.Fatalf("expected legacy file to be moved, stat error=%v", err)
+	}
+
+	sessionID, exists, err := store.GetUserSession(7)
+	if err != nil {
+		t.Fatalf("failed to read migrated session: %v", err)
+	}
+	if !exists || sessionID != "session-legacy" {
+		t.Fatalf("unexpected migrated data: exists=%v sessionID=%q", exists, sessionID)
+	}
+}
+
 func TestNewFileStore_LoadExisting(t *testing.T) {
 	path := createTempFile(t)
 

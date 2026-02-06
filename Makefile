@@ -20,8 +20,8 @@ clean:
 	rm -f tg-bot-linux-amd64
 	rm -f tg-bot-darwin-amd64
 	rm -f bot.log
-	rm -f sessions.db
 	rm -f sessions.json
+	rm -f bot-state.json
 
 # Run the bot
 run: build

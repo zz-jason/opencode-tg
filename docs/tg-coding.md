@@ -81,8 +81,8 @@ url = "http://192.168.50.100:8080"
 timeout = 30
 
 [storage]
-type = "memory"  # or "sqlite"
-sqlite_path = "sessions.db"
+type = "file"
+file_path = "bot-state.json"
 
 [logging]
 level = "info"

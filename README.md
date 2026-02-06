@@ -68,8 +68,8 @@ url = "http://192.168.50.100:8080"
 timeout = 300  # Increased timeout for long-running tasks
 
 [storage]
-type = "memory"  # or "sqlite"
-sqlite_path = "sessions.db"
+type = "file"
+file_path = "bot-state.json"
 
 [logging]
 level = "info"
@@ -228,8 +228,8 @@ go test ./internal/session
 - `timeout`: API request timeout in seconds (increased to 300 for long tasks)
 
 ### Storage Configuration
-- `type`: Storage type (`memory` or `sqlite`)
-- `sqlite_path`: SQLite database path (when type=sqlite)
+- `type`: Storage type (`file`)
+- `file_path`: JSON state file path (when type=file)
 
 ### Logging Configuration
 - `level`: Log level (debug, info, warn, error)
@@ -252,10 +252,10 @@ go test ./internal/session
 ### ⚠️ Known Limitations
 - Search APIs (`/search`, `/findfile`, `/symbol`) return "API not available" messages as OpenCode search endpoints return HTML instead of JSON
 - Some advanced OpenCode features may not be available via API
-- Session persistence is memory-only (optional SQLite support available)
+- Session state uses local JSON file storage by default (`bot-state.json`)
 
 ### 🔧 Technical Details
-- **Message Updates**: Uses 5-second periodic polling to update message status
+- **Message Updates**: Uses 2-second periodic polling to update message status
 - **Tool Call Display**: Attempts to parse JSON snapshots to show tool names and arguments
 - **Timeout Handling**: Increased to 300 seconds to accommodate long-running tasks
 - **Proxy Configuration**: Explicit proxy settings to avoid proxy interference with local OpenCode connections

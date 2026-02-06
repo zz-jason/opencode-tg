@@ -29,7 +29,7 @@ type SessionMeta = storage.SessionMeta
 func NewManager(client *opencode.Client) *Manager {
 	store, err := storage.NewStore(storage.Options{
 		Type:     "file",
-		FilePath: "sessions.json",
+		FilePath: "bot-state.json",
 	})
 	if err != nil {
 		// Panic since this is a programming error - storage should always be available

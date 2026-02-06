@@ -101,7 +101,7 @@ func mockOpenCodeServer(t *testing.T) *httptest.Server {
 // createTestManager creates a manager with file storage in a temporary directory
 func createTestManager(t *testing.T, client *opencode.Client) *Manager {
 	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "sessions.json")
+	path := filepath.Join(tmpDir, "bot-state.json")
 	store, err := storage.NewStore(storage.Options{
 		Type:     "file",
 		FilePath: path,
