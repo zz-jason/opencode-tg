@@ -60,6 +60,12 @@ func (m *Manager) Initialize(ctx context.Context) error {
 	} else {
 		log.Infof("Found %d sessions in OpenCode", len(sessions))
 		for _, ocSession := range sessions {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+
 			// Use getOrCreateSessionMeta to ensure session metadata is stored
 			// We use 0 as userID since we don't know the owner at initialization
 			// getOrCreateSessionMeta will determine ownership from metadata
@@ -76,6 +82,12 @@ func (m *Manager) Initialize(ctx context.Context) error {
 
 	log.Infof("Found %d models in OpenCode", len(models))
 	for _, model := range models {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		meta := &storage.ModelMeta{
 			ID:          model.ID,
 			ProviderID:  model.ProviderID,

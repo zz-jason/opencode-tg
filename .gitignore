@@ -1,6 +1,8 @@
 # Binaries
-tg-bot
-bot
+/tg-bot
+/bot
+/tg-bot-linux-amd64
+/tg-bot-darwin-amd64
 bin/
 
 # Configurations
