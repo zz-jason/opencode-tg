@@ -268,3 +268,56 @@ func TestErrorResponse(t *testing.T) {
 		t.Errorf("Expected error %q, got %v", expectedError, err)
 	}
 }
+
+func TestExtractTextChunksFromStreamEvent(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+		want []string
+	}{
+		{
+			name: "parts with text",
+			data: `{"parts":[{"type":"text","text":"hello"},{"type":"tool","text":"ignored"}]}`,
+			want: []string{"hello", "ignored"},
+		},
+		{
+			name: "delta payload",
+			data: `{"type":"delta","delta":"partial chunk"}`,
+			want: []string{"partial chunk"},
+		},
+		{
+			name: "nested content",
+			data: `{"event":{"content":"final content"}}`,
+			want: []string{"final content"},
+		},
+		{
+			name: "raw text fallback",
+			data: `not-json-payload`,
+			want: []string{"not-json-payload"},
+		},
+		{
+			name: "empty payload",
+			data: `   `,
+			want: nil,
+		},
+		{
+			name: "json event without text should be ignored",
+			data: `{"event":"start"}`,
+			want: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractTextChunksFromStreamEvent(tt.data)
+			if len(got) != len(tt.want) {
+				t.Fatalf("expected %d chunks, got %d (%v)", len(tt.want), len(got), got)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Fatalf("expected chunk %d to be %q, got %q", i, tt.want[i], got[i])
+				}
+			}
+		})
+	}
+}

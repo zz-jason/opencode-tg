@@ -530,10 +530,10 @@ func (c *Client) StreamMessage(ctx context.Context, sessionID string, content st
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
 
-	// Create a client with longer timeout for streaming
-	streamClient := &http.Client{
-		Timeout: 600 * time.Second, // 10 minutes for streaming
-	}
+	// Reuse base client transport (notably proxy bypass for local OpenCode),
+	// but with longer timeout for long-running streaming tasks.
+	streamClient := *c.client
+	streamClient.Timeout = 600 * time.Second // 10 minutes for streaming
 
 	resp, err := streamClient.Do(req)
 	if err != nil {
@@ -576,27 +576,9 @@ func (c *Client) StreamMessage(ctx context.Context, sessionID string, content st
 				// Empty line indicates end of event
 				if line == "" {
 					if eventData.Len() > 0 {
-						// Parse the event data as JSON to extract text
-						var event map[string]interface{}
-						if err := json.Unmarshal([]byte(eventData.String()), &event); err == nil {
-							// Try to extract text from parts
-							if parts, ok := event["parts"].([]interface{}); ok {
-								for _, part := range parts {
-									if partMap, ok := part.(map[string]interface{}); ok {
-										if partType, ok := partMap["type"].(string); ok && partType == "text" {
-											if text, ok := partMap["text"].(string); ok && text != "" {
-												if err := callback(text); err != nil {
-													return err
-												}
-
-											}
-										}
-									}
-								}
-							}
-						} else {
-							// If not JSON, send raw data
-							if err := callback(eventData.String()); err != nil {
+						textChunks := extractTextChunksFromStreamEvent(eventData.String())
+						for _, text := range textChunks {
+							if err := callback(text); err != nil {
 								return err
 							}
 						}
@@ -637,6 +619,76 @@ func (c *Client) StreamMessage(ctx context.Context, sessionID string, content st
 	}
 
 	return nil
+}
+
+func extractTextChunksFromStreamEvent(data string) []string {
+	data = strings.TrimSpace(data)
+	if data == "" {
+		return nil
+	}
+
+	var payload interface{}
+	if err := json.Unmarshal([]byte(data), &payload); err != nil {
+		return []string{data}
+	}
+
+	chunks := make([]string, 0, 4)
+	seen := make(map[string]struct{}, 4)
+
+	var visit func(interface{})
+	visit = func(v interface{}) {
+		switch value := v.(type) {
+		case map[string]interface{}:
+			// Common stream payload shape: {"parts":[...]}
+			if parts, ok := value["parts"]; ok {
+				visit(parts)
+			}
+
+			// Common delta payloads: {"type":"text","text":"..."} etc.
+			if text, ok := value["text"].(string); ok {
+				text = strings.TrimSpace(text)
+				if text != "" {
+					if _, exists := seen[text]; !exists {
+						seen[text] = struct{}{}
+						chunks = append(chunks, text)
+					}
+				}
+			}
+			if text, ok := value["delta"].(string); ok {
+				text = strings.TrimSpace(text)
+				if text != "" {
+					if _, exists := seen[text]; !exists {
+						seen[text] = struct{}{}
+						chunks = append(chunks, text)
+					}
+				}
+			}
+			if text, ok := value["content"].(string); ok {
+				text = strings.TrimSpace(text)
+				if text != "" {
+					if _, exists := seen[text]; !exists {
+						seen[text] = struct{}{}
+						chunks = append(chunks, text)
+					}
+				}
+			}
+
+			// Traverse nested objects/arrays to handle wrapped payloads.
+			for _, nested := range value {
+				visit(nested)
+			}
+		case []interface{}:
+			for _, item := range value {
+				visit(item)
+			}
+		}
+	}
+
+	visit(payload)
+	if len(chunks) == 0 {
+		return nil
+	}
+	return chunks
 }
 
 // SearchResult represents a search result

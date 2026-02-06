@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -286,16 +287,22 @@ func (b *Bot) handleSessions(c telebot.Context) error {
 		}
 
 		// Add separator line (fixed length)
-		sb.WriteString("════════════════\n")
+		sb.WriteString("────────────────\n")
 
 		// Add session details with bullet points
 		sb.WriteString(fmt.Sprintf("• Created: %s\n", sess.CreatedAt.Format("2006-01-02 15:04")))
 		sb.WriteString(fmt.Sprintf("• Last used: %s\n", sess.LastUsedAt.Format("2006-01-02 15:04")))
 		sb.WriteString(fmt.Sprintf("• Messages: %d\n", sess.MessageCount))
 
-		// Add model information if available
+		// Add model information
 		if sess.ProviderID != "" && sess.ModelID != "" {
 			sb.WriteString(fmt.Sprintf("• Model: %s/%s\n", sess.ProviderID, sess.ModelID))
+		} else if sess.ModelID != "" {
+			sb.WriteString(fmt.Sprintf("• Model: %s\n", sess.ModelID))
+		} else if sess.ProviderID != "" {
+			sb.WriteString(fmt.Sprintf("• Model: %s\n", sess.ProviderID))
+		} else {
+			sb.WriteString("• Model: Default\n")
 		}
 
 		// Add empty line between sessions
@@ -429,7 +436,7 @@ func (b *Bot) handleCurrent(c telebot.Context) error {
 
 	var sb strings.Builder
 	sb.WriteString("📁 Current Session\n")
-	sb.WriteString("════════════════\n")
+	sb.WriteString("────────────────\n")
 
 	// Show session info in bullet points (same format as /status)
 	sb.WriteString(fmt.Sprintf("• Name: %s\n", meta.Name))
@@ -464,7 +471,7 @@ func (b *Bot) handleCurrent(c telebot.Context) error {
 		timeStr := msg.CreatedAt.Format("15:04")
 
 		sb.WriteString(fmt.Sprintf("[Message 0] %s [%s]\n", role, timeStr))
-		sb.WriteString("════════════════\n")
+		sb.WriteString("────────────────\n")
 
 		// Show message content
 		if len(msg.Parts) > 0 {
@@ -864,7 +871,7 @@ func (b *Bot) handleStatus(c telebot.Context) error {
 
 	var sb strings.Builder
 	sb.WriteString("📊 Session Status\n")
-	sb.WriteString("════════════════\n")
+	sb.WriteString("────────────────\n")
 
 	// Show session info
 	session, err := b.opencodeClient.GetSession(b.ctx, sessionID)
@@ -896,7 +903,7 @@ func (b *Bot) handleStatus(c telebot.Context) error {
 		timeStr := msg.CreatedAt.Format("15:04")
 
 		sb.WriteString(fmt.Sprintf("\n[Message %d] %s [%s]\n", relIndex, role, timeStr))
-		sb.WriteString("════════════════\n")
+		sb.WriteString("────────────────\n")
 
 		// Show message content
 		if len(msg.Parts) > 0 {
@@ -945,7 +952,7 @@ func (b *Bot) handleModels(c telebot.Context) error {
 	}
 
 	var sb strings.Builder
-	sb.WriteString("🤖 Available AI Models\n\n")
+	sb.WriteString("📋 Connected Providers\n\n")
 
 	// Create a set of connected provider IDs for faster lookup
 	connectedSet := make(map[string]bool)
@@ -953,27 +960,49 @@ func (b *Bot) handleModels(c telebot.Context) error {
 		connectedSet[providerID] = true
 	}
 
-	// Track if we found any models
-	foundAnyModels := false
+	// Collect connected providers that actually expose models.
+	connectedProviders := make([]opencode.Provider, 0, len(providersResp.All))
+	for _, provider := range providersResp.All {
+		if connectedSet[provider.ID] && len(provider.Models) > 0 {
+			connectedProviders = append(connectedProviders, provider)
+		}
+	}
 
-	// Map to store model ID mapping (sequential integer -> model selection)
-	modelCounter := 1
+	// Keep display order stable across calls.
+	sort.Slice(connectedProviders, func(i, j int) bool {
+		if strings.EqualFold(connectedProviders[i].Name, connectedProviders[j].Name) {
+			return connectedProviders[i].ID < connectedProviders[j].ID
+		}
+		return strings.ToLower(connectedProviders[i].Name) < strings.ToLower(connectedProviders[j].Name)
+	})
+
+	modelCounter := 1 // sequential integer -> model selection
 	modelMapping := make(map[int]modelSelection)
 
-	// First, show models from connected providers
-	for _, provider := range providersResp.All {
-		if !connectedSet[provider.ID] {
-			continue // Skip unconnected providers
-		}
+	if len(connectedProviders) == 0 {
+		sb.WriteString("⚠️ No connected AI providers.\n")
+		sb.WriteString("Please configure API keys for at least one AI provider first.\n\n")
+		sb.WriteString("Use /providers to view provider connection status.")
+		b.storeModelMapping(c.Sender().ID, modelMapping)
+		return c.Send(sb.String())
+	}
 
-		if len(provider.Models) == 0 {
-			continue
-		}
+	for _, provider := range connectedProviders {
+		sb.WriteString(fmt.Sprintf("%s (%s)\n", provider.Name, provider.ID))
+		sb.WriteString("────────────────\n")
 
-		foundAnyModels = true
-		sb.WriteString(fmt.Sprintf("🏷️ %s\n", provider.Name))
-
+		models := make([]opencode.Model, 0, len(provider.Models))
 		for _, model := range provider.Models {
+			models = append(models, model)
+		}
+		sort.Slice(models, func(i, j int) bool {
+			if strings.EqualFold(models[i].Name, models[j].Name) {
+				return models[i].ID < models[j].ID
+			}
+			return strings.ToLower(models[i].Name) < strings.ToLower(models[j].Name)
+		})
+
+		for _, model := range models {
 			// Store mapping
 			modelMapping[modelCounter] = modelSelection{
 				ProviderID: provider.ID,
@@ -981,40 +1010,16 @@ func (b *Bot) handleModels(c telebot.Context) error {
 				ModelName:  model.Name,
 			}
 
-			sb.WriteString(fmt.Sprintf("  %d. %s\n", modelCounter, model.Name))
+			sb.WriteString(fmt.Sprintf("%d. %s\n", modelCounter, model.Name))
+
 			modelCounter++
 		}
-		sb.WriteString("----\n")
-	}
 
-	// If no connected providers, show a message
-	if !foundAnyModels {
-		sb.WriteString("⚠️ No connected AI providers.\n")
-		sb.WriteString("Please configure API keys for at least one AI provider first.\n\n")
-
-		// Show all available providers for reference
-		sb.WriteString("Configurable AI providers:\n")
-		for _, provider := range providersResp.All {
-			sb.WriteString(fmt.Sprintf("  • %s (%s)\n", provider.Name, provider.ID))
-			if len(provider.Env) > 0 {
-				sb.WriteString(fmt.Sprintf("    Environment variables required: %s\n", strings.Join(provider.Env, ", ")))
-			}
-		}
 		sb.WriteString("\n")
-	} else {
-		// Remove the last "----" separator
-		resultStr := sb.String()
-		if strings.HasSuffix(resultStr, "----\n") {
-			resultStr = strings.TrimSuffix(resultStr, "----\n")
-			sb.Reset()
-			sb.WriteString(resultStr)
-		}
-
-		// Add usage instructions
-		sb.WriteString("\n📝 Usage Instructions:\n")
-		sb.WriteString("• Use /setmodel <number> to set model for current session\n")
-		sb.WriteString("• Use /newmodel <name> <number> to create new session with specified model\n")
 	}
+
+	sb.WriteString("Use /setmodel <number> to set model for current session.\n")
+	sb.WriteString("Use /newmodel <name> <number> to create new session with selected model.")
 
 	// Store the model mapping in the bot context (for this user)
 	// We'll store it in a simple way for now - could be enhanced with persistence
@@ -1210,7 +1215,6 @@ func (b *Bot) handleText(c telebot.Context) error {
 	b.streamingStateMu.Lock()
 	if existingState, ok := b.streamingStates[sessionID]; ok && existingState.isStreaming {
 		existingState.cancel()
-		close(existingState.stopUpdates)
 		existingState.isStreaming = false
 		log.Infof("Cancelled existing streaming for session %s before starting new request", sessionID)
 	}
@@ -1228,7 +1232,14 @@ func (b *Bot) handleText(c telebot.Context) error {
 
 	// Channel to signal when to stop updates
 	stopUpdates := make(chan struct{})
-	defer close(stopUpdates)
+	stopUpdatesClosed := false
+	defer func() {
+		if !stopUpdatesClosed {
+			close(stopUpdates)
+		}
+	}()
+	periodicCtx, cancelPeriodic := context.WithCancel(ctx)
+	defer cancelPeriodic()
 
 	// Track streaming state
 	streamingState := &streamingState{
@@ -1261,8 +1272,24 @@ func (b *Bot) handleText(c telebot.Context) error {
 		return b.handleStreamChunk(streamingState, textChunk)
 	}
 
+	// Start periodic polling updates as a fallback channel for OpenCode outputs
+	// that may not be emitted as text chunks in SSE events.
+	periodicDone := make(chan struct{})
+	go func() {
+		defer close(periodicDone)
+		b.periodicMessageUpdates(periodicCtx, c, processingMsg, sessionID, stopUpdates)
+	}()
+
 	// Start streaming the message
 	err = b.opencodeClient.StreamMessage(ctx, sessionID, text, streamCallback)
+	cancelPeriodic()
+	close(stopUpdates)
+	stopUpdatesClosed = true
+	select {
+	case <-periodicDone:
+	case <-time.After(2 * time.Second):
+		log.Warnf("Timed out waiting for periodic updater to stop for session %s", sessionID)
+	}
 	if err != nil {
 		log.Errorf("Failed to stream message: %v", err)
 
@@ -1289,6 +1316,14 @@ func (b *Bot) handleText(c telebot.Context) error {
 	// Get final content
 	finalContent := streamingState.content.String()
 	if finalContent == "" {
+		fallbackContent, fallbackErr := b.waitForLatestAssistantContent(sessionID, 10*time.Second)
+		if fallbackErr != nil {
+			log.Warnf("Failed to fetch latest assistant content for fallback: %v", fallbackErr)
+		} else if fallbackContent != "" {
+			finalContent = fallbackContent
+		}
+	}
+	if finalContent == "" {
 		finalContent = "🤖 Response completed with no content."
 	}
 
@@ -1312,6 +1347,61 @@ func (b *Bot) handleText(c telebot.Context) error {
 	}
 
 	return nil
+}
+
+func (b *Bot) waitForLatestAssistantContent(sessionID string, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+
+	for time.Now().Before(deadline) {
+		content, err := b.getLatestAssistantContent(sessionID)
+		if err != nil {
+			lastErr = err
+		} else if content != "" {
+			return content, nil
+		}
+
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	// Final immediate check at timeout boundary.
+	content, err := b.getLatestAssistantContent(sessionID)
+	if err != nil {
+		if lastErr != nil {
+			return "", lastErr
+		}
+		return "", err
+	}
+	return content, nil
+}
+
+func (b *Bot) getLatestAssistantContent(sessionID string) (string, error) {
+	messages, err := b.opencodeClient.GetMessages(b.ctx, sessionID)
+	if err != nil {
+		return "", err
+	}
+
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg := messages[i]
+		if msg.Role != "assistant" {
+			continue
+		}
+
+		content := strings.TrimSpace(msg.Content)
+		if content != "" {
+			return content, nil
+		}
+
+		if len(msg.Parts) == 0 {
+			continue
+		}
+		parts := strings.TrimSpace(formatMessageParts(msg.Parts))
+		if parts != "" && parts != "No detailed content" {
+			return parts, nil
+		}
+	}
+
+	return "", nil
 }
 
 // The following handlers are stubs for future implementation
@@ -1683,8 +1773,8 @@ func (b *Bot) clearModelMapping(userID int64) {
 
 // periodicMessageUpdates periodically updates a message with the latest session status
 func (b *Bot) periodicMessageUpdates(ctx context.Context, c telebot.Context, msg *telebot.Message, sessionID string, stopCh <-chan struct{}) {
-	// Ticker for periodic updates (every 5 seconds)
-	ticker := time.NewTicker(5 * time.Second)
+	// Ticker for periodic updates (every 2 seconds)
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	// Track the last message ID we've processed to avoid repeated updates
@@ -2196,9 +2286,9 @@ func (b *Bot) formatLatestMessage(sessionID string, userID int64) (string, error
 
 	var sb strings.Builder
 	sb.WriteString("📋 Latest Message Details\n")
-	sb.WriteString("════════════════\n")
+	sb.WriteString("────────────────\n")
 	sb.WriteString(fmt.Sprintf("[Message 0] %s [%s]\n", role, timeStr))
-	sb.WriteString("════════════════\n")
+	sb.WriteString("────────────────\n")
 
 	// Show detailed parts
 	partsStr := formatMessageParts(latestMsg.Parts)

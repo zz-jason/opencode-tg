@@ -133,6 +133,67 @@ func waitForTelegramMessage(t *testing.T, ch <-chan string) string {
 	}
 }
 
+func waitForTelegramMessageWithPrefix(t *testing.T, ch <-chan string, prefix string, timeout time.Duration) string {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		remaining := time.Until(deadline)
+		select {
+		case msg := <-ch:
+			if strings.HasPrefix(msg, prefix) {
+				return msg
+			}
+		case <-time.After(minDuration(remaining, 500*time.Millisecond)):
+		}
+	}
+
+	t.Fatalf("timed out waiting for telegram message with prefix %q", prefix)
+	return ""
+}
+
+func waitForTelegramMessageContaining(t *testing.T, ch <-chan string, needle string, timeout time.Duration) (string, time.Time) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		remaining := time.Until(deadline)
+		select {
+		case msg := <-ch:
+			if strings.Contains(msg, needle) {
+				return msg, time.Now()
+			}
+		case <-time.After(minDuration(remaining, 500*time.Millisecond)):
+		}
+	}
+
+	t.Fatalf("timed out waiting for telegram message containing %q", needle)
+	return "", time.Time{}
+}
+
+func assertNoTelegramMessageContaining(t *testing.T, ch <-chan string, needle string, duration time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(duration)
+	for time.Now().Before(deadline) {
+		remaining := time.Until(deadline)
+		select {
+		case msg := <-ch:
+			if strings.Contains(msg, needle) {
+				t.Fatalf("unexpected telegram message containing %q: %s", needle, msg)
+			}
+		case <-time.After(minDuration(remaining, 300*time.Millisecond)):
+		}
+	}
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func runCommand(t *testing.T, tgBot *telebot.Bot, out <-chan string, userID int64, updateID int, text string) string {
 	t.Helper()
 	tgBot.ProcessUpdate(telebot.Update{
@@ -258,6 +319,351 @@ func TestIntegration_HandleCoreCommands(t *testing.T) {
 
 	resp = runCommand(t, tgBot, rec.messages, userID, 7, "/status")
 	assertContains(t, resp, "Current session has no messages yet.")
+}
+
+func TestIntegration_HandleCoreCommandsTextFallback(t *testing.T) {
+	t.Helper()
+
+	var (
+		mu             sync.Mutex
+		sessionID      = "session-fallback-1"
+		messageReadyAt time.Time
+	)
+
+	opencodeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/global/health":
+			w.WriteHeader(http.StatusOK)
+			return
+
+		case r.Method == "GET" && r.URL.Path == "/provider":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"all": []map[string]interface{}{},
+			})
+			return
+
+		case r.Method == "GET" && r.URL.Path == "/session":
+			_ = json.NewEncoder(w).Encode([]map[string]interface{}{})
+			return
+
+		case r.Method == "POST" && r.URL.Path == "/session":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"id":    sessionID,
+				"title": "Telegram Session",
+				"time": map[string]interface{}{
+					"created": time.Now().UnixMilli(),
+					"updated": time.Now().UnixMilli(),
+				},
+			})
+			return
+
+		case r.Method == "POST" && r.URL.Path == "/session/"+sessionID+"/message":
+			// Simulate stream events with no text payload.
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			flusher, _ := w.(http.Flusher)
+			_, _ = io.WriteString(w, "data: {\"event\":\"start\"}\n\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+
+			mu.Lock()
+			messageReadyAt = time.Now().Add(1200 * time.Millisecond)
+			mu.Unlock()
+			return
+
+		case r.Method == "GET" && r.URL.Path == "/session/"+sessionID+"/message":
+			mu.Lock()
+			ready := !messageReadyAt.IsZero() && time.Now().After(messageReadyAt)
+			mu.Unlock()
+
+			if !ready {
+				_ = json.NewEncoder(w).Encode([]map[string]interface{}{})
+				return
+			}
+
+			_ = json.NewEncoder(w).Encode([]map[string]interface{}{
+				{
+					"info": map[string]interface{}{
+						"id":        "msg-assistant-1",
+						"sessionID": sessionID,
+						"role":      "assistant",
+						"time": map[string]interface{}{
+							"created": time.Now().UnixMilli(),
+						},
+						"finish": "stop",
+					},
+					"parts": []map[string]interface{}{
+						{
+							"id":        "part-1",
+							"sessionID": sessionID,
+							"messageID": "msg-assistant-1",
+							"type":      "text",
+							"text":      "Fallback assistant reply",
+						},
+					},
+				},
+			})
+			return
+		}
+
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer opencodeServer.Close()
+
+	rec := newTelegramRecorder(t)
+	tgServer := httptest.NewServer(http.HandlerFunc(rec.serveHTTP))
+	defer tgServer.Close()
+
+	tgBot, err := telebot.NewBot(telebot.Settings{
+		Token:       "integration-token",
+		URL:         tgServer.URL,
+		Client:      tgServer.Client(),
+		Offline:     true,
+		Synchronous: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to create telegram bot: %v", err)
+	}
+
+	cfg := &config.Config{
+		Telegram: config.TelegramConfig{
+			Token:          "integration-token",
+			PollingTimeout: 5,
+			PollingLimit:   100,
+		},
+		OpenCode: config.OpenCodeConfig{
+			URL:     opencodeServer.URL,
+			Timeout: 30,
+		},
+		Storage: config.StorageConfig{
+			Type:     "file",
+			FilePath: filepath.Join(t.TempDir(), "sessions.json"),
+		},
+		Logging: config.LoggingConfig{
+			Level:  "error",
+			Output: "stdout",
+		},
+	}
+
+	bot, err := NewBot(cfg)
+	if err != nil {
+		t.Fatalf("failed to create handler bot: %v", err)
+	}
+	defer func() {
+		if closeErr := bot.Close(); closeErr != nil {
+			t.Fatalf("failed to close handler bot: %v", closeErr)
+		}
+	}()
+
+	bot.SetTelegramBot(tgBot)
+	bot.Start()
+
+	const userID int64 = 20002
+	tgBot.ProcessUpdate(telebot.Update{
+		ID: 101,
+		Message: &telebot.Message{
+			ID:       101,
+			Text:     "please solve this task",
+			Unixtime: time.Now().Unix(),
+			Sender: &telebot.User{
+				ID:        userID,
+				FirstName: "Integration",
+			},
+			Chat: &telebot.Chat{
+				ID:   userID,
+				Type: telebot.ChatPrivate,
+			},
+		},
+	})
+
+	finalMsg := waitForTelegramMessageWithPrefix(t, rec.messages, "✅", 20*time.Second)
+	if strings.Contains(finalMsg, "Response completed with no content") {
+		t.Fatalf("unexpected empty response fallback: %s", finalMsg)
+	}
+	assertContains(t, finalMsg, "Fallback assistant reply")
+}
+
+func TestIntegration_HandleCoreCommandsRealtimeUpdate(t *testing.T) {
+	t.Helper()
+
+	var (
+		mu             sync.Mutex
+		sessionID      = "session-realtime-1"
+		messageReadyAt time.Time
+	)
+
+	opencodeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/global/health":
+			w.WriteHeader(http.StatusOK)
+			return
+
+		case r.Method == "GET" && r.URL.Path == "/provider":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"all": []map[string]interface{}{},
+			})
+			return
+
+		case r.Method == "GET" && r.URL.Path == "/session":
+			_ = json.NewEncoder(w).Encode([]map[string]interface{}{})
+			return
+
+		case r.Method == "POST" && r.URL.Path == "/session":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"id":    sessionID,
+				"title": "Telegram Session",
+				"time": map[string]interface{}{
+					"created": time.Now().UnixMilli(),
+					"updated": time.Now().UnixMilli(),
+				},
+			})
+			return
+
+		case r.Method == "POST" && r.URL.Path == "/session/"+sessionID+"/message":
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			flusher, _ := w.(http.Flusher)
+			_, _ = io.WriteString(w, "data: {\"event\":\"start\"}\n\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+
+			mu.Lock()
+			messageReadyAt = time.Now().Add(1200 * time.Millisecond)
+			mu.Unlock()
+
+			// Keep stream alive for a while to verify realtime polling updates
+			// can update Telegram message before stream completion.
+			time.Sleep(4 * time.Second)
+			return
+
+		case r.Method == "GET" && r.URL.Path == "/session/"+sessionID+"/message":
+			mu.Lock()
+			ready := !messageReadyAt.IsZero() && time.Now().After(messageReadyAt)
+			mu.Unlock()
+
+			if !ready {
+				_ = json.NewEncoder(w).Encode([]map[string]interface{}{})
+				return
+			}
+
+			_ = json.NewEncoder(w).Encode([]map[string]interface{}{
+				{
+					"info": map[string]interface{}{
+						"id":        "msg-assistant-realtime",
+						"sessionID": sessionID,
+						"role":      "assistant",
+						"time": map[string]interface{}{
+							"created": time.Now().UnixMilli(),
+						},
+					},
+					"parts": []map[string]interface{}{
+						{
+							"id":        "part-realtime",
+							"sessionID": sessionID,
+							"messageID": "msg-assistant-realtime",
+							"type":      "text",
+							"text":      "Realtime assistant reply",
+						},
+					},
+				},
+			})
+			return
+		}
+
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer opencodeServer.Close()
+
+	rec := newTelegramRecorder(t)
+	tgServer := httptest.NewServer(http.HandlerFunc(rec.serveHTTP))
+	defer tgServer.Close()
+
+	tgBot, err := telebot.NewBot(telebot.Settings{
+		Token:       "integration-token",
+		URL:         tgServer.URL,
+		Client:      tgServer.Client(),
+		Offline:     true,
+		Synchronous: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to create telegram bot: %v", err)
+	}
+
+	cfg := &config.Config{
+		Telegram: config.TelegramConfig{
+			Token:          "integration-token",
+			PollingTimeout: 5,
+			PollingLimit:   100,
+		},
+		OpenCode: config.OpenCodeConfig{
+			URL:     opencodeServer.URL,
+			Timeout: 30,
+		},
+		Storage: config.StorageConfig{
+			Type:     "file",
+			FilePath: filepath.Join(t.TempDir(), "sessions.json"),
+		},
+		Logging: config.LoggingConfig{
+			Level:  "error",
+			Output: "stdout",
+		},
+	}
+
+	bot, err := NewBot(cfg)
+	if err != nil {
+		t.Fatalf("failed to create handler bot: %v", err)
+	}
+	defer func() {
+		if closeErr := bot.Close(); closeErr != nil {
+			t.Fatalf("failed to close handler bot: %v", closeErr)
+		}
+	}()
+
+	bot.SetTelegramBot(tgBot)
+	bot.Start()
+
+	const userID int64 = 30003
+	started := time.Now()
+	go tgBot.ProcessUpdate(telebot.Update{
+		ID: 201,
+		Message: &telebot.Message{
+			ID:       201,
+			Text:     "run realtime task",
+			Unixtime: time.Now().Unix(),
+			Sender: &telebot.User{
+				ID:        userID,
+				FirstName: "Integration",
+			},
+			Chat: &telebot.Chat{
+				ID:   userID,
+				Type: telebot.ChatPrivate,
+			},
+		},
+	})
+
+	// first message is initial processing indicator
+	_ = waitForTelegramMessage(t, rec.messages)
+
+	realtimeMsg, realtimeAt := waitForTelegramMessageContaining(t, rec.messages, "Realtime assistant reply", 6*time.Second)
+	elapsed := realtimeAt.Sub(started)
+	if elapsed >= 4*time.Second {
+		t.Fatalf("expected realtime update before stream completion, got elapsed=%v message=%q", elapsed, realtimeMsg)
+	}
+	if strings.HasPrefix(realtimeMsg, "✅") {
+		t.Fatalf("expected intermediate realtime update, got final-style message: %q", realtimeMsg)
+	}
+
+	finalMsg := waitForTelegramMessageWithPrefix(t, rec.messages, "✅", 8*time.Second)
+	assertContains(t, finalMsg, "Realtime assistant reply")
+
+	// Ensure periodic updater does not overwrite final content with stale auto-updating text.
+	assertNoTelegramMessageContaining(t, rec.messages, "⏳ Auto-updating...", 3*time.Second)
 }
 
 func installOpenCode(t *testing.T, opencodeHome string) string {

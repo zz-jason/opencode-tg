@@ -300,6 +300,90 @@ func TestListUserSessions(t *testing.T) {
 	}
 }
 
+func TestListUserSessionsSyncsMessageCountAndModel(t *testing.T) {
+	now := time.Now().UnixMilli()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/session":
+			response := []opencode.Session{
+				{
+					ID:    "session-1",
+					Slug:  "session-1",
+					Title: "Session 1",
+					Time: opencode.SessionTime{
+						Created: now - 1000,
+						Updated: now,
+					},
+					Metadata: map[string]interface{}{
+						"telegram_user_id": float64(12345),
+					},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(response)
+		case r.Method == "GET" && r.URL.Path == "/session/session-1/message":
+			response := []opencode.MessageResponse{
+				{
+					Info: opencode.MessageInfo{
+						ID:        "msg-1",
+						SessionID: "session-1",
+						Role:      "user",
+						Time: opencode.MessageTime{
+							Created: now - 500,
+						},
+					},
+					Parts: []opencode.MessagePartResponse{
+						{Type: "text", Text: "hello"},
+					},
+				},
+				{
+					Info: opencode.MessageInfo{
+						ID:         "msg-2",
+						SessionID:  "session-1",
+						Role:       "assistant",
+						ModelID:    "gpt-4.1",
+						ProviderID: "openai",
+						Time: opencode.MessageTime{
+							Created: now,
+						},
+					},
+					Parts: []opencode.MessagePartResponse{
+						{Type: "text", Text: "world"},
+					},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(response)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := opencode.NewClient(server.URL, 5)
+	manager := createTestManager(t, client)
+
+	sessions, err := manager.ListUserSessions(context.Background(), 12345)
+	if err != nil {
+		t.Fatalf("ListUserSessions failed: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("Expected 1 session, got %d", len(sessions))
+	}
+
+	sess := sessions[0]
+	if sess.MessageCount != 2 {
+		t.Fatalf("Expected message count 2, got %d", sess.MessageCount)
+	}
+	if sess.ProviderID != "openai" {
+		t.Fatalf("Expected providerID openai, got %q", sess.ProviderID)
+	}
+	if sess.ModelID != "gpt-4.1" {
+		t.Fatalf("Expected modelID gpt-4.1, got %q", sess.ModelID)
+	}
+}
+
 func TestCreateNewSession(t *testing.T) {
 	server := mockOpenCodeServer(t)
 	defer server.Close()
