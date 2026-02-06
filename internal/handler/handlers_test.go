@@ -2,8 +2,10 @@ package handler
 
 import (
 	"strings"
+	"sync"
 	"testing"
 	"tg-bot/internal/opencode"
+	"time"
 )
 
 func TestFormatMessageParts(t *testing.T) {
@@ -235,6 +237,23 @@ func TestFormatMessageParts(t *testing.T) {
 			notContains: []string{"status: done"}, // Map fallback doesn't parse snapshot
 		},
 		{
+			name: "map representation tool with command and output",
+			parts: []interface{}{
+				map[string]interface{}{
+					"type": "tool",
+					"tool": "bash",
+					"state": map[string]interface{}{
+						"status": "running",
+						"input": map[string]interface{}{
+							"command": "git diff origin/main HEAD",
+						},
+						"output": "# Compare HEAD and main\n$ git diff origin/main HEAD",
+					},
+				},
+			},
+			contains: []string{"• 🛠️ bash:", "$ git diff origin/main HEAD", "output:", "# Compare HEAD and main"},
+		},
+		{
 			name: "tool call with empty snapshot",
 			parts: []interface{}{
 				opencode.MessagePartResponse{
@@ -300,7 +319,7 @@ func TestFormatMessageParts(t *testing.T) {
 					},
 				},
 			},
-			contains: []string{"• ✅ bash:", "List files"},
+			contains: []string{"• ✅ bash:", "List files", "$ ls -la", "output:", "total 0"},
 		},
 		{
 			name: "tool call with only Tool field",
@@ -332,5 +351,181 @@ func TestFormatMessageParts(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestFormatMessageForDisplay_NoDuplicateReplyContentWhenMessageContentExists(t *testing.T) {
+	b := &Bot{}
+	msg := opencode.Message{
+		Content: "Main assistant content",
+		Parts: []interface{}{
+			opencode.MessagePartResponse{
+				Type: "text",
+				Text: "Main assistant content",
+			},
+		},
+	}
+
+	got := b.formatMessageForDisplay(msg, false)
+	if !strings.Contains(got, "Main assistant content") {
+		t.Fatalf("expected main content to be displayed, got: %s", got)
+	}
+	if strings.Contains(got, "Reply content") {
+		t.Fatalf("expected no duplicated reply-content block when content already exists, got: %s", got)
+	}
+}
+
+func TestFormatMessageForDisplay_StillShowsToolDetailsWhenMessageContentExists(t *testing.T) {
+	b := &Bot{}
+	msg := opencode.Message{
+		Content: "Main assistant content",
+		Parts: []interface{}{
+			opencode.MessagePartResponse{
+				Type: "tool",
+				Tool: "bash",
+				State: map[string]interface{}{
+					"status": "running",
+					"input": map[string]interface{}{
+						"command": "git diff origin/main HEAD",
+					},
+					"output": "diff --git a/file b/file",
+				},
+			},
+		},
+	}
+
+	got := b.formatMessageForDisplay(msg, false)
+	if !strings.Contains(got, "📋 Processing Details:") {
+		t.Fatalf("expected processing details block, got: %s", got)
+	}
+	if !strings.Contains(got, "$ git diff origin/main HEAD") {
+		t.Fatalf("expected tool command in details, got: %s", got)
+	}
+	if !strings.Contains(got, "output:") {
+		t.Fatalf("expected tool output in details, got: %s", got)
+	}
+}
+
+func TestStreamChunkDelta(t *testing.T) {
+	tests := []struct {
+		name     string
+		existing string
+		chunk    string
+		want     string
+	}{
+		{
+			name:     "append when empty",
+			existing: "",
+			chunk:    "hello",
+			want:     "hello",
+		},
+		{
+			name:     "cumulative snapshot",
+			existing: "hello",
+			chunk:    "hello world",
+			want:     " world",
+		},
+		{
+			name:     "stale shorter snapshot",
+			existing: "hello world",
+			chunk:    "hello",
+			want:     "",
+		},
+		{
+			name:     "overlap suffix prefix",
+			existing: "abc123",
+			chunk:    "123XYZ",
+			want:     "XYZ",
+		},
+		{
+			name:     "repeated content",
+			existing: "hello world",
+			chunk:    "world",
+			want:     "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := streamChunkDelta(tt.existing, tt.chunk)
+			if got != tt.want {
+				t.Fatalf("streamChunkDelta() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHandleStreamChunk_DeduplicatesCumulativeSnapshots(t *testing.T) {
+	b := &Bot{}
+	state := &streamingState{
+		content:     &strings.Builder{},
+		lastUpdate:  time.Now(),
+		updateMutex: &sync.Mutex{},
+	}
+
+	if err := b.handleStreamChunk(state, "Integration tests validate "); err != nil {
+		t.Fatalf("handleStreamChunk first call failed: %v", err)
+	}
+	if err := b.handleStreamChunk(state, "Integration tests validate tool progress "); err != nil {
+		t.Fatalf("handleStreamChunk second call failed: %v", err)
+	}
+	if err := b.handleStreamChunk(state, "tool progress visibility."); err != nil {
+		t.Fatalf("handleStreamChunk third call failed: %v", err)
+	}
+
+	got := state.content.String()
+	want := "Integration tests validate tool progress visibility."
+	if got != want {
+		t.Fatalf("unexpected accumulated stream content\n got: %q\nwant: %q", got, want)
+	}
+}
+
+func TestSplitLongContent_SplitsLongSingleLine(t *testing.T) {
+	b := &Bot{}
+	input := strings.Repeat("x", 7500)
+
+	chunks := b.splitLongContent(input)
+	if len(chunks) < 3 {
+		t.Fatalf("expected at least 3 chunks, got %d", len(chunks))
+	}
+
+	for i, chunk := range chunks {
+		if len(chunk) > 3500 {
+			t.Fatalf("chunk %d exceeds limit: %d", i, len(chunk))
+		}
+	}
+
+	if strings.Join(chunks, "") != input {
+		t.Fatalf("split/join roundtrip mismatch")
+	}
+}
+
+func TestSplitLongContent_LeadingNewlineNoDataLoss(t *testing.T) {
+	b := &Bot{}
+	input := "\n" + strings.Repeat("x", 5000)
+
+	chunks := b.splitLongContent(input)
+	if len(chunks) < 2 {
+		t.Fatalf("expected multiple chunks, got %d", len(chunks))
+	}
+	if strings.Join(chunks, "") != input {
+		t.Fatalf("split/join roundtrip mismatch for leading newline input")
+	}
+}
+
+func TestFormatStreamingDisplays_LongSingleLineCreatesMultipleParts(t *testing.T) {
+	b := &Bot{}
+	content := strings.Repeat("a", 7600)
+
+	displays := b.formatStreamingDisplays(content)
+	if len(displays) < 3 {
+		t.Fatalf("expected multiple streaming displays, got %d", len(displays))
+	}
+
+	if !strings.Contains(displays[1], "Part 2/") {
+		t.Fatalf("expected second display to contain Part 2 header, got: %q", displays[1])
+	}
+	if !strings.Contains(displays[len(displays)-1], "▌") {
+		t.Fatalf("expected last display to include streaming cursor, got: %q", displays[len(displays)-1])
 	}
 }
