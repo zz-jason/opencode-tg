@@ -1,11 +1,11 @@
 # OpenCode Telegram Bot
 
-A Telegram bot for interacting with OpenCode AI programming assistant deployed in internal networks. The bot runs in internal network environments, accesses Telegram API via HTTP proxy, and uses polling to receive messages. It provides a CLI-like experience for users to interact with OpenCode through Telegram.
+A Telegram bot for interacting with an OpenCode server over HTTP. The bot uses Telegram polling mode and can be deployed on any host that can reach both Telegram API and your OpenCode server.
 
 ## Features
 
 - ✅ Interact with OpenCode through Telegram Bot
-- ✅ HTTP proxy support (for accessing external services)
+- ✅ Optional HTTP proxy support for bot outbound traffic to Telegram API
 - ✅ Polling mode (no public IP required)
 - ✅ Session management (independent sessions per user)
 - ✅ View task status and intermediate outputs
@@ -18,34 +18,38 @@ A Telegram bot for interacting with OpenCode AI programming assistant deployed i
 ## System Architecture
 
 ```mermaid
-flowchart TD
-    User[Telegram User] -->|Sends messages| TelegramAPI[Telegram API]
-    TelegramAPI -->|Via HTTP Proxy| TelegramBot[Telegram Bot Go Application]
-    
-    TelegramBot -->|Internal HTTP API| OpenCode[OpenCode Server]
-    OpenCode -->|AI Processing| AIProviders[AI Providers: OpenAI, Anthropic, etc.]
-    
-    subgraph "Internal Network"
+flowchart LR
+    User[Telegram User] -->|Chat messages| TelegramAPI[Telegram API]
+    TelegramAPI -->|Bot updates/replies| User
+
+    TelegramBot[Telegram Bot Go Application] -->|Long polling + sendMessage| TelegramAPI
+    TelegramBot -->|HTTP API| OpenCode[OpenCode Server]
+    OpenCode -->|Model requests| AIProviders[AI Providers]
+
+    Proxy[HTTP Proxy (Optional)] -.->|Used only by bot outbound Telegram requests| TelegramAPI
+
+    subgraph "Your Infrastructure"
         TelegramBot
         OpenCode
     end
-    
+
     subgraph "External Services"
         TelegramAPI
         AIProviders
     end
-    
-    Proxy[HTTP Proxy] -.->|Optional| TelegramAPI
 ```
 
-**Simplified View:** `Telegram API <--[HTTP Proxy]--> Telegram Bot (Golang) <--[Internal HTTP]--> OpenCode Server`
+**Simplified View:** `Telegram User <-> Telegram API <-> Telegram Bot <-> OpenCode Server`
+
+**Deployment Note:** Telegram Bot and OpenCode do not need to run on the same machine. They only need network connectivity.
+**User Experience Note:** Telegram users only chat with the bot; proxy settings are an infrastructure detail and are not user-visible.
 
 ## Quick Start
 
 ### Prerequisites
 
-1. OpenCode server running at `http://192.168.50.100:8080` (or your OpenCode server URL)
-2. HTTP proxy accessible to Telegram API (e.g., `http://127.0.0.1:7890`)
+1. OpenCode server reachable from bot host (e.g. `http://192.168.50.100:8080`)
+2. Telegram API reachable from bot host (directly or via optional proxy)
 3. Telegram Bot Token (obtain from @BotFather)
 4. Go 1.21+ development environment
 
@@ -60,7 +64,7 @@ polling_timeout = 60
 polling_limit = 100
 
 [proxy]
-enabled = true
+enabled = false  # set true only if bot host must use a proxy to access Telegram API
 url = "http://127.0.0.1:7890"
 
 [opencode]
@@ -136,7 +140,7 @@ go run cmd/bot/main.go
 - `/symbol <name>` - Search for symbols (if API available)
 
 ### AI Model Management
-- `/models` - List available AI models with numeric IDs
+- `/models` - List available AI models grouped by provider with numeric IDs
 - `/providers` - List AI providers and connection status
 - `/setmodel <number>` - Set model for current session
 - `/newmodel <name> <number>` - Create new session with specific model
@@ -157,7 +161,7 @@ Bot: Here's a Go function to calculate Fibonacci sequence...
 - Each Telegram user has one default session
 - Use `/new` to create multiple sessions for different tasks
 - Use `/switch` to switch between sessions
-- Session state is stored in memory (lost on restart)
+- Session state is stored in a local JSON file (`bot-state.json`)
 
 ## Development
 
@@ -220,8 +224,8 @@ go test ./internal/session
 - `polling_limit`: Number of messages to fetch per poll
 
 ### Proxy Configuration
-- `enabled`: Whether to enable proxy
-- `url`: Proxy server URL
+- `enabled`: Whether bot should use proxy for Telegram API requests
+- `url`: Proxy server URL (required when `enabled=true`)
 
 ### OpenCode Configuration
 - `url`: OpenCode server URL (required)
@@ -246,7 +250,7 @@ go test ./internal/session
 - Task abortion (`/abort` command)
 - Message formatting optimization (removed redundant headers)
 - Tool call display with JSON parsing
-- Proxy support for Telegram API access
+- Optional proxy support for Telegram API access
 - Health checks and error handling
 
 ### ⚠️ Known Limitations
@@ -258,7 +262,7 @@ go test ./internal/session
 - **Message Updates**: Uses 2-second periodic polling to update message status
 - **Tool Call Display**: Attempts to parse JSON snapshots to show tool names and arguments
 - **Timeout Handling**: Increased to 300 seconds to accommodate long-running tasks
-- **Proxy Configuration**: Explicit proxy settings to avoid proxy interference with local OpenCode connections
+- **Proxy Behavior**: Proxy setting applies to Telegram API client only; OpenCode client requests are direct
 
 ## Troubleshooting
 
@@ -275,8 +279,8 @@ ERROR: OpenCode health check failed
 ERROR: Failed to create Telegram bot
 ```
 - Verify Bot Token is correct
-- Check proxy configuration
-- Ensure proxy server can access Telegram API
+- If `proxy.enabled=true`, verify proxy configuration
+- Ensure the bot host (or proxy) can access Telegram API
 
 ### Streaming Response Interruption
 - Check if OpenCode SSE endpoint is working properly
