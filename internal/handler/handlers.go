@@ -14,6 +14,7 @@ import (
 	"tg-bot/internal/config"
 	"tg-bot/internal/opencode"
 	"tg-bot/internal/session"
+	"tg-bot/internal/storage"
 )
 
 // Bot represents the Telegram bot with all dependencies
@@ -29,9 +30,34 @@ type Bot struct {
 	modelMappingMu sync.RWMutex
 	modelMapping   map[int64]map[int]modelSelection
 
+	// Global model mapping (number -> modelSelection) - populated at startup
+	globalModelMappingMu sync.RWMutex
+	globalModelMapping   map[int]modelSelection
+
 	// Session mapping for each user (userID -> map[int]sessionID)
 	sessionMappingMu sync.RWMutex
 	sessionMapping   map[int64]map[int]string
+
+	// Streaming state management
+	streamingStateMu sync.RWMutex
+	streamingStates  map[string]*streamingState
+}
+
+// streamingState tracks the state of an active streaming response
+type streamingState struct {
+	ctx         context.Context
+	cancel      context.CancelFunc
+	stopUpdates chan struct{}
+
+	telegramMsg *telebot.Message
+	telegramCtx telebot.Context
+
+	content     *strings.Builder
+	lastUpdate  time.Time
+	updateMutex *sync.Mutex
+
+	isStreaming bool
+	isComplete  bool
 }
 
 // modelSelection represents a model selection with provider and model IDs
@@ -45,6 +71,14 @@ type modelSelection struct {
 func NewBot(cfg *config.Config) (*Bot, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// Ensure cancel is called if we return with an error
+	var returnErr error
+	defer func() {
+		if returnErr != nil {
+			cancel()
+		}
+	}()
+
 	// Create OpenCode client
 	client := opencode.NewClient(cfg.OpenCode.URL, cfg.OpenCode.Timeout)
 
@@ -52,25 +86,53 @@ func NewBot(cfg *config.Config) (*Bot, error) {
 	healthCtx, healthCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer healthCancel()
 
-	if err := client.HealthCheck(healthCtx); err != nil {
-		log.Warnf("OpenCode health check failed: %v", err)
+	if healthErr := client.HealthCheck(healthCtx); healthErr != nil {
+		log.Warnf("OpenCode health check failed: %v", healthErr)
 		// Continue anyway, as the server might become available later
 	} else {
 		log.Info("OpenCode connection successful")
 	}
 
-	// Create session manager
-	sessionManager := session.NewManager(client)
+	// Create storage
+	store, err := storage.NewStore(storage.Options{
+		Type:     cfg.Storage.Type,
+		FilePath: cfg.Storage.FilePath,
+	})
+	if err != nil {
+		returnErr = fmt.Errorf("failed to create storage: %w", err)
+		return nil, returnErr
+	}
+
+	// Create session manager with storage
+	sessionManager := session.NewManagerWithStore(client, store)
 
 	bot := &Bot{
-		config:         cfg,
-		opencodeClient: client,
-		sessionManager: sessionManager,
-		ctx:            ctx,
-		cancel:         cancel,
-		modelMapping:   make(map[int64]map[int]modelSelection),
-		sessionMapping: make(map[int64]map[int]string),
+		config:             cfg,
+		opencodeClient:     client,
+		sessionManager:     sessionManager,
+		ctx:                ctx,
+		cancel:             cancel,
+		modelMapping:       make(map[int64]map[int]modelSelection),
+		globalModelMapping: make(map[int]modelSelection),
+		sessionMapping:     make(map[int64]map[int]string),
+		streamingStates:    make(map[string]*streamingState),
 	}
+
+	// Initialize session manager asynchronously to preload sessions and models
+	go func() {
+		initCtx, initCancel := context.WithTimeout(ctx, 10*time.Second)
+		defer initCancel()
+
+		if err := sessionManager.Initialize(initCtx); err != nil {
+			log.Warnf("Failed to initialize session manager (preloading sessions/models): %v", err)
+			log.Warn("Bot will start without preloaded sessions and models. Users will need to run /sessions and /models manually.")
+		} else {
+			log.Info("Session manager initialized successfully with preloaded sessions and models")
+
+			// Build global model mapping after successful initialization
+			bot.buildGlobalModelMapping(initCtx)
+		}
+	}()
 
 	return bot, nil
 }
@@ -452,6 +514,17 @@ func (b *Bot) handleAbort(c telebot.Context) error {
 		return c.Send("You don't have a current session. Use /new to create a new session.")
 	}
 
+	// First, try to cancel any local streaming state
+	b.streamingStateMu.Lock()
+	if state, ok := b.streamingStates[sessionID]; ok && state.isStreaming {
+		state.cancel()
+		close(state.stopUpdates)
+		state.isStreaming = false
+		log.Infof("Cancelled local streaming state for session %s", sessionID)
+	}
+	b.streamingStateMu.Unlock()
+
+	// Then send abort to OpenCode
 	if err := b.opencodeClient.AbortSession(b.ctx, sessionID); err != nil {
 		log.Errorf("Failed to abort session: %v", err)
 		return c.Send(fmt.Sprintf("Failed to abort session: %v", err))
@@ -1116,7 +1189,7 @@ func (b *Bot) handleNewModel(c telebot.Context) error {
 	return c.Send(fmt.Sprintf("✅ Created new session '%s' with model %s (%s/%s)", name, selection.ModelName, selection.ProviderID, selection.ModelID))
 }
 
-// handleText handles plain text messages (non-commands) with periodic updates
+// handleText handles plain text messages (non-commands) with real-time streaming
 func (b *Bot) handleText(c telebot.Context) error {
 	userID := c.Sender().ID
 	text := c.Text()
@@ -1133,48 +1206,111 @@ func (b *Bot) handleText(c telebot.Context) error {
 		return c.Send(fmt.Sprintf("Session error: %v", err))
 	}
 
+	// Cancel any existing streaming for this session
+	b.streamingStateMu.Lock()
+	if existingState, ok := b.streamingStates[sessionID]; ok && existingState.isStreaming {
+		existingState.cancel()
+		close(existingState.stopUpdates)
+		existingState.isStreaming = false
+		log.Infof("Cancelled existing streaming for session %s before starting new request", sessionID)
+	}
+	b.streamingStateMu.Unlock()
+
 	// Send initial "processing" message
 	processingMsg, err := c.Bot().Send(c.Chat(), "🤖 Processing...")
 	if err != nil {
 		return err
 	}
 
-	// Prepare context for the main request
+	// Prepare context for the streaming request
 	ctx, cancel := context.WithCancel(b.ctx)
 	defer cancel()
 
-	// Channel to signal when to stop periodic updates
+	// Channel to signal when to stop updates
 	stopUpdates := make(chan struct{})
 	defer close(stopUpdates)
 
-	// Start periodic updates in a goroutine
-	go b.periodicMessageUpdates(ctx, c, processingMsg, sessionID, stopUpdates)
-
-	// Send the message to OpenCode
-	req := opencode.SendMessageRequest{
-		Parts: []opencode.MessagePart{
-			{
-				Type: "text",
-				Text: text,
-			},
-		},
+	// Track streaming state
+	streamingState := &streamingState{
+		ctx:         ctx,
+		cancel:      cancel,
+		stopUpdates: stopUpdates,
+		telegramMsg: processingMsg,
+		telegramCtx: c,
+		content:     &strings.Builder{},
+		lastUpdate:  time.Now(),
+		updateMutex: &sync.Mutex{},
+		isStreaming: true,
 	}
 
-	// Use SendMessage which will block until response is complete
-	// This allows periodic updates to show progress while waiting
-	_, err = b.opencodeClient.SendMessage(ctx, sessionID, &req)
+	// Store streaming state for potential abort
+	b.streamingStateMu.Lock()
+	b.streamingStates[sessionID] = streamingState
+	b.streamingStateMu.Unlock()
+
+	// Clean up streaming state when done
+	defer func() {
+		b.streamingStateMu.Lock()
+		delete(b.streamingStates, sessionID)
+		b.streamingStateMu.Unlock()
+		streamingState.isStreaming = false
+	}()
+
+	// Stream callback function to handle real-time updates
+	streamCallback := func(textChunk string) error {
+		return b.handleStreamChunk(streamingState, textChunk)
+	}
+
+	// Start streaming the message
+	err = b.opencodeClient.StreamMessage(ctx, sessionID, text, streamCallback)
 	if err != nil {
-		log.Errorf("Failed to send message: %v", err)
+		log.Errorf("Failed to stream message: %v", err)
+
 		// Update with error message
 		errorMsg := fmt.Sprintf("Processing error: %v", err)
 		if len(errorMsg) > 4000 {
 			errorMsg = errorMsg[:4000]
 		}
+
+		// Add any partial content we received
+		finalContent := streamingState.content.String()
+		if finalContent != "" {
+			errorMsg = finalContent + "\n\n---\n\n" + errorMsg
+		}
+
 		c.Bot().Edit(processingMsg, errorMsg)
 		return nil
 	}
 
-	// Message sent successfully, periodic updates will handle the rest
+	// Streaming completed successfully
+	// Mark streaming as complete
+	streamingState.isComplete = true
+
+	// Get final content
+	finalContent := streamingState.content.String()
+	if finalContent == "" {
+		finalContent = "🤖 Response completed with no content."
+	}
+
+	// Handle final content (may need to split into multiple messages)
+	b.handleFinalResponse(c, processingMsg, finalContent)
+
+	// Send latest message details if available (thinking, tool calls, etc.)
+	latestMsgDetails, err := b.formatLatestMessage(sessionID, userID)
+	if err != nil {
+		log.Warnf("Failed to get latest message details: %v", err)
+		// Continue without latest message details
+	} else if latestMsgDetails != "" {
+		// Small delay to ensure message order
+		time.Sleep(500 * time.Millisecond)
+
+		// Send the latest message details as a separate update
+		_, err := c.Bot().Send(c.Chat(), latestMsgDetails)
+		if err != nil {
+			log.Errorf("Failed to send latest message details: %v", err)
+		}
+	}
+
 	return nil
 }
 
@@ -1458,6 +1594,54 @@ func (b *Bot) handleCommand(c telebot.Context) error {
 	return c.Send("Command list functionality is not yet implemented.")
 }
 
+// buildGlobalModelMapping builds the global model mapping from preloaded models
+func (b *Bot) buildGlobalModelMapping(ctx context.Context) {
+	// Get providers to determine connection status
+	providersResp, err := b.opencodeClient.GetProviders(ctx)
+	if err != nil {
+		log.Warnf("Failed to get providers for global model mapping: %v", err)
+		return
+	}
+
+	// Create a set of connected provider IDs for faster lookup
+	connectedSet := make(map[string]bool)
+	for _, providerID := range providersResp.Connected {
+		connectedSet[providerID] = true
+	}
+
+	// Get preloaded models from storage
+	models, err := b.sessionManager.GetAllModels()
+	if err != nil {
+		log.Warnf("Failed to get preloaded models for global mapping: %v", err)
+		return
+	}
+
+	// Build mapping with sequential numbers
+	modelCounter := 1
+	globalMapping := make(map[int]modelSelection)
+
+	for _, model := range models {
+		// Only include models from connected providers
+		if !connectedSet[model.ProviderID] {
+			continue
+		}
+
+		globalMapping[modelCounter] = modelSelection{
+			ProviderID: model.ProviderID,
+			ModelID:    model.ID,
+			ModelName:  model.Name,
+		}
+		modelCounter++
+	}
+
+	// Store global mapping
+	b.globalModelMappingMu.Lock()
+	b.globalModelMapping = globalMapping
+	b.globalModelMappingMu.Unlock()
+
+	log.Infof("Built global model mapping with %d models from connected providers", len(globalMapping))
+}
+
 // storeModelMapping stores the model mapping for a user
 func (b *Bot) storeModelMapping(userID int64, mapping map[int]modelSelection) {
 	b.modelMappingMu.Lock()
@@ -1467,16 +1651,27 @@ func (b *Bot) storeModelMapping(userID int64, mapping map[int]modelSelection) {
 
 // getModelSelection gets a model selection by ID for a user
 func (b *Bot) getModelSelection(userID int64, modelID int) (modelSelection, bool) {
+	// First, try user-specific mapping
 	b.modelMappingMu.RLock()
-	defer b.modelMappingMu.RUnlock()
+	userMapping, userExists := b.modelMapping[userID]
+	b.modelMappingMu.RUnlock()
 
-	userMapping, exists := b.modelMapping[userID]
-	if !exists {
-		return modelSelection{}, false
+	if userExists {
+		if selection, exists := userMapping[modelID]; exists {
+			return selection, true
+		}
 	}
 
-	selection, exists := userMapping[modelID]
-	return selection, exists
+	// Fall back to global mapping
+	b.globalModelMappingMu.RLock()
+	selection, globalExists := b.globalModelMapping[modelID]
+	b.globalModelMappingMu.RUnlock()
+
+	if globalExists {
+		return selection, true
+	}
+
+	return modelSelection{}, false
 }
 
 // clearModelMapping clears the model mapping for a user
@@ -1768,4 +1963,261 @@ func (b *Bot) handleDelete(c telebot.Context) error {
 	b.sessionMappingMu.Unlock()
 
 	return c.Send("🗑️ Session deleted successfully.")
+}
+
+// handleStreamChunk processes a chunk of text from the streaming response
+func (b *Bot) handleStreamChunk(state *streamingState, textChunk string) error {
+	state.updateMutex.Lock()
+	defer state.updateMutex.Unlock()
+
+	// Append the new chunk to our content
+	state.content.WriteString(textChunk)
+	currentContent := state.content.String()
+
+	// Track content length for update decisions
+	currentLength := len(currentContent)
+
+	// Check if we should update the Telegram message
+	// Update logic:
+	// 1. Always update if it's been more than 2 seconds since last update
+	// 2. Update if content has grown significantly (300+ chars) even if less than 2 seconds
+	// 3. Limit updates to at most once per 0.5 seconds to avoid rate limiting
+	now := time.Now()
+	timeSinceLastUpdate := now.Sub(state.lastUpdate)
+
+	// Estimate content growth since last update (rough)
+	contentGrowth := len(textChunk) // This chunk size
+
+	shouldUpdate := false
+	if timeSinceLastUpdate >= 2*time.Second {
+		shouldUpdate = true
+	} else if timeSinceLastUpdate >= 500*time.Millisecond && contentGrowth >= 100 {
+		// Significant content growth, update more frequently
+		shouldUpdate = true
+	} else if currentLength < 1000 && timeSinceLastUpdate >= 1*time.Second {
+		// For short content, update more frequently to show progress
+		shouldUpdate = true
+	}
+
+	if !shouldUpdate {
+		return nil
+	}
+
+	state.lastUpdate = now
+
+	// Format the content for display
+	displayContent := b.formatStreamingContent(currentContent)
+
+	// Update the Telegram message
+	b.updateTelegramMessage(state.telegramCtx, state.telegramMsg, displayContent)
+
+	return nil
+}
+
+// formatStreamingContent formats streaming content for display
+func (b *Bot) formatStreamingContent(content string) string {
+	// Trim trailing whitespace
+	content = strings.TrimSpace(content)
+
+	if content == "" {
+		return "🤖 Processing..."
+	}
+
+	// Calculate approximate percentage complete based on content length
+	// This is a rough estimate since we don't know the total length
+	progressIndicator := "▌"
+	contentLength := len(content)
+
+	// Simple heuristic: if content is getting long, show progress
+	var progressText string
+	if contentLength > 5000 {
+		progressText = " (streaming... ~80%)"
+	} else if contentLength > 3000 {
+		progressText = " (streaming... ~60%)"
+	} else if contentLength > 1500 {
+		progressText = " (streaming... ~40%)"
+	} else if contentLength > 500 {
+		progressText = " (streaming... ~20%)"
+	} else {
+		progressText = " (streaming...)"
+	}
+
+	// If content is getting long, show a truncated version
+	displayContent := content
+	if len(displayContent) > 3000 {
+		// Show last 3000 characters to keep message readable
+		// Try to find a good truncation point (not in middle of line)
+		if len(displayContent) > 3000 {
+			truncated := displayContent
+			// Find the last newline before 3000 characters
+			cutPoint := 3000
+			if cutPoint < len(truncated) {
+				// Try to cut at a newline
+				newlineCut := strings.LastIndex(truncated[:cutPoint], "\n")
+				if newlineCut > 2500 { // Only use if it's not too far back
+					cutPoint = newlineCut
+				}
+			}
+			if cutPoint < len(truncated) {
+				displayContent = truncated[cutPoint:]
+				// Add ellipsis to show content was truncated
+				displayContent = "..." + displayContent
+			}
+		}
+	}
+
+	return fmt.Sprintf("🤖%s\n%s%s", progressIndicator, displayContent, progressText)
+}
+
+// handleFinalResponse handles the final response after streaming is complete
+func (b *Bot) handleFinalResponse(c telebot.Context, msg *telebot.Message, content string) {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		content = "🤖 Response completed."
+	}
+
+	// Check if content is too long for a single Telegram message
+	if len(content) <= 3500 {
+		// Content fits in one message, just update it
+		finalMessage := fmt.Sprintf("✅ %s", content)
+		b.updateTelegramMessage(c, msg, finalMessage)
+		return
+	}
+
+	// Content is too long, we need to split it
+	// First, update the original message to indicate completion
+	b.updateTelegramMessage(c, msg, "✅ Response completed. Content is too long for one message, sending in parts...")
+
+	// Split the content into manageable chunks
+	chunks := b.splitLongContent(content)
+
+	// Send each chunk as a separate message
+	for i, chunk := range chunks {
+		// Add header for multi-part messages
+		header := fmt.Sprintf("Part %d/%d:\n", i+1, len(chunks))
+		message := header + chunk
+
+		if i == 0 {
+			// First chunk replaces the original message
+			b.updateTelegramMessage(c, msg, message)
+		} else {
+			// Subsequent chunks are new messages
+			_, err := c.Bot().Send(c.Chat(), message)
+			if err != nil {
+				log.Errorf("Failed to send message part %d: %v", i+1, err)
+				// Try to send error message
+				c.Bot().Send(c.Chat(), fmt.Sprintf("Failed to send part %d of response", i+1))
+			}
+		}
+
+		// Small delay between messages to avoid rate limiting
+		if i < len(chunks)-1 {
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+}
+
+// splitLongContent splits long content into chunks that fit in Telegram messages
+func (b *Bot) splitLongContent(content string) []string {
+	const maxChunkSize = 3500
+	var chunks []string
+
+	// Try to split at natural boundaries (paragraphs, code blocks)
+	lines := strings.Split(content, "\n")
+	currentChunk := strings.Builder{}
+	currentLength := 0
+
+	for _, line := range lines {
+		lineLength := len(line) + 1 // +1 for newline
+
+		// If adding this line would exceed the limit and we already have content,
+		// start a new chunk
+		if currentLength > 0 && currentLength+lineLength > maxChunkSize {
+			chunks = append(chunks, currentChunk.String())
+			currentChunk.Reset()
+			currentLength = 0
+		}
+
+		// Add the line
+		if currentChunk.Len() > 0 {
+			currentChunk.WriteString("\n")
+			currentLength += 1
+		}
+		currentChunk.WriteString(line)
+		currentLength += len(line)
+	}
+
+	// Add the last chunk if there's any content
+	if currentChunk.Len() > 0 {
+		chunks = append(chunks, currentChunk.String())
+	}
+
+	// If we couldn't split nicely (e.g., one very long line), fall back to simple splitting
+	if len(chunks) == 0 && len(content) > 0 {
+		for i := 0; i < len(content); i += maxChunkSize {
+			end := i + maxChunkSize
+			if end > len(content) {
+				end = len(content)
+			}
+			chunks = append(chunks, content[i:end])
+		}
+	}
+
+	return chunks
+}
+
+// formatLatestMessage formats the latest message from a session for display
+func (b *Bot) formatLatestMessage(sessionID string, userID int64) (string, error) {
+	// Get recent messages
+	messages, err := b.opencodeClient.GetMessages(b.ctx, sessionID)
+	if err != nil {
+		log.Errorf("Failed to get messages for latest update: %v", err)
+		return "", err
+	}
+
+	if len(messages) == 0 {
+		return "No messages in session.", nil
+	}
+
+	// Get the latest message
+	latestMsg := messages[len(messages)-1]
+
+	// Check if this is an assistant message with detailed parts
+	hasDetailedParts := len(latestMsg.Parts) > 0 && formatMessageParts(latestMsg.Parts) != "No detailed content"
+
+	// If it's not an assistant message or doesn't have detailed parts, no need for separate update
+	if latestMsg.Role != "assistant" || !hasDetailedParts {
+		return "", nil
+	}
+
+	// Format the message similar to /status command
+	role := "🤖 Assistant"
+	timeStr := latestMsg.CreatedAt.Format("15:04")
+
+	var sb strings.Builder
+	sb.WriteString("📋 Latest Message Details\n")
+	sb.WriteString("════════════════\n")
+	sb.WriteString(fmt.Sprintf("[Message 0] %s [%s]\n", role, timeStr))
+	sb.WriteString("════════════════\n")
+
+	// Show detailed parts
+	partsStr := formatMessageParts(latestMsg.Parts)
+	sb.WriteString(fmt.Sprintf("%s\n", partsStr))
+
+	// Truncate if too long for Telegram
+	result := sb.String()
+	const maxTelegramLength = 3500
+	if len(result) > maxTelegramLength {
+		result = result[:maxTelegramLength] + "\n... (content too long, use /status or /current for full details)"
+	}
+
+	return result, nil
+}
+
+// Close closes the bot and releases resources
+func (b *Bot) Close() error {
+	if b.sessionManager != nil {
+		return b.sessionManager.Close()
+	}
+	return nil
 }

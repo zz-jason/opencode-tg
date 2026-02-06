@@ -26,7 +26,7 @@ url = "http://192.168.50.100:8080"
 timeout = 30
 
 [storage]
-type = "memory"
+type = "file"
 sqlite_path = "sessions.db"
 
 [logging]
@@ -63,8 +63,8 @@ output = "bot.log"
 	if cfg.OpenCode.Timeout != 30 {
 		t.Errorf("Expected OpenCode timeout 30, got %d", cfg.OpenCode.Timeout)
 	}
-	if cfg.Storage.Type != "memory" {
-		t.Errorf("Expected storage type 'memory', got %s", cfg.Storage.Type)
+	if cfg.Storage.Type != "file" {
+		t.Errorf("Expected storage type 'file', got %s", cfg.Storage.Type)
 	}
 	if cfg.Logging.Level != "info" {
 		t.Errorf("Expected log level 'info', got %s", cfg.Logging.Level)
@@ -103,8 +103,11 @@ url = "http://192.168.50.100:8080"
 	if cfg.OpenCode.Timeout != 30 {
 		t.Errorf("Expected default OpenCode timeout 30, got %d", cfg.OpenCode.Timeout)
 	}
-	if cfg.Storage.Type != "memory" {
-		t.Errorf("Expected default storage type 'memory', got %s", cfg.Storage.Type)
+	if cfg.Storage.Type != "file" {
+		t.Errorf("Expected default storage type 'file', got %s", cfg.Storage.Type)
+	}
+	if cfg.Storage.FilePath != "sessions.json" {
+		t.Errorf("Expected default file path 'sessions.json', got %s", cfg.Storage.FilePath)
 	}
 	if cfg.Logging.Level != "info" {
 		t.Errorf("Expected default log level 'info', got %s", cfg.Logging.Level)

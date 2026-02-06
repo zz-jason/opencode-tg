@@ -8,39 +8,100 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	"tg-bot/internal/opencode"
+	"tg-bot/internal/storage"
 )
 
 // Manager handles session management for Telegram users
 type Manager struct {
 	mu sync.RWMutex
-	// userID -> sessionID mapping
-	userSessions map[int64]string
-	// sessionID -> session metadata
-	sessions map[string]*SessionMeta
+	// storage backend
+	store storage.Store
 	// OpenCode client
 	client *opencode.Client
 }
 
-// SessionMeta contains metadata about a session
-type SessionMeta struct {
-	SessionID    string
-	UserID       int64
-	Name         string
-	CreatedAt    time.Time
-	LastUsedAt   time.Time
-	MessageCount int
-	ProviderID   string
-	ModelID      string
-	Status       string // "owned", "orphaned", "other"
+// SessionMeta is an alias for storage.SessionMeta
+type SessionMeta = storage.SessionMeta
+
+// NewManager creates a new session manager with default file storage
+// Deprecated: Use NewManagerWithStore for better control over storage
+func NewManager(client *opencode.Client) *Manager {
+	store, err := storage.NewStore(storage.Options{
+		Type:     "file",
+		FilePath: "sessions.json",
+	})
+	if err != nil {
+		// Panic since this is a programming error - storage should always be available
+		panic(fmt.Sprintf("Failed to create default file storage: %v", err))
+	}
+	return &Manager{
+		store:  store,
+		client: client,
+	}
 }
 
-// NewManager creates a new session manager
-func NewManager(client *opencode.Client) *Manager {
+// NewManagerWithStore creates a new session manager with custom storage
+func NewManagerWithStore(client *opencode.Client, store storage.Store) *Manager {
 	return &Manager{
-		userSessions: make(map[int64]string),
-		sessions:     make(map[string]*SessionMeta),
-		client:       client,
+		store:  store,
+		client: client,
 	}
+}
+
+// Initialize preloads sessions and models from OpenCode at bot startup
+func (m *Manager) Initialize(ctx context.Context) error {
+	log.Info("Initializing session manager: preloading sessions and models from OpenCode")
+
+	// Preload sessions
+	sessions, err := m.client.ListSessions(ctx)
+	if err != nil {
+		log.Warnf("Failed to preload sessions from OpenCode: %v", err)
+		// Continue to try loading models even if sessions fail
+	} else {
+		log.Infof("Found %d sessions in OpenCode", len(sessions))
+		for _, ocSession := range sessions {
+			// Use getOrCreateSessionMeta to ensure session metadata is stored
+			// We use 0 as userID since we don't know the owner at initialization
+			// getOrCreateSessionMeta will determine ownership from metadata
+			m.getOrCreateSessionMeta(ocSession.ID, 0, ocSession.Metadata, ocSession.Title)
+		}
+	}
+
+	// Preload models
+	models, err := m.client.GetModels(ctx)
+	if err != nil {
+		log.Warnf("Failed to preload models from OpenCode: %v", err)
+		return fmt.Errorf("failed to preload models: %w", err)
+	}
+
+	log.Infof("Found %d models in OpenCode", len(models))
+	for _, model := range models {
+		meta := &storage.ModelMeta{
+			ID:          model.ID,
+			ProviderID:  model.ProviderID,
+			Name:        model.Name,
+			Family:      model.Family,
+			Status:      model.Status,
+			ReleaseDate: model.ReleaseDate,
+		}
+		if err := m.store.StoreModel(meta); err != nil {
+			log.Warnf("Failed to store model %s: %v", model.ID, err)
+			// Continue with other models
+		}
+	}
+
+	log.Info("Session manager initialization completed")
+	return nil
+}
+
+// GetAllModels returns all preloaded models from storage
+func (m *Manager) GetAllModels() ([]*storage.ModelMeta, error) {
+	return m.store.ListModels()
+}
+
+// GetModel retrieves a specific model by ID
+func (m *Manager) GetModel(modelID string) (*storage.ModelMeta, bool, error) {
+	return m.store.GetModel(modelID)
 }
 
 // GetOrCreateSession gets the current session for a user, or creates a new one
@@ -49,11 +110,22 @@ func (m *Manager) GetOrCreateSession(ctx context.Context, userID int64) (string,
 	defer m.mu.Unlock()
 
 	// Check if user has an existing session
-	if sessionID, exists := m.userSessions[userID]; exists {
+	sessionID, exists, err := m.store.GetUserSession(userID)
+	if err != nil {
+		return "", err
+	}
+	if exists {
 		// Update last used time
-		if meta, exists := m.sessions[sessionID]; exists {
+		meta, exists, err := m.store.GetSessionMeta(sessionID)
+		if err != nil {
+			return "", err
+		}
+		if exists {
 			meta.LastUsedAt = time.Now()
 			meta.MessageCount++
+			if err := m.store.StoreSessionMeta(meta); err != nil {
+				return "", err
+			}
 		}
 		return sessionID, nil
 	}
@@ -75,14 +147,16 @@ func (m *Manager) GetOrCreateSession(ctx context.Context, userID int64) (string,
 
 		if len(userSessions) > 0 {
 			// Use the most recent session (assuming later in list is newer)
-			// Could sort by creation time if needed
 			ocSession := userSessions[0]
 
 			// Check if we already have metadata for this session
-			meta, exists := m.sessions[ocSession.ID]
+			meta, exists, err := m.store.GetSessionMeta(ocSession.ID)
+			if err != nil {
+				return "", err
+			}
 			if !exists {
 				// Create new metadata
-				meta = &SessionMeta{
+				meta = &storage.SessionMeta{
 					SessionID:  ocSession.ID,
 					UserID:     userID,
 					Status:     "owned",
@@ -114,18 +188,25 @@ func (m *Manager) GetOrCreateSession(ctx context.Context, userID int64) (string,
 					}
 				}
 
-				m.sessions[ocSession.ID] = meta
+				if err := m.store.StoreSessionMeta(meta); err != nil {
+					return "", err
+				}
 			} else {
 				// Update existing metadata
 				meta.LastUsedAt = time.Now()
 				meta.UserID = userID  // Ensure user ID is correct
 				meta.Status = "owned" // Ensure status is correct
+				if err := m.store.StoreSessionMeta(meta); err != nil {
+					return "", err
+				}
 			}
 
 			meta.MessageCount++
 
 			// Store user mapping
-			m.userSessions[userID] = ocSession.ID
+			if err := m.store.StoreUserSession(userID, ocSession.ID); err != nil {
+				return "", err
+			}
 
 			log.Infof("Using existing OpenCode session %s for user %d", ocSession.ID, userID)
 			return ocSession.ID, nil
@@ -146,7 +227,7 @@ func (m *Manager) GetOrCreateSession(ctx context.Context, userID int64) (string,
 	}
 
 	// Create session metadata
-	meta := &SessionMeta{
+	meta := &storage.SessionMeta{
 		SessionID:    session.ID,
 		UserID:       userID,
 		Name:         "Telegram Session",
@@ -155,9 +236,15 @@ func (m *Manager) GetOrCreateSession(ctx context.Context, userID int64) (string,
 		MessageCount: 1,
 	}
 
-	// Store mappings
-	m.userSessions[userID] = session.ID
-	m.sessions[session.ID] = meta
+	// Store metadata
+	if err := m.store.StoreSessionMeta(meta); err != nil {
+		return "", err
+	}
+
+	// Store user mapping
+	if err := m.store.StoreUserSession(userID, session.ID); err != nil {
+		return "", err
+	}
 
 	log.Infof("Created new session %s for user %d", session.ID, userID)
 	return session.ID, nil
@@ -168,7 +255,11 @@ func (m *Manager) GetUserSession(userID int64) (string, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	sessionID, exists := m.userSessions[userID]
+	sessionID, exists, err := m.store.GetUserSession(userID)
+	if err != nil {
+		log.Errorf("Failed to get user session from store: %v", err)
+		return "", false
+	}
 	return sessionID, exists
 }
 
@@ -178,21 +269,33 @@ func (m *Manager) SetUserSession(userID int64, sessionID string) error {
 	defer m.mu.Unlock()
 
 	// Update user session mapping
-	m.userSessions[userID] = sessionID
+	if err := m.store.StoreUserSession(userID, sessionID); err != nil {
+		return err
+	}
 
 	// Update or create metadata
-	if meta, exists := m.sessions[sessionID]; exists {
+	meta, exists, err := m.store.GetSessionMeta(sessionID)
+	if err != nil {
+		return err
+	}
+	if exists {
 		meta.LastUsedAt = time.Now()
 		meta.UserID = userID
 		meta.Status = "owned"
+		if err := m.store.StoreSessionMeta(meta); err != nil {
+			return err
+		}
 	} else {
-		m.sessions[sessionID] = &SessionMeta{
+		meta = &storage.SessionMeta{
 			SessionID:    sessionID,
 			UserID:       userID,
 			Status:       "owned",
 			CreatedAt:    time.Now(),
 			LastUsedAt:   time.Now(),
 			MessageCount: 0,
+		}
+		if err := m.store.StoreSessionMeta(meta); err != nil {
+			return err
 		}
 	}
 
@@ -271,7 +374,7 @@ func (m *Manager) CreateNewSessionWithModel(ctx context.Context, userID int64, n
 	}
 
 	// Create session metadata
-	meta := &SessionMeta{
+	meta := &storage.SessionMeta{
 		SessionID:    session.ID,
 		UserID:       userID,
 		Name:         name,
@@ -284,7 +387,9 @@ func (m *Manager) CreateNewSessionWithModel(ctx context.Context, userID int64, n
 	}
 
 	// Store metadata
-	m.sessions[session.ID] = meta
+	if err := m.store.StoreSessionMeta(meta); err != nil {
+		return "", err
+	}
 
 	// Initialize session with the selected model if specified
 	if providerID != "" && modelID != "" {
@@ -311,7 +416,10 @@ func (m *Manager) SetSessionModel(ctx context.Context, sessionID, providerID, mo
 		log.Debugf("SetSessionModel: lock released for session %s, total function time: %v", sessionID, totalTime)
 	}()
 
-	meta, exists := m.sessions[sessionID]
+	meta, exists, err := m.store.GetSessionMeta(sessionID)
+	if err != nil {
+		return err
+	}
 	if !exists {
 		log.Errorf("SetSessionModel: session %s not found in session map", sessionID)
 		return fmt.Errorf("session not found: %s", sessionID)
@@ -323,6 +431,10 @@ func (m *Manager) SetSessionModel(ctx context.Context, sessionID, providerID, mo
 	meta.ModelID = modelID
 	meta.LastUsedAt = time.Now()
 	log.Debugf("SetSessionModel: updated metadata for session %s to %s/%s", sessionID, providerID, modelID)
+
+	if err := m.store.StoreSessionMeta(meta); err != nil {
+		return err
+	}
 
 	// Initialize session with the selected model
 	if providerID != "" && modelID != "" {
@@ -349,7 +461,10 @@ func (m *Manager) RenameSession(ctx context.Context, sessionID string, newName s
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	meta, exists := m.sessions[sessionID]
+	meta, exists, err := m.store.GetSessionMeta(sessionID)
+	if err != nil {
+		return err
+	}
 	if !exists {
 		return fmt.Errorf("session not found: %s", sessionID)
 	}
@@ -367,6 +482,9 @@ func (m *Manager) RenameSession(ctx context.Context, sessionID string, newName s
 	// Update local metadata
 	meta.Name = newName
 	meta.LastUsedAt = time.Now()
+	if err := m.store.StoreSessionMeta(meta); err != nil {
+		return err
+	}
 
 	log.Infof("Renamed session %s to '%s'", sessionID, newName)
 	return nil
@@ -377,7 +495,10 @@ func (m *Manager) DeleteSession(ctx context.Context, sessionID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	meta, exists := m.sessions[sessionID]
+	meta, exists, err := m.store.GetSessionMeta(sessionID)
+	if err != nil {
+		return err
+	}
 	if !exists {
 		// Session not in local cache, still try to delete from OpenCode
 		if err := m.client.DeleteSession(ctx, sessionID); err != nil {
@@ -398,15 +519,26 @@ func (m *Manager) DeleteSession(ctx context.Context, sessionID string) error {
 	}
 
 	// Remove from user mapping if this is their current session
-	for userID, userSessionID := range m.userSessions {
-		if userSessionID == sessionID {
-			delete(m.userSessions, userID)
-			break
+	// We need to find which user has this session as current
+	allSessions, err := m.store.ListSessions()
+	if err != nil {
+		log.Warnf("Failed to list sessions during delete: %v", err)
+	} else {
+		for _, sess := range allSessions {
+			if sess.SessionID == sessionID && sess.UserID != 0 {
+				// This session belongs to a user, remove their mapping
+				if err := m.store.DeleteUserSession(sess.UserID); err != nil {
+					log.Warnf("Failed to delete user session mapping for user %d: %v", sess.UserID, err)
+				}
+				break
+			}
 		}
 	}
 
 	// Remove from local cache
-	delete(m.sessions, sessionID)
+	if err := m.store.DeleteSessionMeta(sessionID); err != nil {
+		return err
+	}
 
 	log.Infof("Deleted session %s ('%s')", sessionID, meta.Name)
 	return nil
@@ -417,7 +549,11 @@ func (m *Manager) GetSessionMeta(sessionID string) (*SessionMeta, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	meta, exists := m.sessions[sessionID]
+	meta, exists, err := m.store.GetSessionMeta(sessionID)
+	if err != nil {
+		log.Errorf("Failed to get session meta from store: %v", err)
+		return nil, false
+	}
 	return meta, exists
 }
 
@@ -426,22 +562,10 @@ func (m *Manager) CleanupInactiveSessions(maxAge time.Duration) []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	now := time.Now()
-	var removed []string
-
-	for sessionID, meta := range m.sessions {
-		if now.Sub(meta.LastUsedAt) > maxAge {
-			// Remove from user mapping if this is their current session
-			for userID, userSessionID := range m.userSessions {
-				if userSessionID == sessionID {
-					delete(m.userSessions, userID)
-					break
-				}
-			}
-			// Remove session metadata
-			delete(m.sessions, sessionID)
-			removed = append(removed, sessionID)
-		}
+	removed, err := m.store.CleanupInactiveSessions(maxAge)
+	if err != nil {
+		log.Errorf("Failed to cleanup inactive sessions: %v", err)
+		return nil
 	}
 
 	if len(removed) > 0 {
@@ -454,7 +578,13 @@ func (m *Manager) CleanupInactiveSessions(maxAge time.Duration) []string {
 func (m *Manager) GetSessionCount() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return len(m.sessions)
+
+	sessions, err := m.store.ListSessions()
+	if err != nil {
+		log.Errorf("Failed to list sessions: %v", err)
+		return 0
+	}
+	return len(sessions)
 }
 
 // listLocalUserSessions lists sessions from local storage only
@@ -462,8 +592,14 @@ func (m *Manager) listLocalUserSessions(userID int64) []*SessionMeta {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	sessions, err := m.store.ListSessions()
+	if err != nil {
+		log.Errorf("Failed to list sessions: %v", err)
+		return nil
+	}
+
 	var userSessions []*SessionMeta
-	for _, meta := range m.sessions {
+	for _, meta := range sessions {
 		if meta.UserID == userID {
 			userSessions = append(userSessions, meta)
 		}
@@ -477,7 +613,13 @@ func (m *Manager) getOrCreateSessionMeta(sessionID string, currentUserID int64, 
 	defer m.mu.Unlock()
 
 	// Check if we already have metadata for this session
-	if meta, exists := m.sessions[sessionID]; exists {
+	meta, exists, err := m.store.GetSessionMeta(sessionID)
+	if err != nil {
+		// If error, create new meta
+		log.Warnf("Failed to get session meta for %s: %v, creating new", sessionID, err)
+		exists = false
+	}
+	if exists {
 		// Update last used time and recalculate status based on current user
 		meta.LastUsedAt = time.Now()
 		// Recalculate status based on owner ID and current user
@@ -487,6 +629,9 @@ func (m *Manager) getOrCreateSessionMeta(sessionID string, currentUserID int64, 
 			meta.Status = "owned"
 		} else {
 			meta.Status = "other"
+		}
+		if err := m.store.StoreSessionMeta(meta); err != nil {
+			log.Warnf("Failed to store updated session meta: %v", err)
 		}
 		return meta
 	}
@@ -500,7 +645,7 @@ func (m *Manager) getOrCreateSessionMeta(sessionID string, currentUserID int64, 
 	}
 
 	// Create new metadata
-	meta := &SessionMeta{
+	meta = &storage.SessionMeta{
 		SessionID:  sessionID,
 		UserID:     ownerID,
 		CreatedAt:  time.Now(),
@@ -536,15 +681,26 @@ func (m *Manager) getOrCreateSessionMeta(sessionID string, currentUserID int64, 
 	}
 
 	// Store in local cache
-	m.sessions[sessionID] = meta
+	if err := m.store.StoreSessionMeta(meta); err != nil {
+		log.Warnf("Failed to store new session meta: %v", err)
+	}
 
 	// Update user session mapping only if this session belongs to the current user
 	if meta.Status == "owned" {
-		currentSessionID, exists := m.userSessions[currentUserID]
-		if !exists || currentSessionID != sessionID {
-			m.userSessions[currentUserID] = sessionID
+		currentSessionID, exists, err := m.store.GetUserSession(currentUserID)
+		if err != nil {
+			log.Warnf("Failed to get user session for %d: %v", currentUserID, err)
+		} else if !exists || currentSessionID != sessionID {
+			if err := m.store.StoreUserSession(currentUserID, sessionID); err != nil {
+				log.Warnf("Failed to store user session mapping: %v", err)
+			}
 		}
 	}
 
 	return meta
+}
+
+// Close closes the storage backend
+func (m *Manager) Close() error {
+	return m.store.Close()
 }

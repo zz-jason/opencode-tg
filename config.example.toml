@@ -15,8 +15,8 @@ url = "http://192.168.50.100:8080"
 timeout = 30
 
 [storage]
-type = "memory"  # or "sqlite"
-sqlite_path = "sessions.db"
+type = "file"  # only "file" storage is supported
+sqlite_path = "sessions.json"  # path to JSON file for session storage
 
 [logging]
 level = "info"
