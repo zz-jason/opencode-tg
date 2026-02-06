@@ -18,6 +18,7 @@ type fileStore struct {
 	// in-memory data
 	userSessions map[int64]string
 	sessions     map[string]*SessionMeta
+	models       map[string]*ModelMeta
 
 	// dirty flag to track changes
 	dirty bool
@@ -29,6 +30,7 @@ func NewFileStore(filePath string) (Store, error) {
 		filePath:     filePath,
 		userSessions: make(map[int64]string),
 		sessions:     make(map[string]*SessionMeta),
+		models:       make(map[string]*ModelMeta),
 		dirty:        false,
 	}
 
@@ -53,6 +55,7 @@ func (f *fileStore) load() error {
 	var storedData struct {
 		UserSessions map[int64]string        `json:"user_sessions"`
 		Sessions     map[string]*SessionMeta `json:"sessions"`
+		Models       map[string]*ModelMeta   `json:"models,omitempty"`
 	}
 
 	if err := json.Unmarshal(data, &storedData); err != nil {
@@ -61,6 +64,10 @@ func (f *fileStore) load() error {
 
 	f.userSessions = storedData.UserSessions
 	f.sessions = storedData.Sessions
+	f.models = storedData.Models
+	if f.models == nil {
+		f.models = make(map[string]*ModelMeta)
+	}
 	f.dirty = false
 
 	return nil
@@ -79,9 +86,11 @@ func (f *fileStore) saveLocked() error {
 	storedData := struct {
 		UserSessions map[int64]string        `json:"user_sessions"`
 		Sessions     map[string]*SessionMeta `json:"sessions"`
+		Models       map[string]*ModelMeta   `json:"models,omitempty"`
 	}{
 		UserSessions: f.userSessions,
 		Sessions:     f.sessions,
+		Models:       f.models,
 	}
 
 	data, err := json.MarshalIndent(storedData, "", "  ")
@@ -211,6 +220,46 @@ func (f *fileStore) CleanupInactiveSessions(maxAge time.Duration) ([]string, err
 	}
 
 	return removed, nil
+}
+
+// StoreModel stores model metadata
+func (f *fileStore) StoreModel(meta *ModelMeta) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.models[meta.ID] = meta
+	f.markDirty()
+	return f.saveLocked()
+}
+
+// GetModel retrieves model metadata
+func (f *fileStore) GetModel(modelID string) (*ModelMeta, bool, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	meta, exists := f.models[modelID]
+	return meta, exists, nil
+}
+
+// ListModels returns all model metadata
+func (f *fileStore) ListModels() ([]*ModelMeta, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	models := make([]*ModelMeta, 0, len(f.models))
+	for _, meta := range f.models {
+		models = append(models, meta)
+	}
+	return models, nil
+}
+
+// DeleteModel removes model metadata
+func (f *fileStore) DeleteModel(modelID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	delete(f.models, modelID)
+	f.markDirty()
+	return f.saveLocked()
 }
 
 // Close implements Store interface

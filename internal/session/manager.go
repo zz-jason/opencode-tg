@@ -48,6 +48,62 @@ func NewManagerWithStore(client *opencode.Client, store storage.Store) *Manager 
 	}
 }
 
+// Initialize preloads sessions and models from OpenCode at bot startup
+func (m *Manager) Initialize(ctx context.Context) error {
+	log.Info("Initializing session manager: preloading sessions and models from OpenCode")
+
+	// Preload sessions
+	sessions, err := m.client.ListSessions(ctx)
+	if err != nil {
+		log.Warnf("Failed to preload sessions from OpenCode: %v", err)
+		// Continue to try loading models even if sessions fail
+	} else {
+		log.Infof("Found %d sessions in OpenCode", len(sessions))
+		for _, ocSession := range sessions {
+			// Use getOrCreateSessionMeta to ensure session metadata is stored
+			// We use 0 as userID since we don't know the owner at initialization
+			// getOrCreateSessionMeta will determine ownership from metadata
+			m.getOrCreateSessionMeta(ocSession.ID, 0, ocSession.Metadata, ocSession.Title)
+		}
+	}
+
+	// Preload models
+	models, err := m.client.GetModels(ctx)
+	if err != nil {
+		log.Warnf("Failed to preload models from OpenCode: %v", err)
+		return fmt.Errorf("failed to preload models: %w", err)
+	}
+
+	log.Infof("Found %d models in OpenCode", len(models))
+	for _, model := range models {
+		meta := &storage.ModelMeta{
+			ID:          model.ID,
+			ProviderID:  model.ProviderID,
+			Name:        model.Name,
+			Family:      model.Family,
+			Status:      model.Status,
+			ReleaseDate: model.ReleaseDate,
+		}
+		if err := m.store.StoreModel(meta); err != nil {
+			log.Warnf("Failed to store model %s: %v", model.ID, err)
+			// Continue with other models
+		}
+	}
+
+	log.Info("Session manager initialization completed")
+	return nil
+}
+
+// GetAllModels returns all preloaded models from storage
+func (m *Manager) GetAllModels() ([]*storage.ModelMeta, error) {
+	return m.store.ListModels()
+}
+
+// GetModel retrieves a specific model by ID
+func (m *Manager) GetModel(modelID string) (*storage.ModelMeta, bool, error) {
+	return m.store.GetModel(modelID)
+}
+
 // GetOrCreateSession gets the current session for a user, or creates a new one
 func (m *Manager) GetOrCreateSession(ctx context.Context, userID int64) (string, error) {
 	m.mu.Lock()

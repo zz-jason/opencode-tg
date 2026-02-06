@@ -30,6 +30,10 @@ type Bot struct {
 	modelMappingMu sync.RWMutex
 	modelMapping   map[int64]map[int]modelSelection
 
+	// Global model mapping (number -> modelSelection) - populated at startup
+	globalModelMappingMu sync.RWMutex
+	globalModelMapping   map[int]modelSelection
+
 	// Session mapping for each user (userID -> map[int]sessionID)
 	sessionMappingMu sync.RWMutex
 	sessionMapping   map[int64]map[int]string
@@ -103,15 +107,32 @@ func NewBot(cfg *config.Config) (*Bot, error) {
 	sessionManager := session.NewManagerWithStore(client, store)
 
 	bot := &Bot{
-		config:          cfg,
-		opencodeClient:  client,
-		sessionManager:  sessionManager,
-		ctx:             ctx,
-		cancel:          cancel,
-		modelMapping:    make(map[int64]map[int]modelSelection),
-		sessionMapping:  make(map[int64]map[int]string),
-		streamingStates: make(map[string]*streamingState),
+		config:             cfg,
+		opencodeClient:     client,
+		sessionManager:     sessionManager,
+		ctx:                ctx,
+		cancel:             cancel,
+		modelMapping:       make(map[int64]map[int]modelSelection),
+		globalModelMapping: make(map[int]modelSelection),
+		sessionMapping:     make(map[int64]map[int]string),
+		streamingStates:    make(map[string]*streamingState),
 	}
+
+	// Initialize session manager asynchronously to preload sessions and models
+	go func() {
+		initCtx, initCancel := context.WithTimeout(ctx, 10*time.Second)
+		defer initCancel()
+
+		if err := sessionManager.Initialize(initCtx); err != nil {
+			log.Warnf("Failed to initialize session manager (preloading sessions/models): %v", err)
+			log.Warn("Bot will start without preloaded sessions and models. Users will need to run /sessions and /models manually.")
+		} else {
+			log.Info("Session manager initialized successfully with preloaded sessions and models")
+
+			// Build global model mapping after successful initialization
+			bot.buildGlobalModelMapping(initCtx)
+		}
+	}()
 
 	return bot, nil
 }
@@ -1557,6 +1578,54 @@ func (b *Bot) handleCommand(c telebot.Context) error {
 	return c.Send("Command list functionality is not yet implemented.")
 }
 
+// buildGlobalModelMapping builds the global model mapping from preloaded models
+func (b *Bot) buildGlobalModelMapping(ctx context.Context) {
+	// Get providers to determine connection status
+	providersResp, err := b.opencodeClient.GetProviders(ctx)
+	if err != nil {
+		log.Warnf("Failed to get providers for global model mapping: %v", err)
+		return
+	}
+
+	// Create a set of connected provider IDs for faster lookup
+	connectedSet := make(map[string]bool)
+	for _, providerID := range providersResp.Connected {
+		connectedSet[providerID] = true
+	}
+
+	// Get preloaded models from storage
+	models, err := b.sessionManager.GetAllModels()
+	if err != nil {
+		log.Warnf("Failed to get preloaded models for global mapping: %v", err)
+		return
+	}
+
+	// Build mapping with sequential numbers
+	modelCounter := 1
+	globalMapping := make(map[int]modelSelection)
+
+	for _, model := range models {
+		// Only include models from connected providers
+		if !connectedSet[model.ProviderID] {
+			continue
+		}
+
+		globalMapping[modelCounter] = modelSelection{
+			ProviderID: model.ProviderID,
+			ModelID:    model.ID,
+			ModelName:  model.Name,
+		}
+		modelCounter++
+	}
+
+	// Store global mapping
+	b.globalModelMappingMu.Lock()
+	b.globalModelMapping = globalMapping
+	b.globalModelMappingMu.Unlock()
+
+	log.Infof("Built global model mapping with %d models from connected providers", len(globalMapping))
+}
+
 // storeModelMapping stores the model mapping for a user
 func (b *Bot) storeModelMapping(userID int64, mapping map[int]modelSelection) {
 	b.modelMappingMu.Lock()
@@ -1566,16 +1635,27 @@ func (b *Bot) storeModelMapping(userID int64, mapping map[int]modelSelection) {
 
 // getModelSelection gets a model selection by ID for a user
 func (b *Bot) getModelSelection(userID int64, modelID int) (modelSelection, bool) {
+	// First, try user-specific mapping
 	b.modelMappingMu.RLock()
-	defer b.modelMappingMu.RUnlock()
+	userMapping, userExists := b.modelMapping[userID]
+	b.modelMappingMu.RUnlock()
 
-	userMapping, exists := b.modelMapping[userID]
-	if !exists {
-		return modelSelection{}, false
+	if userExists {
+		if selection, exists := userMapping[modelID]; exists {
+			return selection, true
+		}
 	}
 
-	selection, exists := userMapping[modelID]
-	return selection, exists
+	// Fall back to global mapping
+	b.globalModelMappingMu.RLock()
+	selection, globalExists := b.globalModelMapping[modelID]
+	b.globalModelMappingMu.RUnlock()
+
+	if globalExists {
+		return selection, true
+	}
+
+	return modelSelection{}, false
 }
 
 // clearModelMapping clears the model mapping for a user

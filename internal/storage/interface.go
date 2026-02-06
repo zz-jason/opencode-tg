@@ -17,6 +17,16 @@ type SessionMeta struct {
 	Status       string // "owned", "orphaned", "other"
 }
 
+// ModelMeta contains metadata about an AI model
+type ModelMeta struct {
+	ID          string `json:"id"`
+	ProviderID  string `json:"providerID"`
+	Name        string `json:"name"`
+	Family      string `json:"family"`
+	Status      string `json:"status,omitempty"`
+	ReleaseDate string `json:"release_date,omitempty"`
+}
+
 // Store defines the interface for persistent session storage
 type Store interface {
 	// UserSession operations
@@ -32,6 +42,12 @@ type Store interface {
 	// Batch operations
 	ListSessions() ([]*SessionMeta, error)
 	CleanupInactiveSessions(maxAge time.Duration) ([]string, error)
+
+	// ModelMeta operations
+	StoreModel(meta *ModelMeta) error
+	GetModel(modelID string) (*ModelMeta, bool, error)
+	ListModels() ([]*ModelMeta, error)
+	DeleteModel(modelID string) error
 
 	// Maintenance
 	Close() error
