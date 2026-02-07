@@ -1410,7 +1410,7 @@ func TestIntegration_HandleCoreCommandsStreamingStartsSecondMessageBeforeComplet
 	_ = waitForTelegramMessage(t, rec.messages) // initial processing message
 
 	// Wait for second message (should contain content)
-	part2Msg, part2At := waitForTelegramMessage(t, rec.messages, 8*time.Second)
+	part2Msg, part2At := waitForTelegramMessageContaining(t, rec.messages, "", 8*time.Second)
 	if strings.HasPrefix(part2Msg, "✅") {
 		t.Fatalf("expected streaming-time second message, got final-style message: %q", part2Msg)
 	}
@@ -1419,7 +1419,7 @@ func TestIntegration_HandleCoreCommandsStreamingStartsSecondMessageBeforeComplet
 	}
 
 	// Wait for third message
-	part3Msg, part3At := waitForTelegramMessage(t, rec.messages, 8*time.Second)
+	part3Msg, part3At := waitForTelegramMessageContaining(t, rec.messages, "", 8*time.Second)
 	if strings.HasPrefix(part3Msg, "✅") {
 		t.Fatalf("expected streaming-time third message, got final-style message: %q", part3Msg)
 	}
@@ -1428,7 +1428,7 @@ func TestIntegration_HandleCoreCommandsStreamingStartsSecondMessageBeforeComplet
 	}
 
 	// Wait for final message (no completion notice expected)
-	finalMsg := waitForTelegramMessage(t, rec.messages, 8*time.Second)
+	finalMsg, _ := waitForTelegramMessageContaining(t, rec.messages, "", 8*time.Second)
 	// No completion notice should be added to the content
 	if strings.Contains(finalMsg, "--- ✅ Task completed ---") {
 		t.Fatalf("unexpected completion notice in final message, got: %q", finalMsg)
@@ -1595,7 +1595,7 @@ func TestIntegration_HandleCoreCommandsPeriodicFallbackStreamsPart2BeforeComplet
 	_ = waitForTelegramMessage(t, rec.messages) // initial processing message
 
 	// Wait for second message
-	part2Msg, part2At := waitForTelegramMessage(t, rec.messages, 10*time.Second)
+	part2Msg, part2At := waitForTelegramMessageContaining(t, rec.messages, "", 10*time.Second)
 	if strings.HasPrefix(part2Msg, "✅") {
 		t.Fatalf("expected streaming-time second message, got final-style message: %q", part2Msg)
 	}
@@ -1604,7 +1604,7 @@ func TestIntegration_HandleCoreCommandsPeriodicFallbackStreamsPart2BeforeComplet
 	}
 
 	// Wait for final message (no completion notice expected)
-	finalMsg := waitForTelegramMessage(t, rec.messages, 12*time.Second)
+	finalMsg, _ := waitForTelegramMessageContaining(t, rec.messages, "", 12*time.Second)
 	// No completion notice should be added to the content
 	if strings.Contains(finalMsg, "--- ✅ Task completed ---") {
 		t.Fatalf("unexpected completion notice in final message, got: %q", finalMsg)
