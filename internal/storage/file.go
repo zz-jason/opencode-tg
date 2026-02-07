@@ -17,12 +17,20 @@ type fileStore struct {
 	filePath string
 
 	// in-memory data
-	userSessions map[int64]string
-	sessions     map[string]*SessionMeta
-	models       map[string]*ModelMeta
+	userSessions     map[int64]string
+	sessions         map[string]*SessionMeta
+	models           map[string]*ModelMeta
+	userLastModels   map[int64]*modelPreference
+	userLastSessions map[int64]string
 
 	// dirty flag to track changes
 	dirty bool
+}
+
+// modelPreference stores provider and model ID for a user
+type modelPreference struct {
+	ProviderID string `json:"providerID"`
+	ModelID    string `json:"modelID"`
 }
 
 // NewFileStore creates a new file-based store
@@ -32,11 +40,13 @@ func NewFileStore(filePath string) (Store, error) {
 	}
 
 	store := &fileStore{
-		filePath:     filePath,
-		userSessions: make(map[int64]string),
-		sessions:     make(map[string]*SessionMeta),
-		models:       make(map[string]*ModelMeta),
-		dirty:        false,
+		filePath:         filePath,
+		userSessions:     make(map[int64]string),
+		sessions:         make(map[string]*SessionMeta),
+		models:           make(map[string]*ModelMeta),
+		userLastModels:   make(map[int64]*modelPreference),
+		userLastSessions: make(map[int64]string),
+		dirty:            false,
 	}
 
 	// Try to load existing data
@@ -79,9 +89,11 @@ func (f *fileStore) load() error {
 	}
 
 	var storedData struct {
-		UserSessions map[int64]string        `json:"user_sessions"`
-		Sessions     map[string]*SessionMeta `json:"sessions"`
-		Models       map[string]*ModelMeta   `json:"models,omitempty"`
+		UserSessions     map[int64]string           `json:"user_sessions"`
+		Sessions         map[string]*SessionMeta    `json:"sessions"`
+		Models           map[string]*ModelMeta      `json:"models,omitempty"`
+		UserLastModels   map[int64]*modelPreference `json:"user_last_models,omitempty"`
+		UserLastSessions map[int64]string           `json:"user_last_sessions,omitempty"`
 	}
 
 	if err := json.Unmarshal(data, &storedData); err != nil {
@@ -93,6 +105,14 @@ func (f *fileStore) load() error {
 	f.models = storedData.Models
 	if f.models == nil {
 		f.models = make(map[string]*ModelMeta)
+	}
+	f.userLastModels = storedData.UserLastModels
+	if f.userLastModels == nil {
+		f.userLastModels = make(map[int64]*modelPreference)
+	}
+	f.userLastSessions = storedData.UserLastSessions
+	if f.userLastSessions == nil {
+		f.userLastSessions = make(map[int64]string)
 	}
 	f.dirty = false
 
@@ -110,13 +130,17 @@ func (f *fileStore) save() error {
 // Caller must hold at least a read lock
 func (f *fileStore) saveLocked() error {
 	storedData := struct {
-		UserSessions map[int64]string        `json:"user_sessions"`
-		Sessions     map[string]*SessionMeta `json:"sessions"`
-		Models       map[string]*ModelMeta   `json:"models,omitempty"`
+		UserSessions     map[int64]string           `json:"user_sessions"`
+		Sessions         map[string]*SessionMeta    `json:"sessions"`
+		Models           map[string]*ModelMeta      `json:"models,omitempty"`
+		UserLastModels   map[int64]*modelPreference `json:"user_last_models,omitempty"`
+		UserLastSessions map[int64]string           `json:"user_last_sessions,omitempty"`
 	}{
-		UserSessions: f.userSessions,
-		Sessions:     f.sessions,
-		Models:       f.models,
+		UserSessions:     f.userSessions,
+		Sessions:         f.sessions,
+		Models:           f.models,
+		UserLastModels:   f.userLastModels,
+		UserLastSessions: f.userLastSessions,
 	}
 
 	data, err := json.MarshalIndent(storedData, "", "  ")
@@ -198,7 +222,16 @@ func (f *fileStore) DeleteSessionMeta(sessionID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	// Remove session metadata
 	delete(f.sessions, sessionID)
+
+	// Remove any user session mappings that reference this session
+	for userID, userSessionID := range f.userSessions {
+		if userSessionID == sessionID {
+			delete(f.userSessions, userID)
+		}
+	}
+
 	f.markDirty()
 	return f.saveLocked()
 }
@@ -286,6 +319,50 @@ func (f *fileStore) DeleteModel(modelID string) error {
 	delete(f.models, modelID)
 	f.markDirty()
 	return f.saveLocked()
+}
+
+// StoreUserLastModel stores the last model used by a user
+func (f *fileStore) StoreUserLastModel(userID int64, providerID, modelID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.userLastModels[userID] = &modelPreference{
+		ProviderID: providerID,
+		ModelID:    modelID,
+	}
+	f.markDirty()
+	return f.saveLocked()
+}
+
+// GetUserLastModel retrieves the last model used by a user
+func (f *fileStore) GetUserLastModel(userID int64) (providerID, modelID string, exists bool, err error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	pref, exists := f.userLastModels[userID]
+	if !exists {
+		return "", "", false, nil
+	}
+	return pref.ProviderID, pref.ModelID, true, nil
+}
+
+// StoreUserLastSession stores the last session used by a user
+func (f *fileStore) StoreUserLastSession(userID int64, sessionID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.userLastSessions[userID] = sessionID
+	f.markDirty()
+	return f.saveLocked()
+}
+
+// GetUserLastSession retrieves the last session used by a user
+func (f *fileStore) GetUserLastSession(userID int64) (sessionID string, exists bool, err error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	sessionID, exists = f.userLastSessions[userID]
+	return sessionID, exists, nil
 }
 
 // Close implements Store interface

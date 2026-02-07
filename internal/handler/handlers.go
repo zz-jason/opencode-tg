@@ -173,7 +173,6 @@ func (b *Bot) Start() {
 	b.tgBot.Handle("/models", b.handleModels)
 	b.tgBot.Handle("/providers", b.handleProviders)
 	b.tgBot.Handle("/setmodel", b.handleSetModel)
-	b.tgBot.Handle("/newmodel", b.handleNewModel)
 	b.tgBot.Handle("/rename", b.handleRename)
 	b.tgBot.Handle("/delete", b.handleDelete)
 
@@ -240,7 +239,6 @@ Model Selection:
 • /models - List available AI models (with numbers)
 • /providers - List AI providers
 • /setmodel <number> - Set model for current session
-• /newmodel <name> <number> - Create new session with specified model
 
 Interactive Mode:
 Send any non-command text and I'll send it as an instruction to OpenCode and stream back the response.
@@ -256,6 +254,12 @@ Notes:
 
 // handleSessions handles the /sessions command
 func (b *Bot) handleSessions(c telebot.Context) error {
+	// Synchronize sessions from OpenCode to local storage
+	if err := b.sessionManager.SyncSessions(b.ctx); err != nil {
+		log.Warnf("Failed to synchronize sessions: %v", err)
+		// Continue to show sessions anyway
+	}
+
 	userID := c.Sender().ID
 	sessions, err := b.sessionManager.ListUserSessions(b.ctx, userID)
 	if err != nil {
@@ -338,7 +342,18 @@ func (b *Bot) handleNew(c telebot.Context) error {
 	// Set as current session
 	b.sessionManager.SetUserSession(userID, sessionID)
 
-	return c.Send(fmt.Sprintf("✅ Created new session: %s\n\nThis session has been set as your current session.", name))
+	// Check if session has a model configured
+	meta, exists := b.sessionManager.GetSessionMeta(sessionID)
+	var message string
+	if exists && meta.ProviderID != "" && meta.ModelID != "" {
+		// Session has a model (likely from user's last preference)
+		message = fmt.Sprintf("✅ Created new session: %s\n\nThis session has been set as your current session.\n\n📋 Using your last model preference.", name)
+	} else {
+		// No model configured for this session
+		message = fmt.Sprintf("✅ Created new session: %s\n\nThis session has been set as your current session.\n\n⚠️ No AI model configured for this session.\n\nPlease use `/models` to view available models, then use `/setmodel <number>` to set a model for this session before sending messages.", name)
+	}
+
+	return c.Send(message)
 }
 
 // handleSwitch handles the /switch command
@@ -940,6 +955,12 @@ func (b *Bot) handleStatus(c telebot.Context) error {
 
 // handleModels lists available AI models
 func (b *Bot) handleModels(c telebot.Context) error {
+	// Synchronize models from OpenCode to local storage
+	if err := b.sessionManager.SyncModels(b.ctx); err != nil {
+		log.Warnf("Failed to synchronize models: %v", err)
+		// Continue to show models anyway
+	}
+
 	providersResp, err := b.opencodeClient.GetProviders(b.ctx)
 	if err != nil {
 		log.Errorf("Failed to get providers: %v", err)
@@ -1014,7 +1035,7 @@ func (b *Bot) handleModels(c telebot.Context) error {
 	}
 
 	sb.WriteString("Use /setmodel <number> to set model for current session.\n")
-	sb.WriteString("Use /newmodel <name> <number> to create new session with selected model.")
+	sb.WriteString("Use /new <name> to create new session (uses your last selected model).")
 
 	// Store the model mapping in the bot context (for this user)
 	// We'll store it in a simple way for now - could be enhanced with persistence
@@ -1149,44 +1170,7 @@ func (b *Bot) handleSetModel(c telebot.Context) error {
 	}
 
 	log.Infof("Successfully set model for user %d session %s to %s/%s", userID, sessionID, selection.ProviderID, selection.ModelID)
-	return c.Send(fmt.Sprintf("✅ Current session model set to %s (%s/%s)", selection.ModelName, selection.ProviderID, selection.ModelID))
-}
-
-// handleNewModel creates a new session with a specific model
-func (b *Bot) handleNewModel(c telebot.Context) error {
-	userID := c.Sender().ID
-	args := c.Args()
-
-	if len(args) != 2 {
-		return c.Send("Please specify session name and model number.\nUsage: /newmodel <name> <number>\nUse /models to view available models and their numbers.")
-	}
-
-	name := args[0]
-	modelNum, err := strconv.Atoi(args[1])
-	if err != nil {
-		return c.Send(fmt.Sprintf("Invalid model number: %s. Number must be an integer.\nUse /models to view available models and their numbers.", args[1]))
-	}
-
-	// Get model selection from mapping
-	selection, exists := b.getModelSelection(userID, modelNum)
-	if !exists {
-		return c.Send(fmt.Sprintf("Model with number %d not found. Please use /models to view the latest model list first.", modelNum))
-	}
-
-	// Create session with timeout
-	ctx, cancel := context.WithTimeout(b.ctx, 30*time.Second)
-	defer cancel()
-
-	sessionID, err := b.sessionManager.CreateNewSessionWithModel(ctx, userID, name, selection.ProviderID, selection.ModelID)
-	if err != nil {
-		log.Errorf("Failed to create session with model: %v", err)
-		return c.Send(fmt.Sprintf("Failed to create session: %v", err))
-	}
-
-	// Set as current session
-	b.sessionManager.SetUserSession(userID, sessionID)
-
-	return c.Send(fmt.Sprintf("✅ Created new session '%s' with model %s (%s/%s)", name, selection.ModelName, selection.ProviderID, selection.ModelID))
+	return c.Send(fmt.Sprintf("✅ Current session model set to %s (%s/%s)\n\nThis model will be used as your default for new sessions.", selection.ModelName, selection.ProviderID, selection.ModelID))
 }
 
 // handleText handles plain text messages (non-commands) with real-time streaming
@@ -1204,6 +1188,21 @@ func (b *Bot) handleText(c telebot.Context) error {
 	if err != nil {
 		log.Errorf("Failed to get/create session: %v", err)
 		return c.Send(fmt.Sprintf("Session error: %v", err))
+	}
+
+	// Get session metadata to check model configuration
+	var messageModel *opencode.MessageModel
+	meta, exists := b.sessionManager.GetSessionMeta(sessionID)
+	if exists && meta.ProviderID != "" && meta.ModelID != "" {
+		messageModel = &opencode.MessageModel{
+			ProviderID: meta.ProviderID,
+			ModelID:    meta.ModelID,
+		}
+		log.Debugf("Using session model %s/%s for message", meta.ProviderID, meta.ModelID)
+	} else {
+		// No model configured for this session
+		log.Warnf("No model configured for session %s", sessionID)
+		return c.Send("⚠️ No AI model configured for this session.\n\nPlease use `/models` to view available models, then use `/setmodel <number>` to set a model for this session.")
 	}
 
 	// Cancel any existing streaming for this session
@@ -1289,7 +1288,7 @@ func (b *Bot) handleText(c telebot.Context) error {
 	}
 
 	// Start streaming the message
-	err = b.opencodeClient.StreamMessage(ctx, sessionID, text, streamCallback)
+	err = b.opencodeClient.StreamMessage(ctx, sessionID, text, messageModel, streamCallback)
 	cancelPeriodic()
 	close(stopUpdates)
 	stopUpdatesClosed = true

@@ -49,6 +49,12 @@ type Store interface {
 	ListModels() ([]*ModelMeta, error)
 	DeleteModel(modelID string) error
 
+	// UserPreference operations
+	StoreUserLastModel(userID int64, providerID, modelID string) error
+	GetUserLastModel(userID int64) (providerID, modelID string, exists bool, err error)
+	StoreUserLastSession(userID int64, sessionID string) error
+	GetUserLastSession(userID int64) (sessionID string, exists bool, err error)
+
 	// Maintenance
 	Close() error
 }

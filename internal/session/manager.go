@@ -51,37 +51,44 @@ func NewManagerWithStore(client *opencode.Client, store storage.Store) *Manager 
 
 // Initialize preloads sessions and models from OpenCode at bot startup
 func (m *Manager) Initialize(ctx context.Context) error {
-	log.Info("Initializing session manager: preloading sessions and models from OpenCode")
+	log.Info("Initializing session manager: synchronizing sessions and models from OpenCode")
 
-	// Preload sessions
-	sessions, err := m.client.ListSessions(ctx)
-	if err != nil {
-		log.Warnf("Failed to preload sessions from OpenCode: %v", err)
+	// Synchronize sessions first
+	if err := m.SyncSessions(ctx); err != nil {
+		log.Warnf("Failed to synchronize sessions from OpenCode: %v", err)
 		// Continue to try loading models even if sessions fail
-	} else {
-		log.Infof("Found %d sessions in OpenCode", len(sessions))
-		for _, ocSession := range sessions {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
-			}
-
-			// Use getOrCreateSessionMeta to ensure session metadata is stored
-			// We use 0 as userID since we don't know the owner at initialization
-			// getOrCreateSessionMeta will determine ownership from metadata
-			m.getOrCreateSessionMeta(ocSession.ID, 0, ocSession.Metadata, ocSession.Title)
-		}
 	}
 
-	// Preload models
+	// Synchronize models
+	if err := m.SyncModels(ctx); err != nil {
+		log.Warnf("Failed to synchronize models from OpenCode: %v", err)
+		return fmt.Errorf("failed to synchronize models: %w", err)
+	}
+
+	log.Info("Session manager initialization completed")
+	return nil
+}
+
+// SyncModels synchronizes models from OpenCode to local storage
+func (m *Manager) SyncModels(ctx context.Context) error {
 	models, err := m.client.GetModels(ctx)
 	if err != nil {
-		log.Warnf("Failed to preload models from OpenCode: %v", err)
-		return fmt.Errorf("failed to preload models: %w", err)
+		return fmt.Errorf("failed to get models from OpenCode: %w", err)
 	}
 
-	log.Infof("Found %d models in OpenCode", len(models))
+	// Get existing models from storage for comparison
+	existingModels, err := m.store.ListModels()
+	if err != nil {
+		return fmt.Errorf("failed to list existing models: %w", err)
+	}
+
+	// Create map of existing model IDs for fast lookup
+	existingModelMap := make(map[string]bool)
+	for _, model := range existingModels {
+		existingModelMap[model.ID] = true
+	}
+
+	// Add or update models from OpenCode
 	for _, model := range models {
 		select {
 		case <-ctx.Done():
@@ -101,10 +108,84 @@ func (m *Manager) Initialize(ctx context.Context) error {
 			log.Warnf("Failed to store model %s: %v", model.ID, err)
 			// Continue with other models
 		}
+		delete(existingModelMap, model.ID)
 	}
 
-	log.Info("Session manager initialization completed")
+	// Remove models that no longer exist in OpenCode
+	for modelID := range existingModelMap {
+		if err := m.store.DeleteModel(modelID); err != nil {
+			log.Warnf("Failed to delete model %s: %v", modelID, err)
+		}
+	}
+
+	log.Infof("Synchronized %d models from OpenCode", len(models))
 	return nil
+}
+
+// SyncSessions synchronizes sessions from OpenCode to local storage
+func (m *Manager) SyncSessions(ctx context.Context) error {
+	opencodeSessions, err := m.client.ListSessions(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get sessions from OpenCode: %w", err)
+	}
+
+	// Get existing sessions from storage for comparison
+	existingSessions, err := m.store.ListSessions()
+	if err != nil {
+		return fmt.Errorf("failed to list existing sessions: %w", err)
+	}
+
+	// Create map of existing session IDs for fast lookup
+	existingSessionMap := make(map[string]bool)
+	for _, sess := range existingSessions {
+		existingSessionMap[sess.SessionID] = true
+	}
+
+	// Add or update sessions from OpenCode
+	for _, ocSession := range opencodeSessions {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		// Use getOrCreateSessionMeta to ensure session metadata is stored
+		// We use 0 as userID since we don't know the owner at sync time
+		// getOrCreateSessionMeta will determine ownership from metadata
+		m.getOrCreateSessionMeta(ocSession.ID, 0, ocSession.Metadata, ocSession.Title)
+		delete(existingSessionMap, ocSession.ID)
+	}
+
+	// Remove sessions that no longer exist in OpenCode (orphaned sessions)
+	for sessionID := range existingSessionMap {
+		log.Debugf("Removing orphaned session from local storage: %s", sessionID)
+		if err := m.store.DeleteSessionMeta(sessionID); err != nil {
+			log.Warnf("Failed to remove orphaned session %s: %v", sessionID, err)
+		}
+	}
+
+	log.Infof("Synchronized %d sessions from OpenCode", len(opencodeSessions))
+	return nil
+}
+
+// GetUserLastModel retrieves the last model used by a user
+func (m *Manager) GetUserLastModel(userID int64) (providerID, modelID string, exists bool, err error) {
+	return m.store.GetUserLastModel(userID)
+}
+
+// SetUserLastModel sets the last model used by a user
+func (m *Manager) SetUserLastModel(userID int64, providerID, modelID string) error {
+	return m.store.StoreUserLastModel(userID, providerID, modelID)
+}
+
+// GetUserLastSession retrieves the last session used by a user
+func (m *Manager) GetUserLastSession(userID int64) (sessionID string, exists bool, err error) {
+	return m.store.GetUserLastSession(userID)
+}
+
+// SetUserLastSession sets the last session used by a user
+func (m *Manager) SetUserLastSession(userID int64, sessionID string) error {
+	return m.store.StoreUserLastSession(userID, sessionID)
 }
 
 // GetAllModels returns all preloaded models from storage
@@ -121,6 +202,35 @@ func (m *Manager) GetModel(modelID string) (*storage.ModelMeta, bool, error) {
 func (m *Manager) GetOrCreateSession(ctx context.Context, userID int64) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// Try to use user's last session first
+	lastSessionID, lastExists, err := m.store.GetUserLastSession(userID)
+	if err != nil {
+		log.Warnf("Failed to get user last session: %v", err)
+		// Continue with normal flow
+	}
+	if lastExists && lastSessionID != "" {
+		// Verify the last session exists and belongs to the user
+		meta, exists, err := m.store.GetSessionMeta(lastSessionID)
+		if err != nil {
+			log.Warnf("Failed to get session meta for last session %s: %v", lastSessionID, err)
+		} else if exists && meta.UserID == userID && meta.Status == "owned" {
+			// Session exists and belongs to user, update last used time
+			meta.LastUsedAt = time.Now()
+			meta.MessageCount++
+			if err := m.store.StoreSessionMeta(meta); err != nil {
+				log.Warnf("Failed to update last session meta: %v", err)
+			}
+			// Ensure user session mapping is set
+			if err := m.store.StoreUserSession(userID, lastSessionID); err != nil {
+				log.Warnf("Failed to store user session mapping: %v", err)
+			}
+			log.Infof("Using user's last session %s for user %d", lastSessionID, userID)
+			return lastSessionID, nil
+		}
+		// Last session is invalid, continue with normal flow
+		log.Debugf("Last session %s is invalid for user %d, falling back to normal flow", lastSessionID, userID)
+	}
 
 	// Check if user has an existing session
 	sessionID, exists, err := m.store.GetUserSession(userID)
@@ -139,6 +249,11 @@ func (m *Manager) GetOrCreateSession(ctx context.Context, userID int64) (string,
 			if err := m.store.StoreSessionMeta(meta); err != nil {
 				return "", err
 			}
+		}
+		// Update user's last session preference
+		if err := m.store.StoreUserLastSession(userID, sessionID); err != nil {
+			log.Warnf("Failed to update user last session: %v", err)
+			// Continue, as this is not critical
 		}
 		return sessionID, nil
 	}
@@ -221,6 +336,11 @@ func (m *Manager) GetOrCreateSession(ctx context.Context, userID int64) (string,
 				return "", err
 			}
 
+			// Update last session preference
+			if err := m.store.StoreUserLastSession(userID, ocSession.ID); err != nil {
+				log.Warnf("Failed to update user last session: %v", err)
+			}
+
 			log.Infof("Using existing OpenCode session %s for user %d", ocSession.ID, userID)
 			return ocSession.ID, nil
 		}
@@ -249,6 +369,16 @@ func (m *Manager) GetOrCreateSession(ctx context.Context, userID int64) (string,
 		MessageCount: 1,
 	}
 
+	// Extract model information from session metadata if available
+	if session.Metadata != nil {
+		if providerID := getMetadataString(session.Metadata, "provider_id", "providerID"); providerID != "" {
+			meta.ProviderID = providerID
+		}
+		if modelID := getMetadataString(session.Metadata, "model_id", "modelID"); modelID != "" {
+			meta.ModelID = modelID
+		}
+	}
+
 	// Store metadata
 	if err := m.store.StoreSessionMeta(meta); err != nil {
 		return "", err
@@ -257,6 +387,11 @@ func (m *Manager) GetOrCreateSession(ctx context.Context, userID int64) (string,
 	// Store user mapping
 	if err := m.store.StoreUserSession(userID, session.ID); err != nil {
 		return "", err
+	}
+
+	// Update last session preference
+	if err := m.store.StoreUserLastSession(userID, session.ID); err != nil {
+		log.Warnf("Failed to update user last session: %v", err)
 	}
 
 	log.Infof("Created new session %s for user %d", session.ID, userID)
@@ -312,6 +447,12 @@ func (m *Manager) SetUserSession(userID int64, sessionID string) error {
 		}
 	}
 
+	// Update user's last session preference
+	if err := m.store.StoreUserLastSession(userID, sessionID); err != nil {
+		log.Warnf("Failed to update user last session: %v", err)
+		// Continue, as this is not critical
+	}
+
 	log.Infof("User %d switched to session %s", userID, sessionID)
 	return nil
 }
@@ -328,34 +469,29 @@ func (m *Manager) ListUserSessions(ctx context.Context, userID int64) ([]*Sessio
 
 	var allSessions []*SessionMeta
 
+	// Create a map of OpenCode session IDs for fast lookup
+	opencodeSessionMap := make(map[string]bool)
+	for _, ocSession := range opencodeSessions {
+		opencodeSessionMap[ocSession.ID] = true
+	}
+
+	// Get local sessions for this user
+	localSessions := m.listLocalUserSessions(userID)
+
+	// Remove local sessions that don't exist in OpenCode (orphaned sessions)
+	for _, localSession := range localSessions {
+		if !opencodeSessionMap[localSession.SessionID] {
+			log.Debugf("Removing orphaned session for user %d: %s", userID, localSession.SessionID)
+			if err := m.store.DeleteSessionMeta(localSession.SessionID); err != nil {
+				log.Warnf("Failed to remove orphaned session %s: %v", localSession.SessionID, err)
+			}
+		}
+	}
+
 	// Process all OpenCode sessions
 	for _, ocSession := range opencodeSessions {
 		meta := m.getOrCreateSessionMeta(ocSession.ID, userID, ocSession.Metadata, ocSession.Title)
 		allSessions = append(allSessions, meta)
-	}
-
-	// Also include any local sessions that might not be in OpenCode (for backward compatibility)
-	localSessions := m.listLocalUserSessions(userID)
-	for _, local := range localSessions {
-		// Check if already included from OpenCode
-		found := false
-		for _, opencodeSession := range allSessions {
-			if opencodeSession.SessionID == local.SessionID {
-				found = true
-				break
-			}
-		}
-		if !found {
-			// Ensure local session has correct status
-			if local.UserID == userID {
-				local.Status = "owned"
-			} else if local.UserID == 0 {
-				local.Status = "orphaned"
-			} else {
-				local.Status = "other"
-			}
-			allSessions = append(allSessions, local)
-		}
 	}
 
 	// Sync message count and model info from OpenCode to avoid stale local counters.
@@ -366,7 +502,17 @@ func (m *Manager) ListUserSessions(ctx context.Context, userID int64) ([]*Sessio
 
 // CreateNewSession creates a new session for a user
 func (m *Manager) CreateNewSession(ctx context.Context, userID int64, name string) (string, error) {
-	return m.CreateNewSessionWithModel(ctx, userID, name, "", "")
+	// Try to use user's last model as default
+	providerID, modelID, exists, err := m.GetUserLastModel(userID)
+	if err != nil {
+		log.Warnf("Failed to get user last model: %v", err)
+		// Continue with empty model
+		providerID, modelID = "", ""
+	}
+	if !exists {
+		providerID, modelID = "", ""
+	}
+	return m.CreateNewSessionWithModel(ctx, userID, name, providerID, modelID)
 }
 
 // CreateNewSessionWithModel creates a new session for a user with specific model
@@ -413,6 +559,20 @@ func (m *Manager) CreateNewSessionWithModel(ctx context.Context, userID int64, n
 			log.Warnf("Failed to initialize session with model %s/%s: %v", providerID, modelID, err)
 			// Continue anyway, session will use default model
 		}
+	}
+
+	// Update user's last model preference if a model was specified
+	if providerID != "" && modelID != "" {
+		if err := m.store.StoreUserLastModel(userID, providerID, modelID); err != nil {
+			log.Warnf("Failed to update user last model: %v", err)
+			// Continue, as this is not critical
+		}
+	}
+
+	// Update user's last session preference
+	if err := m.store.StoreUserLastSession(userID, session.ID); err != nil {
+		log.Warnf("Failed to update user last session: %v", err)
+		// Continue, as this is not critical
 	}
 
 	log.Infof("Created new named session %s (%s) with model %s/%s for user %d", session.ID, name, providerID, modelID, userID)
@@ -465,6 +625,14 @@ func (m *Manager) SetSessionModel(ctx context.Context, sessionID, providerID, mo
 		}
 		initTime := time.Since(initStart)
 		log.Debugf("SetSessionModel: successfully initialized session %s with model %s/%s after %v", sessionID, providerID, modelID, initTime)
+	}
+
+	// Update user's last model preference
+	if meta.UserID != 0 {
+		if err := m.store.StoreUserLastModel(meta.UserID, providerID, modelID); err != nil {
+			log.Warnf("Failed to update user last model: %v", err)
+			// Continue, as this is not critical
+		}
 	}
 
 	totalTime := time.Since(startTime)
