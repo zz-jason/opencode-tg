@@ -14,6 +14,7 @@ import (
 	"gopkg.in/telebot.v4"
 	"tg-bot/internal/config"
 	"tg-bot/internal/opencode"
+	"tg-bot/internal/render"
 	"tg-bot/internal/session"
 	"tg-bot/internal/storage"
 )
@@ -42,6 +43,7 @@ type Bot struct {
 	// Streaming state management
 	streamingStateMu sync.RWMutex
 	streamingStates  map[string]*streamingState
+	renderer         *render.Renderer
 }
 
 // streamingState tracks the state of an active streaming response
@@ -119,6 +121,7 @@ func NewBot(cfg *config.Config) (*Bot, error) {
 		globalModelMapping: make(map[int]modelSelection),
 		sessionMapping:     make(map[int64]map[int]string),
 		streamingStates:    make(map[string]*streamingState),
+		renderer:           render.New(cfg.Render.Mode),
 	}
 
 	// Initialize session manager asynchronously to preload sessions and models
@@ -1213,7 +1216,7 @@ func (b *Bot) handleText(c telebot.Context) error {
 	b.streamingStateMu.Unlock()
 
 	// Send initial "processing" message
-	processingMsg, err := c.Bot().Send(c.Chat(), "🤖 Processing...")
+	processingMsg, err := c.Bot().Send(c.Chat(), "Processing...")
 	if err != nil {
 		return err
 	}
@@ -1240,7 +1243,7 @@ func (b *Bot) handleText(c telebot.Context) error {
 		stopUpdates:      stopUpdates,
 		telegramMsg:      processingMsg,
 		telegramMessages: []*telebot.Message{processingMsg},
-		lastRendered:     []string{"🤖 Processing..."},
+		lastRendered:     []string{"Processing..."},
 		telegramCtx:      c,
 		content:          &strings.Builder{},
 		lastUpdate:       time.Now(),
@@ -1274,6 +1277,17 @@ func (b *Bot) handleText(c telebot.Context) error {
 		b.periodicMessageUpdates(periodicCtx, streamingState, sessionID, stopUpdates)
 	}()
 
+	// Check if OpenCode server is reachable before starting stream
+	healthCtx, healthCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer healthCancel()
+
+	if healthErr := b.opencodeClient.HealthCheck(healthCtx); healthErr != nil {
+		log.Warnf("OpenCode health check failed before streaming: %v", healthErr)
+		// Continue anyway, but log the warning
+	} else {
+		log.Debugf("OpenCode health check passed before streaming")
+	}
+
 	// Start streaming the message
 	err = b.opencodeClient.StreamMessage(ctx, sessionID, text, streamCallback)
 	cancelPeriodic()
@@ -1299,7 +1313,7 @@ func (b *Bot) handleText(c telebot.Context) error {
 			errorMsg = finalContent + "\n\n---\n\n" + errorMsg
 		}
 
-		c.Bot().Edit(processingMsg, errorMsg)
+		b.updateTelegramMessage(c, processingMsg, errorMsg, false)
 		return nil
 	}
 
@@ -1307,14 +1321,14 @@ func (b *Bot) handleText(c telebot.Context) error {
 	// Mark streaming as complete
 	streamingState.isComplete = true
 
-	// Get final content. Prefer the most complete assistant content available:
-	// streamed chunks and periodically-polled message content may differ by timing.
+	// Get final content. Merge streamed chunks and fallback snapshot conservatively
+	// to avoid dropping earlier content when fallback returns a partial tail.
 	finalContent := streamingState.content.String()
 	fallbackContent, fallbackErr := b.waitForLatestAssistantContent(sessionID, 3*time.Second)
 	if fallbackErr != nil {
 		log.Warnf("Failed to fetch latest assistant content for fallback: %v", fallbackErr)
-	} else if len(strings.TrimSpace(fallbackContent)) > len(strings.TrimSpace(finalContent)) {
-		finalContent = fallbackContent
+	} else {
+		finalContent = mergeContentCandidate(finalContent, fallbackContent)
 	}
 	if finalContent == "" {
 		finalContent = "🤖 Response completed with no content."
@@ -1795,7 +1809,7 @@ func (b *Bot) periodicMessageUpdates(ctx context.Context, state *streamingState,
 
 			state.updateMutex.Lock()
 			if !foundAssistantMsg {
-				b.updateStreamingTelegramMessages(state, []string{"🤖 Processing...\n\nModel is thinking, please wait..."})
+				b.updateStreamingTelegramMessages(state, []string{"Processing...\n\nModel is thinking, please wait..."})
 				state.updateMutex.Unlock()
 				continue
 			}
@@ -1803,10 +1817,7 @@ func (b *Bot) periodicMessageUpdates(ctx context.Context, state *streamingState,
 			// Prefer the same content-driven stream layout whenever content exists.
 			// This guarantees page 2/page 3 can start updating before completion.
 			currentContent := state.content.String()
-			displayContent := currentContent
-			if len(strings.TrimSpace(latestAssistantMsg.Content)) > len(strings.TrimSpace(displayContent)) {
-				displayContent = latestAssistantMsg.Content
-			}
+			displayContent := mergeContentCandidate(currentContent, latestAssistantMsg.Content)
 			var displays []string
 			if strings.TrimSpace(displayContent) != "" {
 				displays = b.formatStreamingDisplays(displayContent)
@@ -1864,7 +1875,7 @@ func (b *Bot) formatMessageForDisplay(msg opencode.Message, isCompleted bool) st
 		// Don't show redundant status lines
 		if msg.Content == "" && len(msg.Parts) == 0 {
 			// If no content yet, show minimal status
-			sb.WriteString("🤖 Processing...")
+			sb.WriteString("Processing...")
 		}
 		sb.WriteString("\n\n⏳ Auto-updating...")
 	}
@@ -1872,33 +1883,135 @@ func (b *Bot) formatMessageForDisplay(msg opencode.Message, isCompleted bool) st
 	return sb.String()
 }
 
-// updateTelegramMessage updates a Telegram message with new content
-func (b *Bot) updateTelegramMessage(c telebot.Context, msg *telebot.Message, content string) {
+type telegramRenderResult struct {
+	primaryText string
+	primaryMode telebot.ParseMode
+	fallback    string
+}
+
+func (b *Bot) buildTelegramRenderResult(content string, streaming bool) telegramRenderResult {
+	if b.renderer == nil {
+		return telegramRenderResult{
+			primaryText: content,
+			primaryMode: telebot.ModeDefault,
+			fallback:    content,
+		}
+	}
+
+	rendered := b.renderer.Render(content, streaming)
+	mode := telebot.ModeDefault
+	if rendered.UseHTML {
+		mode = telebot.ModeHTML
+	}
+	fallback := rendered.FallbackText
+	if fallback == "" {
+		fallback = content
+	}
+	return telegramRenderResult{
+		primaryText: rendered.Text,
+		primaryMode: mode,
+		fallback:    fallback,
+	}
+}
+
+func (b *Bot) truncateTelegramText(content string) string {
+	if len(content) > 4000 {
+		log.Debugf("Message content too long (%d chars), truncating to 4000", len(content))
+		return content[:4000] + "\n...(content too long, truncated)"
+	}
+	return content
+}
+
+func (b *Bot) sendTelegramWithMode(c telebot.Context, text string, mode telebot.ParseMode) (*telebot.Message, error) {
+	if mode == telebot.ModeDefault {
+		return c.Bot().Send(c.Chat(), text)
+	}
+	return c.Bot().Send(c.Chat(), text, mode)
+}
+
+func (b *Bot) editTelegramWithMode(c telebot.Context, msg *telebot.Message, text string, mode telebot.ParseMode) (*telebot.Message, error) {
+	if mode == telebot.ModeDefault {
+		return c.Bot().Edit(msg, text)
+	}
+	return c.Bot().Edit(msg, text, mode)
+}
+
+func (b *Bot) sendRenderedTelegramMessage(c telebot.Context, content string, streaming bool) (*telebot.Message, error) {
+	rendered := b.buildTelegramRenderResult(content, streaming)
+	primary := b.truncateTelegramText(rendered.primaryText)
+	fallback := b.truncateTelegramText(rendered.fallback)
+
+	if rendered.primaryMode != telebot.ModeDefault && len(primary) >= 4000 {
+		primary = fallback
+		rendered.primaryMode = telebot.ModeDefault
+	}
+
+	msg, err := b.sendTelegramWithMode(c, primary, rendered.primaryMode)
+	if err == nil {
+		msg.Text = primary
+		return msg, nil
+	}
+	if rendered.primaryMode != telebot.ModeDefault && isTelegramParseModeError(err) {
+		log.Debugf("Telegram HTML render failed on send, falling back to plain text: %v", err)
+		msg, fallbackErr := b.sendTelegramWithMode(c, fallback, telebot.ModeDefault)
+		if fallbackErr == nil {
+			msg.Text = fallback
+		}
+		return msg, fallbackErr
+	}
+	return nil, err
+}
+
+// updateTelegramMessage updates a Telegram message with new content.
+func (b *Bot) updateTelegramMessage(c telebot.Context, msg *telebot.Message, content string, streaming bool) {
 	if msg == nil {
 		log.Warn("updateTelegramMessage called with nil message")
 		return
 	}
 
-	// Ensure content is not too long for Telegram
-	if len(content) > 4000 {
-		log.Debugf("Message content too long (%d chars), truncating to 4000", len(content))
-		content = content[:4000] + "\n...(content too long, truncated)"
+	rendered := b.buildTelegramRenderResult(content, streaming)
+	primary := b.truncateTelegramText(rendered.primaryText)
+	fallback := b.truncateTelegramText(rendered.fallback)
+
+	if rendered.primaryMode != telebot.ModeDefault && len(primary) >= 4000 {
+		primary = fallback
+		rendered.primaryMode = telebot.ModeDefault
 	}
-	if msg.Text == content {
+
+	if msg.Text == primary {
 		log.Debug("Skipping Telegram edit because message content is unchanged")
 		return
 	}
 
-	// Try to update the message
-	if _, err := c.Bot().Edit(msg, content); err != nil {
+	if _, err := b.editTelegramWithMode(c, msg, primary, rendered.primaryMode); err != nil {
 		if isMessageNotModifiedError(err) {
 			log.Debugf("Skipping no-op Telegram edit: %v", err)
-			msg.Text = content
+			msg.Text = primary
 			return
 		}
+
+		if rendered.primaryMode != telebot.ModeDefault && isTelegramParseModeError(err) {
+			log.Debugf("Telegram HTML render failed on edit, falling back to plain text: %v", err)
+			if _, fallbackErr := b.editTelegramWithMode(c, msg, fallback, telebot.ModeDefault); fallbackErr == nil {
+				msg.Text = fallback
+				return
+			} else {
+				log.Warnf("Failed to update Telegram message with rendered HTML and fallback plain text: %v", fallbackErr)
+			}
+		}
+
 		log.Warnf("Failed to update Telegram message: %v", err)
 		// If editing fails, try to send a new message
-		newMsg, err := c.Bot().Send(c.Chat(), content)
+		newMsg, err := b.sendTelegramWithMode(c, primary, rendered.primaryMode)
+		if err != nil {
+			if rendered.primaryMode != telebot.ModeDefault && isTelegramParseModeError(err) {
+				log.Debugf("Telegram HTML render failed on resend, falling back to plain text: %v", err)
+				newMsg, err = b.sendTelegramWithMode(c, fallback, telebot.ModeDefault)
+				if err == nil {
+					newMsg.Text = fallback
+				}
+			}
+		}
 		if err != nil {
 			log.Errorf("Failed to send new message: %v", err)
 			return
@@ -1907,7 +2020,7 @@ func (b *Bot) updateTelegramMessage(c telebot.Context, msg *telebot.Message, con
 		*msg = *newMsg
 		log.Debugf("Sent new message due to edit failure, new message ID: %d", newMsg.ID)
 	} else {
-		msg.Text = content
+		msg.Text = primary
 		log.Debugf("Successfully edited message ID %d", msg.ID)
 	}
 }
@@ -1917,6 +2030,16 @@ func isMessageNotModifiedError(err error) bool {
 		return false
 	}
 	return strings.Contains(strings.ToLower(err.Error()), "message is not modified")
+}
+
+func isTelegramParseModeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	normalized := strings.ToLower(err.Error())
+	return strings.Contains(normalized, "can't parse entities") ||
+		strings.Contains(normalized, "can't find end of") ||
+		strings.Contains(normalized, "entity") && strings.Contains(normalized, "parse")
 }
 
 // handleRename handles the /rename command
@@ -2034,11 +2157,18 @@ func (b *Bot) handleStreamChunk(state *streamingState, textChunk string) error {
 	// Some stream providers emit cumulative snapshots instead of pure deltas.
 	// Normalize to incremental append to avoid duplicated content growth.
 	currentBefore := state.content.String()
-	delta := streamChunkDelta(currentBefore, textChunk)
-	if delta == "" {
-		return nil
+	delta := ""
+	if isCumulativeSnapshotRewrite(currentBefore, textChunk) {
+		state.content.Reset()
+		state.content.WriteString(textChunk)
+		delta = textChunk
+	} else {
+		delta = streamChunkDelta(currentBefore, textChunk)
+		if delta == "" {
+			return nil
+		}
+		state.content.WriteString(delta)
 	}
-	state.content.WriteString(delta)
 	currentContent := state.content.String()
 
 	// Track content length for update decisions
@@ -2129,43 +2259,100 @@ func longestSuffixPrefixOverlap(left, right string) int {
 	return 0
 }
 
+func commonPrefixLength(left, right string) int {
+	max := len(left)
+	if len(right) < max {
+		max = len(right)
+	}
+	i := 0
+	for i < max && left[i] == right[i] {
+		i++
+	}
+	return i
+}
+
+func mergeContentCandidate(current, candidate string) string {
+	if strings.TrimSpace(candidate) == "" {
+		return current
+	}
+	if strings.TrimSpace(current) == "" {
+		return candidate
+	}
+	if strings.HasPrefix(candidate, current) {
+		return candidate
+	}
+	if strings.HasPrefix(current, candidate) {
+		return current
+	}
+	if strings.Contains(candidate, current) && len(candidate) > len(current) {
+		return candidate
+	}
+	if strings.Contains(current, candidate) {
+		return current
+	}
+	if isCumulativeSnapshotRewrite(current, candidate) {
+		return candidate
+	}
+
+	overlap := longestSuffixPrefixOverlap(current, candidate)
+	if overlap > 0 {
+		if overlap >= 64 || (len(candidate) > 0 && overlap*100 >= len(candidate)*60) {
+			return current + candidate[overlap:]
+		}
+	}
+
+	return current
+}
+
+func isCumulativeSnapshotRewrite(existing, chunk string) bool {
+	if existing == "" || chunk == "" {
+		return false
+	}
+	if len(chunk) <= len(existing) {
+		return false
+	}
+	prefix := commonPrefixLength(existing, chunk)
+	if prefix == 0 {
+		return false
+	}
+
+	existingTailDelta := len(existing) - prefix
+	if strings.HasPrefix(existing, "```") && prefix >= 8 && existingTailDelta <= 128 {
+		return true
+	}
+	if prefix >= 128 && existingTailDelta <= 512 {
+		return true
+	}
+	if prefix >= 64 && prefix*100 >= len(existing)*80 && existingTailDelta <= 1024 {
+		return true
+	}
+	return false
+}
+
 // formatStreamingContent formats streaming content for display
 func (b *Bot) formatStreamingDisplays(content string) []string {
 	// Trim trailing whitespace
 	content = strings.TrimSpace(content)
 
 	if content == "" {
-		return []string{"🤖 Processing..."}
+		return []string{"Processing..."}
 	}
 
 	// Split full content into stable streaming pages so page 1 can keep updating
 	// until full, then page 2 starts streaming, and so on.
 	chunks := b.splitLongContent(content)
 	if len(chunks) == 0 {
-		return []string{"🤖 Processing..."}
+		return []string{"Processing..."}
 	}
 
-	displays := make([]string, 0, len(chunks))
-	progressText := b.streamingProgressText(len(content))
-	for i, chunk := range chunks {
-		if len(chunks) == 1 {
-			displays = append(displays, fmt.Sprintf("🤖▌\n%s%s", chunk, progressText))
-			continue
-		}
-		header := fmt.Sprintf("🤖 Part %d/%d", i+1, len(chunks))
-		if i == len(chunks)-1 {
-			displays = append(displays, fmt.Sprintf("%s ▌\n%s%s", header, chunk, progressText))
-		} else {
-			displays = append(displays, fmt.Sprintf("%s\n%s", header, chunk))
-		}
-	}
-	return displays
+	// Return pure content chunks without headers or indicators
+	return chunks
 }
 
 func (b *Bot) paginateDisplayText(content string, streaming bool) []string {
 	content = strings.TrimSpace(content)
 	if content == "" {
-		return []string{"🤖 Processing..."}
+		return []string{"Processing..."}
 	}
 
 	chunks := b.splitLongContent(content)
@@ -2173,33 +2360,8 @@ func (b *Bot) paginateDisplayText(content string, streaming bool) []string {
 		return []string{content}
 	}
 
-	displays := make([]string, 0, len(chunks))
-	for i, chunk := range chunks {
-		header := fmt.Sprintf("🤖 Part %d/%d", i+1, len(chunks))
-		if streaming && i == len(chunks)-1 {
-			displays = append(displays, fmt.Sprintf("%s ▌\n%s", header, chunk))
-		} else {
-			displays = append(displays, fmt.Sprintf("%s\n%s", header, chunk))
-		}
-	}
-	return displays
-}
-
-func (b *Bot) streamingProgressText(contentLength int) string {
-	// This is a rough estimate since we don't know total length.
-	if contentLength > 5000 {
-		return " (streaming... ~80%)"
-	}
-	if contentLength > 3000 {
-		return " (streaming... ~60%)"
-	}
-	if contentLength > 1500 {
-		return " (streaming... ~40%)"
-	}
-	if contentLength > 500 {
-		return " (streaming... ~20%)"
-	}
-	return " (streaming...)"
+	// Return pure content chunks without headers
+	return chunks
 }
 
 func (b *Bot) updateStreamingTelegramMessages(state *streamingState, displays []string) {
@@ -2210,7 +2372,7 @@ func (b *Bot) updateStreamingTelegramMessages(state *streamingState, displays []
 	// Ensure we have enough Telegram messages.
 	for len(state.telegramMessages) < len(displays) {
 		idx := len(state.telegramMessages)
-		newMsg, err := state.telegramCtx.Bot().Send(state.telegramCtx.Chat(), displays[idx])
+		newMsg, err := b.sendRenderedTelegramMessage(state.telegramCtx, displays[idx], true)
 		if err != nil {
 			log.Errorf("Failed to create additional streaming message #%d: %v", idx+1, err)
 			// Keep updating already-existing pages; we'll retry creating missing pages
@@ -2226,7 +2388,7 @@ func (b *Bot) updateStreamingTelegramMessages(state *streamingState, displays []
 		if i < len(state.lastRendered) && state.lastRendered[i] == display {
 			continue
 		}
-		b.updateTelegramMessage(state.telegramCtx, state.telegramMessages[i], display)
+		b.updateTelegramMessage(state.telegramCtx, state.telegramMessages[i], display, true)
 		if i < len(state.lastRendered) {
 			state.lastRendered[i] = display
 		}
@@ -2241,11 +2403,11 @@ func (b *Bot) updateStreamingTelegramMessages(state *streamingState, displays []
 func (b *Bot) handleFinalResponse(c telebot.Context, state *streamingState, content string) {
 	content = strings.TrimSpace(content)
 	if content == "" {
-		content = "🤖 Response completed."
+		content = "Response completed."
 	}
 
 	if state == nil || len(state.telegramMessages) == 0 {
-		msg, err := c.Bot().Send(c.Chat(), "🤖 Processing...")
+		msg, err := c.Bot().Send(c.Chat(), "Processing...")
 		if err != nil {
 			log.Errorf("Failed to create fallback message for final response: %v", err)
 			return
@@ -2255,21 +2417,22 @@ func (b *Bot) handleFinalResponse(c telebot.Context, state *streamingState, cont
 
 	// Check if content fits in one message.
 	if len(content) <= 3500 {
-		finalMessage := fmt.Sprintf("✅ %s", content)
-		b.updateTelegramMessage(c, state.telegramMessages[0], finalMessage)
+		// Update with pure content, no completion notice added
+		b.updateTelegramMessage(c, state.telegramMessages[0], content, false)
 		return
 	}
 
 	// Content is too long: split and render all parts in-place.
 	chunks := b.splitLongContent(content)
 	if len(chunks) == 0 {
-		b.updateTelegramMessage(c, state.telegramMessages[0], "✅ Response completed.")
+		// Empty content, just clear the processing message
+		b.updateTelegramMessage(c, state.telegramMessages[0], "", false)
 		return
 	}
 
 	// Ensure enough Telegram messages exist for all parts.
 	for len(state.telegramMessages) < len(chunks) {
-		newMsg, err := c.Bot().Send(c.Chat(), "🤖 Processing...")
+		newMsg, err := c.Bot().Send(c.Chat(), "Processing...")
 		if err != nil {
 			log.Errorf("Failed to create final response part message %d: %v", len(state.telegramMessages)+1, err)
 			return
@@ -2277,13 +2440,9 @@ func (b *Bot) handleFinalResponse(c telebot.Context, state *streamingState, cont
 		state.telegramMessages = append(state.telegramMessages, newMsg)
 	}
 
+	// Update all chunks with pure content (no completion notice added)
 	for i, chunk := range chunks {
-		header := fmt.Sprintf("Part %d/%d:\n", i+1, len(chunks))
-		partText := header + chunk
-		if i == 0 {
-			partText = "✅ " + partText
-		}
-		b.updateTelegramMessage(c, state.telegramMessages[i], partText)
+		b.updateTelegramMessage(c, state.telegramMessages[i], chunk, false)
 	}
 }
 
@@ -2294,19 +2453,195 @@ func (b *Bot) splitLongContent(content string) []string {
 		return nil
 	}
 
-	var chunks []string
-	remaining := content
+	blocks := splitMarkdownBlocks(content)
+	if len(blocks) == 0 {
+		return nil
+	}
 
+	var chunks []string
+	var current strings.Builder
+	currentLen := 0
+
+	flushCurrent := func() {
+		if currentLen == 0 {
+			return
+		}
+		chunks = append(chunks, current.String())
+		current.Reset()
+		currentLen = 0
+	}
+
+	appendText := func(text string) {
+		if text == "" {
+			return
+		}
+		if currentLen == 0 {
+			current.WriteString(text)
+			currentLen = len(text)
+			return
+		}
+		if currentLen+1+len(text) <= maxChunkSize {
+			current.WriteString("\n")
+			current.WriteString(text)
+			currentLen += 1 + len(text)
+			return
+		}
+		flushCurrent()
+		current.WriteString(text)
+		currentLen = len(text)
+	}
+
+	for _, block := range blocks {
+		if block == "" {
+			continue
+		}
+		if len(block) <= maxChunkSize {
+			appendText(block)
+			continue
+		}
+
+		flushCurrent()
+		var parts []string
+		if isFenceBlock(block) {
+			parts = splitFenceBlock(block, maxChunkSize)
+		} else {
+			parts = splitTextBySize(block, maxChunkSize)
+		}
+
+		for _, part := range parts {
+			if part == "" {
+				continue
+			}
+			if len(part) > maxChunkSize {
+				for _, hard := range forceSplitBySize(part, maxChunkSize) {
+					appendText(hard)
+				}
+				continue
+			}
+			appendText(part)
+		}
+	}
+
+	flushCurrent()
+	return chunks
+}
+
+func splitMarkdownBlocks(content string) []string {
+	lines := strings.Split(content, "\n")
+	blocks := make([]string, 0, len(lines))
+
+	for i := 0; i < len(lines); {
+		if isFenceLine(lines[i]) {
+			start := lines[i]
+			i++
+
+			bodyLines := make([]string, 0, 16)
+			closed := false
+			closeLine := "```"
+			for i < len(lines) {
+				if isFenceLine(lines[i]) {
+					closed = true
+					closeLine = lines[i]
+					i++
+					break
+				}
+				bodyLines = append(bodyLines, lines[i])
+				i++
+			}
+
+			block := start
+			if len(bodyLines) > 0 {
+				block += "\n" + strings.Join(bodyLines, "\n")
+			}
+			if closed {
+				block += "\n" + closeLine
+			}
+			blocks = append(blocks, block)
+			continue
+		}
+
+		start := i
+		for i < len(lines) && !isFenceLine(lines[i]) {
+			i++
+		}
+		blocks = append(blocks, strings.Join(lines[start:i], "\n"))
+	}
+
+	return blocks
+}
+
+func isFenceLine(line string) bool {
+	return strings.HasPrefix(strings.TrimSpace(line), "```")
+}
+
+func isFenceBlock(block string) bool {
+	if block == "" {
+		return false
+	}
+	lines := strings.Split(block, "\n")
+	return len(lines) > 0 && isFenceLine(lines[0])
+}
+
+func splitFenceBlock(block string, maxChunkSize int) []string {
+	lines := strings.Split(block, "\n")
+	if len(lines) == 0 {
+		return nil
+	}
+
+	openLine := lines[0]
+	closeLine := "```"
+	innerLines := lines[1:]
+	if len(lines) >= 2 && isFenceLine(lines[len(lines)-1]) {
+		closeLine = lines[len(lines)-1]
+		innerLines = lines[1 : len(lines)-1]
+	}
+
+	inner := strings.Join(innerLines, "\n")
+	innerMax := maxChunkSize - len(openLine) - len(closeLine) - 2
+	if innerMax < 128 {
+		innerMax = 128
+	}
+
+	parts := splitTextBySize(inner, innerMax)
+	if len(parts) == 0 {
+		parts = []string{""}
+	}
+
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part == "" {
+			result = append(result, openLine+"\n"+closeLine)
+			continue
+		}
+		result = append(result, openLine+"\n"+part+"\n"+closeLine)
+	}
+	return result
+}
+
+func splitTextBySize(text string, maxChunkSize int) []string {
+	if text == "" {
+		return nil
+	}
+	if len(text) <= maxChunkSize {
+		return []string{text}
+	}
+
+	var chunks []string
+	remaining := text
 	for len(remaining) > maxChunkSize {
 		window := remaining[:maxChunkSize]
 		splitAt := strings.LastIndex(window, "\n")
 		if splitAt <= 0 {
-			// No natural boundary in the window (or newline at position 0):
-			// hard-split to guarantee progress for long single-line content.
+			splitAt = strings.LastIndexAny(window, " \t")
+		}
+		if splitAt <= 0 {
 			splitAt = maxChunkSize
 		}
 
-		chunk := remaining[:splitAt]
+		chunk := strings.TrimRight(remaining[:splitAt], "\n")
+		if chunk == "" {
+			chunk = remaining[:splitAt]
+		}
 		chunks = append(chunks, chunk)
 
 		if splitAt < len(remaining) && remaining[splitAt] == '\n' {
@@ -2314,11 +2649,24 @@ func (b *Bot) splitLongContent(content string) []string {
 		}
 		remaining = remaining[splitAt:]
 	}
-
 	if remaining != "" {
 		chunks = append(chunks, remaining)
 	}
+	return chunks
+}
 
+func forceSplitBySize(text string, maxChunkSize int) []string {
+	if text == "" {
+		return nil
+	}
+	var chunks []string
+	for i := 0; i < len(text); i += maxChunkSize {
+		end := i + maxChunkSize
+		if end > len(text) {
+			end = len(text)
+		}
+		chunks = append(chunks, text[i:end])
+	}
 	return chunks
 }
 

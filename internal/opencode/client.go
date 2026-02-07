@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -509,6 +510,8 @@ func (c *Client) InitSessionWithModel(ctx context.Context, sessionID string, pro
 
 // StreamMessage sends a message and streams the response
 func (c *Client) StreamMessage(ctx context.Context, sessionID string, content string, callback func(string) error) error {
+	log.Debugf("Starting stream message for session %s, content length: %d", sessionID, len(content))
+
 	reqBody := SendMessageRequest{
 		Parts: []MessagePart{
 			{
@@ -519,32 +522,91 @@ func (c *Client) StreamMessage(ctx context.Context, sessionID string, content st
 	}
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
+		log.Errorf("Failed to marshal request body: %v", err)
 		return err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/session/"+sessionID+"/message", bytes.NewReader(jsonData))
+	url := c.baseURL + "/session/" + sessionID + "/message"
+	log.Debugf("Streaming to URL: %s", url)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonData))
 	if err != nil {
+		log.Errorf("Failed to create request: %v", err)
 		return err
 	}
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
 
-	// Reuse base client transport (notably proxy bypass for local OpenCode),
-	// but with longer timeout for long-running streaming tasks.
-	streamClient := *c.client
-	streamClient.Timeout = 600 * time.Second // 10 minutes for streaming
+	// Create a new client with the same transport but longer timeout for streaming
+	// We need to clone the transport to adjust timeouts for streaming
+	baseTransport, ok := c.client.Transport.(*http.Transport)
+	var transport *http.Transport
+	if ok && baseTransport != nil {
+		// Clone the transport and adjust timeouts for streaming
+		transport = baseTransport.Clone()
+		transport.TLSHandshakeTimeout = 30 * time.Second
+		transport.ResponseHeaderTimeout = 60 * time.Second
+		transport.ExpectContinueTimeout = 10 * time.Second
+	} else {
+		// Fallback to default transport
+		transport = &http.Transport{
+			Proxy:                 nil, // Disable proxy
+			TLSHandshakeTimeout:   30 * time.Second,
+			ResponseHeaderTimeout: 60 * time.Second,
+			ExpectContinueTimeout: 10 * time.Second,
+			IdleConnTimeout:       300 * time.Second,
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   10,
+		}
+	}
 
-	resp, err := streamClient.Do(req)
-	if err != nil {
-		return err
+	streamClient := &http.Client{
+		Transport: transport,
+		Timeout:   1800 * time.Second, // 30 minutes for long-running streaming tasks
+	}
+
+	// Try the request with retries for temporary network errors
+	var resp *http.Response
+	maxRetries := 3
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		log.Debugf("Making streaming request to OpenCode (attempt %d/%d, timeout: %v)", attempt, maxRetries, streamClient.Timeout)
+		startTime := time.Now()
+		resp, err = streamClient.Do(req)
+		elapsed := time.Since(startTime)
+
+		if err != nil {
+			log.Errorf("Stream request failed after %v (attempt %d/%d): %v", elapsed, attempt, maxRetries, err)
+
+			// Check if we should retry
+			if attempt < maxRetries && isRetryableError(err) {
+				waitTime := time.Duration(attempt) * 2 * time.Second
+				log.Debugf("Retrying in %v...", waitTime)
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(waitTime):
+					continue
+				}
+			}
+			return err
+		}
+
+		log.Debugf("Stream request completed with status %d after %v (attempt %d/%d)", resp.StatusCode, elapsed, attempt, maxRetries)
+		break
+	}
+
+	if resp == nil {
+		return fmt.Errorf("failed to get response after %d attempts", maxRetries)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
 		// Try to read error body for more information
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("stream request failed with status %d: %s", resp.StatusCode, string(body))
+		errMsg := fmt.Sprintf("stream request failed with status %d: %s", resp.StatusCode, string(body))
+		log.Error(errMsg)
+		return errors.New(errMsg)
 	}
 
 	// Check content type to determine response format
@@ -689,6 +751,32 @@ func extractTextChunksFromStreamEvent(data string) []string {
 		return nil
 	}
 	return chunks
+}
+
+// isRetryableError checks if an error is retryable (e.g., network timeout, temporary network issue)
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := err.Error()
+	// Check for timeout errors
+	if strings.Contains(errStr, "timeout") ||
+		strings.Contains(errStr, "Timeout") ||
+		strings.Contains(errStr, "deadline exceeded") ||
+		strings.Contains(errStr, "connection refused") ||
+		strings.Contains(errStr, "connection reset") ||
+		strings.Contains(errStr, "network is unreachable") {
+		return true
+	}
+
+	// Check for temporary network errors
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return netErr.Temporary() || netErr.Timeout()
+	}
+
+	return false
 }
 
 // SearchResult represents a search result
