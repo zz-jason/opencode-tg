@@ -94,3 +94,30 @@ func TestMarkdownToTelegramHTML_UnclosedFenceKeptRaw(t *testing.T) {
 		t.Fatalf("expected unclosed fence marker to stay raw, got %q", got)
 	}
 }
+
+func TestMarkdownToTelegramHTML_NestedFormatting(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{"bold code", "**`code`**", "<b><code>code</code></b>"},
+		{"italic code", "*`code`*", "<i><code>code</code></i>"},
+		{"bold italic code", "***`code`***", "<b><i><code>code</code></i></b>"},
+		{"code in bold text", "**bold `code` here**", "<b>bold <code>code</code> here</b>"},
+		{"multiple codes in bold", "**`code1` and `code2`**", "<b><code>code1</code> and <code>code2</code></b>"},
+		{"link in bold", "**[link](https://example.com)**", `<b><a href="https://example.com">link</a></b>`},
+		{"strikethrough code", "~~`code`~~", "<s><code>code</code></s>"},
+		{"mixed formatting", "**bold *italic `code`* here**", "<b>bold <i>italic <code>code</code></i> here</b>"},
+		{"code with formatting inside", "`**bold**`", "<code>**bold**</code>"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := MarkdownToTelegramHTML(tt.input)
+			if !strings.Contains(result, tt.expected) {
+				t.Errorf("MarkdownToTelegramHTML(%q) = %q, expected to contain %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}

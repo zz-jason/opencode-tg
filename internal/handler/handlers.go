@@ -2272,18 +2272,9 @@ func (b *Bot) formatStreamingDisplays(content string) []string {
 	}
 
 	displays := make([]string, 0, len(chunks))
-	progressText := b.streamingProgressText(len(content))
-	for i, chunk := range chunks {
-		if len(chunks) == 1 {
-			displays = append(displays, fmt.Sprintf("🤖▌\n%s%s", chunk, progressText))
-			continue
-		}
-		header := fmt.Sprintf("🤖 Part %d/%d", i+1, len(chunks))
-		if i == len(chunks)-1 {
-			displays = append(displays, fmt.Sprintf("%s ▌\n%s%s", header, chunk, progressText))
-		} else {
-			displays = append(displays, fmt.Sprintf("%s\n%s", header, chunk))
-		}
+	for _, chunk := range chunks {
+		// Only output content, no progress indicators or pagination headers
+		displays = append(displays, chunk)
 	}
 	return displays
 }
@@ -2300,32 +2291,11 @@ func (b *Bot) paginateDisplayText(content string, streaming bool) []string {
 	}
 
 	displays := make([]string, 0, len(chunks))
-	for i, chunk := range chunks {
-		header := fmt.Sprintf("🤖 Part %d/%d", i+1, len(chunks))
-		if streaming && i == len(chunks)-1 {
-			displays = append(displays, fmt.Sprintf("%s ▌\n%s", header, chunk))
-		} else {
-			displays = append(displays, fmt.Sprintf("%s\n%s", header, chunk))
-		}
+	for _, chunk := range chunks {
+		// Only add content, no pagination headers
+		displays = append(displays, chunk)
 	}
 	return displays
-}
-
-func (b *Bot) streamingProgressText(contentLength int) string {
-	// This is a rough estimate since we don't know total length.
-	if contentLength > 5000 {
-		return " (streaming... ~80%)"
-	}
-	if contentLength > 3000 {
-		return " (streaming... ~60%)"
-	}
-	if contentLength > 1500 {
-		return " (streaming... ~40%)"
-	}
-	if contentLength > 500 {
-		return " (streaming... ~20%)"
-	}
-	return " (streaming...)"
 }
 
 func (b *Bot) updateStreamingTelegramMessages(state *streamingState, displays []string) {
@@ -2381,8 +2351,8 @@ func (b *Bot) handleFinalResponse(c telebot.Context, state *streamingState, cont
 
 	// Check if content fits in one message.
 	if len(content) <= 3500 {
-		finalMessage := fmt.Sprintf("✅ %s", content)
-		b.updateTelegramMessage(c, state.telegramMessages[0], finalMessage, false)
+		// Only output content, no completion markers
+		b.updateTelegramMessage(c, state.telegramMessages[0], content, false)
 		return
 	}
 
@@ -2404,12 +2374,8 @@ func (b *Bot) handleFinalResponse(c telebot.Context, state *streamingState, cont
 	}
 
 	for i, chunk := range chunks {
-		header := fmt.Sprintf("Part %d/%d:\n", i+1, len(chunks))
-		partText := header + chunk
-		if i == 0 {
-			partText = "✅ " + partText
-		}
-		b.updateTelegramMessage(c, state.telegramMessages[i], partText, false)
+		// Only output content, no pagination headers or completion markers
+		b.updateTelegramMessage(c, state.telegramMessages[i], chunk, false)
 	}
 }
 

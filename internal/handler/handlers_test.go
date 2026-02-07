@@ -522,10 +522,25 @@ func TestFormatStreamingDisplays_LongSingleLineCreatesMultipleParts(t *testing.T
 		t.Fatalf("expected multiple streaming displays, got %d", len(displays))
 	}
 
-	if !strings.Contains(displays[1], "Part 2/") {
-		t.Fatalf("expected second display to contain Part 2 header, got: %q", displays[1])
+	// Verify no pagination headers or cursors
+	for i, display := range displays {
+		if strings.Contains(display, "Part ") && strings.Contains(display, "/") {
+			t.Errorf("display %d contains page header, should be plain content: %q", i, display)
+		}
+		if strings.Contains(display, "▌") {
+			t.Errorf("display %d contains streaming cursor, should be plain content: %q", i, display)
+		}
+		if strings.Contains(display, "streaming...") {
+			t.Errorf("display %d contains progress text, should be plain content: %q", i, display)
+		}
 	}
-	if !strings.Contains(displays[len(displays)-1], "▌") {
-		t.Fatalf("expected last display to include streaming cursor, got: %q", displays[len(displays)-1])
+
+	// Verify content integrity (total length should match)
+	totalLength := 0
+	for _, display := range displays {
+		totalLength += len(display)
+	}
+	if totalLength != len(content) {
+		t.Errorf("total length mismatch: got %d, expected %d", totalLength, len(content))
 	}
 }

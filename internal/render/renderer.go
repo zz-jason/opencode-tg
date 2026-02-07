@@ -173,24 +173,24 @@ func (r *Renderer) addToCache(text, html string) {
 }
 
 var (
-	// 链接：匹配 [label](url)，使用自定义解析处理括号
+	// Links: match [label](url), uses custom parsing to handle parentheses
 	linkRe = regexp.MustCompile(`\[([^\[\]]*)\]\(([^)]+)\)`)
 
-	// 粗斜体：非贪婪匹配
+	// Bold italic: non-greedy match
 	boldItalicRe = regexp.MustCompile(`\*\*\*([^*]+?)\*\*\*`)
 
-	// 粗体：允许包含单个星号（用于嵌套斜体）
+	// Bold: allows single asterisk (for nested italic)
 	boldStarRe = regexp.MustCompile(`\*\*([^*]+?(?:\*[^*]+?)*?)\*\*`)
 	boldUndRe  = regexp.MustCompile(`__([^_]+?(?:_[^_]+?)*?)__`)
 
-	// 删除线
+	// Strikethrough
 	strikeRe = regexp.MustCompile(`~~([^~]+?)~~`)
 
-	// 斜体：非贪婪匹配
+	// Italic: non-greedy match
 	italicStarRe = regexp.MustCompile(`\*([^*]+?)\*`)
 	italicUndRe  = regexp.MustCompile(`_([^_]+?)_`)
 
-	// 标题
+	// Heading
 	headingRe = regexp.MustCompile(`^(#{1,6})\s+(.+)$`)
 )
 
@@ -201,10 +201,10 @@ func MarkdownToTelegramHTML(input string) string {
 		return ""
 	}
 
-	// 输入验证：限制最大长度防止 DoS 攻击
+	// Input validation: limit maximum length to prevent DoS attacks
 	const maxInputSize = 100000 // 100KB
 	if len(input) > maxInputSize {
-		// 返回截断的版本，避免处理过大的输入
+		// Return truncated version to avoid processing oversized input
 		truncated := input[:maxInputSize]
 		return html.EscapeString(truncated) + "... (truncated)"
 	}
@@ -219,10 +219,10 @@ func MarkdownToTelegramHTML(input string) string {
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 
-		// 检查是否是代码块开始/结束
-		// 注意：单行的 ```code``` 应该被当作行内代码，而不是代码块
+		// Check if it's the start/end of a code block
+		// Note: single-line ```code``` should be treated as inline code, not code block
 		if strings.HasPrefix(trimmed, "```") {
-			// 计算反引号数量
+			// Count number of backticks
 			backtickCount := 0
 			for i := 0; i < len(trimmed) && trimmed[i] == '`'; i++ {
 				backtickCount++
@@ -230,19 +230,19 @@ func MarkdownToTelegramHTML(input string) string {
 
 			// 检查是否在同一行结束
 			if !inFence {
-				// 查找行内是否有关闭的反引号
+				// Check if there are closing backticks on the same line
 				if strings.HasSuffix(trimmed, strings.Repeat("`", backtickCount)) && len(trimmed) > backtickCount*2 {
-					// 单行代码块，当作行内处理
+					// Single-line code block, treat as inline
 					rendered = append(rendered, renderMarkdownLine(line))
 					continue
 				}
 
-				// 多行代码块开始
+				// Multi-line code block starts
 				inFence = true
 				fenceStart = line
 				fenceLines = fenceLines[:0]
 			} else {
-				// 代码块结束
+				// Code block ends
 				inFence = false
 				rendered = append(rendered, renderFenceBlock(fenceLines))
 			}
@@ -307,43 +307,61 @@ func renderInline(line string) string {
 		return ""
 	}
 
-	// 第一步：处理链接和代码块，将它们标记出来
-	var parts []string
-	i := 0
+	// Step 1: Extract links and code blocks, replace with placeholders
+	type placeholder struct {
+		start, end    int
+		html          string
+		placeholderID string
+	}
+	var placeholders []placeholder
+	placeholderIndex := 0
 
+	// Scan the string to identify links and code blocks
+	i := 0
 	for i < len(line) {
-		// 检查是否是链接开始
+		// Check if it's the start of a link
 		if line[i] == '[' {
 			label, url, ok := parseLink(line[i:])
 			if ok {
-				// 安全检查：只允许 http:// 或 https:// 协议
+				// Security check: only allow http:// or https:// protocols
 				if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
-					// 处理 URL 中的括号
+					// Handle parentheses in URL
 					url = balanceParentheses(url)
-					// 标记为链接
-					parts = append(parts, "LINK:"+label+"|"+url)
-					// 跳过已处理的部分
-					i += len(label) + len(url) + 4 // []() 四个字符
+					// Escape label and url
+					escapedLabel := html.EscapeString(label)
+					escapedUrl := html.EscapeString(url)
+					// Generate link HTML
+					linkHTML := fmt.Sprintf(`<a href="%s">%s</a>`, escapedUrl, escapedLabel)
+					// Create placeholder
+					placeholderID := fmt.Sprintf("{{LINK%d}}", placeholderIndex)
+					placeholderIndex++
+					// Record the placeholder
+					placeholders = append(placeholders, placeholder{
+						start:         i,
+						end:           i + len(label) + len(url) + 4, // []() four characters
+						html:          linkHTML,
+						placeholderID: placeholderID,
+					})
+					// Skip the link
+					i += len(label) + len(url) + 4
 					continue
 				} else {
-					// 不安全的 URL，当作普通文本处理
-					// 我们只跳过 '[' 字符，让后续处理处理其余部分
-					parts = append(parts, line[i:i+1])
+					// Unsafe URL, treat as plain text
 					i++
 					continue
 				}
 			}
 		}
 
-		// 检查是否是代码块开始
+		// Check if it's the start of a code block
 		if line[i] == '`' {
-			// 找到代码块开始
+			// Find the start of code block
 			backtickCount := 1
 			for i+backtickCount < len(line) && line[i+backtickCount] == '`' {
 				backtickCount++
 			}
 
-			// 查找匹配的结束反引号
+			// Find matching closing backticks
 			end := -1
 			for j := i + backtickCount; j < len(line); j++ {
 				if line[j] == '`' {
@@ -362,76 +380,76 @@ func renderInline(line string) string {
 			}
 
 			if end != -1 {
-				// 提取代码内容
+				// Extract code content
 				code := line[i+backtickCount : end]
-				// 转义代码内容中的 HTML 特殊字符
+				// Escape HTML special characters in code content
 				escapedCode := html.EscapeString(code)
-				// 标记为代码块
-				parts = append(parts, "CODE:"+escapedCode)
-				// 跳过代码块
+				// Generate code HTML
+				codeHTML := "<code>" + escapedCode + "</code>"
+				// Create placeholder
+				placeholderID := fmt.Sprintf("{{CODE%d}}", placeholderIndex)
+				placeholderIndex++
+				// Record the placeholder
+				placeholders = append(placeholders, placeholder{
+					start:         i,
+					end:           end + backtickCount,
+					html:          codeHTML,
+					placeholderID: placeholderID,
+				})
+				// Skip the code block
 				i = end + backtickCount
 				continue
 			} else {
-				// 没有找到匹配的结束反引号，当作普通文本处理
-				parts = append(parts, line[i:i+1])
+				// No matching closing backticks found, treat as plain text
 				i++
 				continue
 			}
 		}
 
-		// 不是链接也不是代码块，收集字符
-		start := i
-		for i < len(line) && line[i] != '[' && line[i] != '`' {
-			i++
-		}
-		if start < i {
-			parts = append(parts, line[start:i])
-		}
+		i++
 	}
 
-	// 第二步：处理每个部分
-	var result strings.Builder
-	for _, part := range parts {
-		if strings.HasPrefix(part, "CODE:") {
-			// 代码部分：添加 <code> 标签
-			codeContent := part[5:] // 去掉 "CODE:" 前缀
-			result.WriteString("<code>" + codeContent + "</code>")
-		} else if strings.HasPrefix(part, "LINK:") {
-			// 链接部分：创建链接 HTML
-			linkPart := part[5:] // 去掉 "LINK:" 前缀
-			// 格式是 "label|url"
-			sepIndex := strings.Index(linkPart, "|")
-			if sepIndex != -1 {
-				label := linkPart[:sepIndex]
-				url := linkPart[sepIndex+1:]
-				// 转义 label 和 url
-				escapedLabel := html.EscapeString(label)
-				escapedUrl := html.EscapeString(url)
-				result.WriteString(fmt.Sprintf(`<a href="%s">%s</a>`, escapedUrl, escapedLabel))
-			} else {
-				// 格式错误，当作普通文本处理
-				escapedText := html.EscapeString(part)
-				formattedText := applyFormatting(escapedText)
-				result.WriteString(formattedText)
-			}
-		} else {
-			// 文本部分：转义 HTML 并应用格式化
-			escapedText := html.EscapeString(part)
-			formattedText := applyFormatting(escapedText)
-			result.WriteString(formattedText)
+	// Step 2: Build string with placeholders
+	// For simplicity, we build the new string from left to right
+	var processed strings.Builder
+	lastPos := 0
+	for _, ph := range placeholders {
+		// Add text before the placeholder
+		if ph.start > lastPos {
+			processed.WriteString(line[lastPos:ph.start])
 		}
+		// Add the placeholder
+		processed.WriteString(ph.placeholderID)
+		lastPos = ph.end
+	}
+	// Add remaining text
+	if lastPos < len(line) {
+		processed.WriteString(line[lastPos:])
+	}
+	processedStr := processed.String()
+
+	// Step 3: HTML escape the entire string (placeholders are unaffected as they contain no special characters)
+	escapedStr := html.EscapeString(processedStr)
+
+	// Step 4: Apply markdown formatting
+	formattedStr := applyFormatting(escapedStr)
+
+	// Step 5: Replace placeholders with actual HTML
+	result := formattedStr
+	for _, ph := range placeholders {
+		result = strings.Replace(result, ph.placeholderID, ph.html, 1)
 	}
 
-	return result.String()
+	return result
 }
 
-// applyFormatting 应用 markdown 格式化到已转义的文本
+// applyFormatting applies markdown formatting to escaped text
 func applyFormatting(text string) string {
 	if text == "" {
 		return ""
 	}
 
-	// 应用格式化
+	// Apply formatting
 	text = boldItalicRe.ReplaceAllString(text, "<b><i>$1</i></b>")
 	text = boldStarRe.ReplaceAllString(text, "<b>$1</b>")
 	text = boldUndRe.ReplaceAllString(text, "<b>$1</b>")
@@ -442,15 +460,15 @@ func applyFormatting(text string) string {
 	return text
 }
 
-// parseLink 解析 markdown 链接，正确处理括号
+// parseLink parses markdown link, correctly handles parentheses
 func parseLink(input string) (label, url string, ok bool) {
-	// 查找第一个 '['
+	// Find first '['
 	start := strings.Index(input, "[")
 	if start == -1 {
 		return "", "", false
 	}
 
-	// 查找匹配的 ']'
+	// Find matching ']'
 	balance := 0
 	end := -1
 	for i := start; i < len(input); i++ {
@@ -470,12 +488,12 @@ func parseLink(input string) (label, url string, ok bool) {
 
 	label = input[start+1 : end]
 
-	// 查找 '('
+	// Find '('
 	if end+1 >= len(input) || input[end+1] != '(' {
 		return "", "", false
 	}
 
-	// 查找匹配的 ')'
+	// Find matching ')'
 	balance = 0
 	urlStart := end + 2
 	urlEnd := -1
@@ -498,7 +516,7 @@ func parseLink(input string) (label, url string, ok bool) {
 	return label, url, true
 }
 
-// balanceParentheses 处理 URL 中的括号，确保括号平衡
+// balanceParentheses handles parentheses in URL, ensures balanced parentheses
 func balanceParentheses(url string) string {
 	balance := 0
 	lastValidIndex := len(url)
@@ -509,16 +527,16 @@ func balanceParentheses(url string) string {
 		} else if ch == ')' {
 			balance--
 			if balance < 0 {
-				// 多余的右括号，截断到这里
+				// Extra closing parenthesis, truncate here
 				return url[:i]
 			} else if balance == 0 {
-				// 记录最后一个平衡的位置
+				// Record last balanced position
 				lastValidIndex = i + 1
 			}
 		}
 	}
 
-	// 如果左括号多于右括号，使用最后一个平衡位置
+	// If more opening than closing parentheses, use last balanced position
 	if balance > 0 {
 		return url[:lastValidIndex]
 	}

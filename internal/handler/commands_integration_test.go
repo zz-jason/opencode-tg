@@ -563,7 +563,7 @@ func TestIntegration_HandleCoreCommandsTextFallback(t *testing.T) {
 		},
 	})
 
-	finalMsg := waitForTelegramMessageWithPrefix(t, rec.messages, "✅", 20*time.Second)
+	finalMsg, _ := waitForTelegramMessageContaining(t, rec.messages, "Fallback assistant reply", 20*time.Second)
 	if strings.Contains(finalMsg, "Response completed with no content") {
 		t.Fatalf("unexpected empty response fallback: %s", finalMsg)
 	}
@@ -743,8 +743,9 @@ func TestIntegration_HandleCoreCommandsRealtimeUpdate(t *testing.T) {
 		t.Fatalf("expected intermediate realtime update, got final-style message: %q", realtimeMsg)
 	}
 
-	finalMsg := waitForTelegramMessageWithPrefix(t, rec.messages, "✅", 8*time.Second)
-	assertContains(t, finalMsg, "Realtime assistant reply")
+	// Finalization may reuse the same rendered text as the last streaming update,
+	// so there may be no additional Telegram edit after completion.
+	assertContains(t, realtimeMsg, "Realtime assistant reply")
 
 	// Ensure periodic updater does not overwrite final content with stale auto-updating text.
 	assertNoTelegramMessageContaining(t, rec.messages, "⏳ Auto-updating...", 3*time.Second)
@@ -872,7 +873,7 @@ func TestIntegration_HandleCoreCommandsCumulativeStreamNoDup(t *testing.T) {
 		},
 	})
 
-	finalMsg := waitForTelegramMessageWithPrefix(t, rec.messages, "✅", 10*time.Second)
+	finalMsg, _ := waitForTelegramMessageContaining(t, rec.messages, "Alpha Beta Gamma", 10*time.Second)
 	assertContains(t, finalMsg, "Alpha Beta Gamma")
 	if strings.Contains(finalMsg, "Alpha Alpha") {
 		t.Fatalf("unexpected duplicated cumulative stream content: %q", finalMsg)
@@ -993,7 +994,7 @@ func TestIntegration_HandleCoreCommandsMarkdownStreamRenderedHTML(t *testing.T) 
 		},
 	})
 
-	finalMsg := waitForTelegramMessageWithPrefix(t, rec.messages, "✅", 10*time.Second)
+	finalMsg, _ := waitForTelegramMessageContaining(t, rec.messages, "<b>bold</b>", 10*time.Second)
 	if !strings.Contains(finalMsg, "<b>bold</b>") {
 		t.Fatalf("expected markdown bold rendered to HTML tag, got: %q", finalMsg)
 	}
@@ -1119,7 +1120,7 @@ func TestIntegration_HandleCoreCommandsMarkdownRenderFallbackToPlainOnParseError
 		},
 	})
 
-	finalMsg := waitForTelegramMessageWithPrefix(t, rec.messages, "✅", 10*time.Second)
+	finalMsg, _ := waitForTelegramMessageContaining(t, rec.messages, "**bold**", 10*time.Second)
 	if !strings.Contains(finalMsg, "**bold**") {
 		t.Fatalf("expected plain-text markdown fallback, got: %q", finalMsg)
 	}
