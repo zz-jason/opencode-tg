@@ -14,15 +14,6 @@ Ensure:
 
 ### 2. Create Release
 
-Use the release script:
-
-```bash
-# Create and push tag
-./scripts/release.sh v1.0.0
-```
-
-Or manually:
-
 ```bash
 # 1. Create tag
 git tag -a v1.0.0 -m "Release v1.0.0"
