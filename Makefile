@@ -106,5 +106,4 @@ help:
 	@echo "  check-opencode - Check OpenCode server connectivity"
 	@echo "  deps           - Install dependencies"
 	@echo "  release        - Build for multiple platforms"
-	@echo "  release-packages - Create release packages (4 tar.gz + 1 src)"
 	@echo "  help           - Show this help"
