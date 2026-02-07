@@ -4,7 +4,7 @@
 
 # Build the bot
 build:
-	go build -o tg-bot ./cmd/bot
+	go build -o opencode-tg ./cmd/bot
 
 # Run tests
 test:
@@ -16,12 +16,16 @@ test-integration:
 
 # Clean build artifacts
 clean:
-	rm -f tg-bot
-	rm -f tg-bot-linux-amd64
-	rm -f tg-bot-darwin-amd64
+	rm -f opencode-tg
+	rm -f opencode-tg-linux-amd64
+	rm -f opencode-tg-linux-arm64
+	rm -f opencode-tg-darwin-amd64
+	rm -f opencode-tg-darwin-arm64
 	rm -f bot.log
 	rm -f sessions.json
 	rm -f bot-state.json
+	rm -rf release
+	rm -f *.tar.gz
 
 # Run the bot
 run: build
@@ -48,8 +52,48 @@ run-with-config: build
 
 # Build for production
 release: test
-	GOOS=linux GOARCH=amd64 go build -o tg-bot-linux-amd64 ./cmd/bot
-	GOOS=darwin GOARCH=amd64 go build -o tg-bot-darwin-amd64 ./cmd/bot
+	GOOS=linux GOARCH=amd64 go build -o opencode-tg-linux-amd64 ./cmd/bot
+	GOOS=linux GOARCH=arm64 go build -o opencode-tg-linux-arm64 ./cmd/bot
+	GOOS=darwin GOARCH=amd64 go build -o opencode-tg-darwin-amd64 ./cmd/bot
+	GOOS=darwin GOARCH=arm64 go build -o opencode-tg-darwin-arm64 ./cmd/bot
+
+# Create release packages
+release-packages: release
+	@echo "Creating release packages..."
+	
+	# Linux amd64 package
+	mkdir -p release/linux-amd64
+	cp opencode-tg-linux-amd64 release/linux-amd64/opencode-tg
+	cp config.example.toml release/linux-amd64/config.toml
+	cp README.md release/linux-amd64/
+	tar -czf opencode-tg-linux-amd64.tar.gz -C release/linux-amd64 .
+	
+	# Linux arm64 package
+	mkdir -p release/linux-arm64
+	cp opencode-tg-linux-arm64 release/linux-arm64/opencode-tg
+	cp config.example.toml release/linux-arm64/config.toml
+	cp README.md release/linux-arm64/
+	tar -czf opencode-tg-linux-arm64.tar.gz -C release/linux-arm64 .
+	
+	# Darwin amd64 package
+	mkdir -p release/darwin-amd64
+	cp opencode-tg-darwin-amd64 release/darwin-amd64/opencode-tg
+	cp config.example.toml release/darwin-amd64/config.toml
+	cp README.md release/darwin-amd64/
+	tar -czf opencode-tg-darwin-amd64.tar.gz -C release/darwin-amd64 .
+	
+	# Darwin arm64 package
+	mkdir -p release/darwin-arm64
+	cp opencode-tg-darwin-arm64 release/darwin-arm64/opencode-tg
+	cp config.example.toml release/darwin-arm64/config.toml
+	cp README.md release/darwin-arm64/
+	tar -czf opencode-tg-darwin-arm64.tar.gz -C release/darwin-arm64 .
+	
+	# Source code package
+	tar --exclude='.git' --exclude='release' --exclude='opencode-tg-*' --exclude='*.tar.gz' -czf opencode-tg-src.tar.gz .
+	
+	@echo "Release packages created:"
+	@ls -la *.tar.gz
 
 # Help
 help:
@@ -62,4 +106,5 @@ help:
 	@echo "  check-opencode - Check OpenCode server connectivity"
 	@echo "  deps           - Install dependencies"
 	@echo "  release        - Build for multiple platforms"
+	@echo "  release-packages - Create release packages (4 tar.gz + 1 src)"
 	@echo "  help           - Show this help"
