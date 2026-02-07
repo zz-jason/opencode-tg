@@ -1,68 +1,68 @@
 #!/bin/bash
 set -e
 
-# 发布脚本
-# 使用方法: ./scripts/release.sh <version>
-# 例如: ./scripts/release.sh v1.0.0
+# Release script for OpenCode Telegram Bot
+# Usage: ./scripts/release.sh <version>
+# Example: ./scripts/release.sh v1.0.0
 
 if [ $# -ne 1 ]; then
-    echo "使用方法: $0 <version>"
-    echo "例如: $0 v1.0.0"
+    echo "Usage: $0 <version>"
+    echo "Example: $0 v1.0.0"
     exit 1
 fi
 
 VERSION=$1
 
-# 验证版本号格式
+# Validate version format
 if [[ ! $VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    echo "错误: 版本号格式应为 vX.Y.Z"
+    echo "Error: Version format should be vX.Y.Z"
     exit 1
 fi
 
-echo "🚀 准备发布版本: $VERSION"
+echo "Preparing release: $VERSION"
 
-# 1. 检查是否有未提交的更改
+# 1. Check for uncommitted changes
 if [[ -n $(git status --porcelain) ]]; then
-    echo "错误: 有未提交的更改，请先提交或暂存"
+    echo "Error: There are uncommitted changes, please commit or stash first"
     git status
     exit 1
 fi
 
-# 2. 运行测试
-echo "🧪 运行测试..."
+# 2. Run tests
+echo "Running tests..."
 make test
 
-# 3. 创建发布包（本地测试）
-echo "📦 创建发布包..."
+# 3. Create release packages (local test)
+echo "Creating release packages..."
 make release-packages
 
-# 4. 显示创建的包
-echo "📁 创建的包:"
+# 4. Show created packages
+echo "Created packages:"
 ls -la opencode-tg-*.tar.gz
 
-# 5. 创建标签
-echo "🏷️  创建标签 $VERSION..."
+# 5. Create tag
+echo "Creating tag $VERSION..."
 git tag -a "$VERSION" -m "Release $VERSION"
 
-# 6. 推送标签
-echo "📤 推送标签到远程..."
+# 6. Push tag
+echo "Pushing tag to remote..."
 git push origin "$VERSION"
 
-# 7. 显示发布说明
+# 7. Show release instructions
 echo ""
-echo "✅ 发布流程已启动!"
+echo "Release process started!"
 echo ""
-echo "下一步:"
-echo "1. 等待 GitHub Actions 完成构建和发布"
-echo "2. 检查发布页面: https://github.com/anomalyco/opencode-tg/releases"
-echo "3. 编辑发布说明（如果需要）"
+echo "Next steps:"
+echo "1. Wait for GitHub Actions to complete build and release"
+echo "2. Check release page: https://github.com/anomalyco/opencode-tg/releases"
+echo "3. Edit release notes if needed"
 echo ""
-echo "📦 每个包包含:"
-echo "  - opencode-tg (二进制文件)"
-echo "  - config.toml (配置文件模板)"
-echo "  - README.md (说明文档)"
+echo "Each package contains:"
+echo "  - opencode-tg (binary)"
+echo "  - config.toml (configuration template)"
+echo "  - README.md (documentation)"
 echo ""
-echo "📁 总共5个包:"
+echo "Total 5 packages:"
 echo "  - opencode-tg-linux-amd64.tar.gz"
 echo "  - opencode-tg-linux-arm64.tar.gz"
 echo "  - opencode-tg-darwin-amd64.tar.gz"
