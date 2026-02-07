@@ -14,6 +14,7 @@ import (
 	"gopkg.in/telebot.v4"
 	"tg-bot/internal/config"
 	"tg-bot/internal/opencode"
+	"tg-bot/internal/render"
 	"tg-bot/internal/session"
 	"tg-bot/internal/storage"
 )
@@ -42,6 +43,7 @@ type Bot struct {
 	// Streaming state management
 	streamingStateMu sync.RWMutex
 	streamingStates  map[string]*streamingState
+	renderer         *render.Renderer
 }
 
 // streamingState tracks the state of an active streaming response
@@ -119,6 +121,7 @@ func NewBot(cfg *config.Config) (*Bot, error) {
 		globalModelMapping: make(map[int]modelSelection),
 		sessionMapping:     make(map[int64]map[int]string),
 		streamingStates:    make(map[string]*streamingState),
+		renderer:           render.New(cfg.Render.Mode),
 	}
 
 	// Initialize session manager asynchronously to preload sessions and models
@@ -1213,7 +1216,7 @@ func (b *Bot) handleText(c telebot.Context) error {
 	b.streamingStateMu.Unlock()
 
 	// Send initial "processing" message
-	processingMsg, err := c.Bot().Send(c.Chat(), "🤖 Processing...")
+	processingMsg, err := b.sendRenderedTelegramMessage(c, "🤖 Processing...", true)
 	if err != nil {
 		return err
 	}
@@ -1274,6 +1277,17 @@ func (b *Bot) handleText(c telebot.Context) error {
 		b.periodicMessageUpdates(periodicCtx, streamingState, sessionID, stopUpdates)
 	}()
 
+	// Check if OpenCode server is reachable before starting stream
+	healthCtx, healthCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer healthCancel()
+
+	if healthErr := b.opencodeClient.HealthCheck(healthCtx); healthErr != nil {
+		log.Warnf("OpenCode health check failed before streaming: %v", healthErr)
+		// Continue anyway, but log the warning
+	} else {
+		log.Debugf("OpenCode health check passed before streaming")
+	}
+
 	// Start streaming the message
 	err = b.opencodeClient.StreamMessage(ctx, sessionID, text, streamCallback)
 	cancelPeriodic()
@@ -1299,7 +1313,7 @@ func (b *Bot) handleText(c telebot.Context) error {
 			errorMsg = finalContent + "\n\n---\n\n" + errorMsg
 		}
 
-		c.Bot().Edit(processingMsg, errorMsg)
+		b.updateTelegramMessage(c, processingMsg, errorMsg, false)
 		return nil
 	}
 
@@ -1872,33 +1886,56 @@ func (b *Bot) formatMessageForDisplay(msg opencode.Message, isCompleted bool) st
 	return sb.String()
 }
 
-// updateTelegramMessage updates a Telegram message with new content
-func (b *Bot) updateTelegramMessage(c telebot.Context, msg *telebot.Message, content string) {
+// updateTelegramMessage updates a Telegram message with new content.
+func (b *Bot) updateTelegramMessage(c telebot.Context, msg *telebot.Message, content string, streaming bool) {
 	if msg == nil {
 		log.Warn("updateTelegramMessage called with nil message")
 		return
 	}
 
-	// Ensure content is not too long for Telegram
-	if len(content) > 4000 {
-		log.Debugf("Message content too long (%d chars), truncating to 4000", len(content))
-		content = content[:4000] + "\n...(content too long, truncated)"
+	rendered := b.buildTelegramRenderResult(content, streaming)
+	primary := b.truncateTelegramText(rendered.primaryText)
+	fallback := b.truncateTelegramText(rendered.fallback)
+
+	if rendered.primaryMode != telebot.ModeDefault && len(primary) >= 4000 {
+		primary = fallback
+		rendered.primaryMode = telebot.ModeDefault
 	}
-	if msg.Text == content {
+
+	if msg.Text == primary {
 		log.Debug("Skipping Telegram edit because message content is unchanged")
 		return
 	}
 
-	// Try to update the message
-	if _, err := c.Bot().Edit(msg, content); err != nil {
+	if _, err := b.editTelegramWithMode(c, msg, primary, rendered.primaryMode); err != nil {
 		if isMessageNotModifiedError(err) {
 			log.Debugf("Skipping no-op Telegram edit: %v", err)
-			msg.Text = content
+			msg.Text = primary
 			return
 		}
+
+		if rendered.primaryMode != telebot.ModeDefault && isTelegramParseModeError(err) {
+			log.Debugf("Telegram HTML render failed on edit, falling back to plain text: %v", err)
+			if _, fallbackErr := b.editTelegramWithMode(c, msg, fallback, telebot.ModeDefault); fallbackErr == nil {
+				msg.Text = fallback
+				return
+			} else {
+				log.Warnf("Failed to update Telegram message with rendered HTML and fallback plain text: %v", fallbackErr)
+			}
+		}
+
 		log.Warnf("Failed to update Telegram message: %v", err)
 		// If editing fails, try to send a new message
-		newMsg, err := c.Bot().Send(c.Chat(), content)
+		newMsg, err := b.sendTelegramWithMode(c, primary, rendered.primaryMode)
+		if err != nil {
+			if rendered.primaryMode != telebot.ModeDefault && isTelegramParseModeError(err) {
+				log.Debugf("Telegram HTML render failed on resend, falling back to plain text: %v", err)
+				newMsg, err = b.sendTelegramWithMode(c, fallback, telebot.ModeDefault)
+				if err == nil {
+					newMsg.Text = fallback
+				}
+			}
+		}
 		if err != nil {
 			log.Errorf("Failed to send new message: %v", err)
 			return
@@ -1907,7 +1944,7 @@ func (b *Bot) updateTelegramMessage(c telebot.Context, msg *telebot.Message, con
 		*msg = *newMsg
 		log.Debugf("Sent new message due to edit failure, new message ID: %d", newMsg.ID)
 	} else {
-		msg.Text = content
+		msg.Text = primary
 		log.Debugf("Successfully edited message ID %d", msg.ID)
 	}
 }
@@ -1917,6 +1954,95 @@ func isMessageNotModifiedError(err error) bool {
 		return false
 	}
 	return strings.Contains(strings.ToLower(err.Error()), "message is not modified")
+}
+
+type telegramRenderResult struct {
+	primaryText string
+	primaryMode telebot.ParseMode
+	fallback    string
+}
+
+func (b *Bot) buildTelegramRenderResult(content string, streaming bool) telegramRenderResult {
+	if b.renderer == nil {
+		return telegramRenderResult{
+			primaryText: content,
+			primaryMode: telebot.ModeDefault,
+			fallback:    content,
+		}
+	}
+
+	rendered := b.renderer.Render(content, streaming)
+	mode := telebot.ModeDefault
+	if rendered.UseHTML {
+		mode = telebot.ModeHTML
+	}
+	fallback := rendered.FallbackText
+	if fallback == "" {
+		fallback = content
+	}
+	return telegramRenderResult{
+		primaryText: rendered.Text,
+		primaryMode: mode,
+		fallback:    fallback,
+	}
+}
+
+func (b *Bot) truncateTelegramText(content string) string {
+	if len(content) > 4000 {
+		log.Debugf("Message content too long (%d chars), truncating to 4000", len(content))
+		return content[:4000] + "\n...(content too long, truncated)"
+	}
+	return content
+}
+
+func (b *Bot) sendTelegramWithMode(c telebot.Context, text string, mode telebot.ParseMode) (*telebot.Message, error) {
+	if mode == telebot.ModeDefault {
+		return c.Bot().Send(c.Chat(), text)
+	}
+	return c.Bot().Send(c.Chat(), text, mode)
+}
+
+func (b *Bot) editTelegramWithMode(c telebot.Context, msg *telebot.Message, text string, mode telebot.ParseMode) (*telebot.Message, error) {
+	if mode == telebot.ModeDefault {
+		return c.Bot().Edit(msg, text)
+	}
+	return c.Bot().Edit(msg, text, mode)
+}
+
+func (b *Bot) sendRenderedTelegramMessage(c telebot.Context, content string, streaming bool) (*telebot.Message, error) {
+	rendered := b.buildTelegramRenderResult(content, streaming)
+	primary := b.truncateTelegramText(rendered.primaryText)
+	fallback := b.truncateTelegramText(rendered.fallback)
+
+	if rendered.primaryMode != telebot.ModeDefault && len(primary) >= 4000 {
+		primary = fallback
+		rendered.primaryMode = telebot.ModeDefault
+	}
+
+	msg, err := b.sendTelegramWithMode(c, primary, rendered.primaryMode)
+	if err == nil {
+		msg.Text = primary
+		return msg, nil
+	}
+	if rendered.primaryMode != telebot.ModeDefault && isTelegramParseModeError(err) {
+		log.Debugf("Telegram HTML render failed on send, falling back to plain text: %v", err)
+		msg, fallbackErr := b.sendTelegramWithMode(c, fallback, telebot.ModeDefault)
+		if fallbackErr == nil {
+			msg.Text = fallback
+		}
+		return msg, fallbackErr
+	}
+	return nil, err
+}
+
+func isTelegramParseModeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	normalized := strings.ToLower(err.Error())
+	return strings.Contains(normalized, "can't parse entities") ||
+		strings.Contains(normalized, "can't find end of") ||
+		strings.Contains(normalized, "entity") && strings.Contains(normalized, "parse")
 }
 
 // handleRename handles the /rename command
@@ -2210,7 +2336,7 @@ func (b *Bot) updateStreamingTelegramMessages(state *streamingState, displays []
 	// Ensure we have enough Telegram messages.
 	for len(state.telegramMessages) < len(displays) {
 		idx := len(state.telegramMessages)
-		newMsg, err := state.telegramCtx.Bot().Send(state.telegramCtx.Chat(), displays[idx])
+		newMsg, err := b.sendRenderedTelegramMessage(state.telegramCtx, displays[idx], true)
 		if err != nil {
 			log.Errorf("Failed to create additional streaming message #%d: %v", idx+1, err)
 			// Keep updating already-existing pages; we'll retry creating missing pages
@@ -2226,7 +2352,7 @@ func (b *Bot) updateStreamingTelegramMessages(state *streamingState, displays []
 		if i < len(state.lastRendered) && state.lastRendered[i] == display {
 			continue
 		}
-		b.updateTelegramMessage(state.telegramCtx, state.telegramMessages[i], display)
+		b.updateTelegramMessage(state.telegramCtx, state.telegramMessages[i], display, true)
 		if i < len(state.lastRendered) {
 			state.lastRendered[i] = display
 		}
@@ -2245,7 +2371,7 @@ func (b *Bot) handleFinalResponse(c telebot.Context, state *streamingState, cont
 	}
 
 	if state == nil || len(state.telegramMessages) == 0 {
-		msg, err := c.Bot().Send(c.Chat(), "🤖 Processing...")
+		msg, err := b.sendRenderedTelegramMessage(c, "🤖 Processing...", false)
 		if err != nil {
 			log.Errorf("Failed to create fallback message for final response: %v", err)
 			return
@@ -2256,20 +2382,20 @@ func (b *Bot) handleFinalResponse(c telebot.Context, state *streamingState, cont
 	// Check if content fits in one message.
 	if len(content) <= 3500 {
 		finalMessage := fmt.Sprintf("✅ %s", content)
-		b.updateTelegramMessage(c, state.telegramMessages[0], finalMessage)
+		b.updateTelegramMessage(c, state.telegramMessages[0], finalMessage, false)
 		return
 	}
 
 	// Content is too long: split and render all parts in-place.
 	chunks := b.splitLongContent(content)
 	if len(chunks) == 0 {
-		b.updateTelegramMessage(c, state.telegramMessages[0], "✅ Response completed.")
+		b.updateTelegramMessage(c, state.telegramMessages[0], "✅ Response completed.", false)
 		return
 	}
 
 	// Ensure enough Telegram messages exist for all parts.
 	for len(state.telegramMessages) < len(chunks) {
-		newMsg, err := c.Bot().Send(c.Chat(), "🤖 Processing...")
+		newMsg, err := b.sendRenderedTelegramMessage(c, "🤖 Processing...", false)
 		if err != nil {
 			log.Errorf("Failed to create final response part message %d: %v", len(state.telegramMessages)+1, err)
 			return
@@ -2283,7 +2409,7 @@ func (b *Bot) handleFinalResponse(c telebot.Context, state *streamingState, cont
 		if i == 0 {
 			partText = "✅ " + partText
 		}
-		b.updateTelegramMessage(c, state.telegramMessages[i], partText)
+		b.updateTelegramMessage(c, state.telegramMessages[i], partText, false)
 	}
 }
 

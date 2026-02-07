@@ -18,6 +18,9 @@ timeout = 30
 type = "file"  # only "file" storage is supported
 file_path = "bot-state.json"  # path to JSON file for session storage
 
+[render]
+mode = "markdown_stream"  # plain | markdown_final | markdown_stream
+
 [logging]
 level = "info"
 output = "bot.log"

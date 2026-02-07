@@ -56,10 +56,14 @@ url = "http://127.0.0.1:7890"
 [opencode]
 url = "http://<opencode-host>:<opencode-port>"
 timeout = 300
+
+[render]
+mode = "markdown_stream"
 ```
 
 `telegram.polling_timeout` and `telegram.polling_limit` are optional. Defaults are `60` and `100`.
 `storage.type` and `storage.file_path` are optional. Defaults are `file` and `bot-state.json`.
+`render.mode` is optional. Defaults to `markdown_stream` (`plain`, `markdown_final`, `markdown_stream`).
 `logging.level` and `logging.output` are optional. Defaults are `info` and `bot.log`.
 
 ### Start OpenCode (hostname and port)
