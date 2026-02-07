@@ -173,7 +173,7 @@ func (r *Renderer) addToCache(text, html string) {
 }
 
 var (
-	// 链接：匹配 [label](url)，使用自定义解析处理括号
+	// Links: match [label](url), uses custom parsing to handle parentheses
 	linkRe = regexp.MustCompile(`\[([^\[\]]*)\]\(([^)]+)\)`)
 
 	// 粗斜体：非贪婪匹配
@@ -307,7 +307,7 @@ func renderInline(line string) string {
 		return ""
 	}
 
-	// 第一步：提取链接和代码块，用占位符替换
+	// Step 1: Extract links and code blocks, replace with placeholders
 	type placeholder struct {
 		start, end    int
 		html          string
@@ -316,52 +316,52 @@ func renderInline(line string) string {
 	var placeholders []placeholder
 	placeholderIndex := 0
 
-	// 扫描字符串，识别链接和代码块
+	// Scan the string to identify links and code blocks
 	i := 0
 	for i < len(line) {
-		// 检查是否是链接开始
+		// Check if it's the start of a link
 		if line[i] == '[' {
 			label, url, ok := parseLink(line[i:])
 			if ok {
-				// 安全检查：只允许 http:// 或 https:// 协议
+				// Security check: only allow http:// or https:// protocols
 				if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
-					// 处理 URL 中的括号
+					// Handle parentheses in URL
 					url = balanceParentheses(url)
-					// 转义 label 和 url
+					// Escape label and url
 					escapedLabel := html.EscapeString(label)
 					escapedUrl := html.EscapeString(url)
-					// 生成链接 HTML
+					// Generate link HTML
 					linkHTML := fmt.Sprintf(`<a href="%s">%s</a>`, escapedUrl, escapedLabel)
-					// 创建占位符
+					// Create placeholder
 					placeholderID := fmt.Sprintf("{{LINK%d}}", placeholderIndex)
 					placeholderIndex++
-					// 记录占位符
+					// Record the placeholder
 					placeholders = append(placeholders, placeholder{
 						start:         i,
 						end:           i + len(label) + len(url) + 4, // []() 四个字符
 						html:          linkHTML,
 						placeholderID: placeholderID,
 					})
-					// 跳过链接
+					// Skip the link
 					i += len(label) + len(url) + 4
 					continue
 				} else {
-					// 不安全的 URL，当作普通文本处理
+					// Unsafe URL, treat as plain text
 					i++
 					continue
 				}
 			}
 		}
 
-		// 检查是否是代码块开始
+		// Check if it's the start of a code block
 		if line[i] == '`' {
-			// 找到代码块开始
+			// Find the start of code block
 			backtickCount := 1
 			for i+backtickCount < len(line) && line[i+backtickCount] == '`' {
 				backtickCount++
 			}
 
-			// 查找匹配的结束反引号
+			// Find matching closing backticks
 			end := -1
 			for j := i + backtickCount; j < len(line); j++ {
 				if line[j] == '`' {
@@ -380,27 +380,27 @@ func renderInline(line string) string {
 			}
 
 			if end != -1 {
-				// 提取代码内容
+				// Extract code content
 				code := line[i+backtickCount : end]
-				// 转义代码内容中的 HTML 特殊字符
+				// Escape HTML special characters in code content
 				escapedCode := html.EscapeString(code)
-				// 生成代码 HTML
+				// Generate code HTML
 				codeHTML := "<code>" + escapedCode + "</code>"
-				// 创建占位符
+				// Create placeholder
 				placeholderID := fmt.Sprintf("{{CODE%d}}", placeholderIndex)
 				placeholderIndex++
-				// 记录占位符
+				// Record the placeholder
 				placeholders = append(placeholders, placeholder{
 					start:         i,
 					end:           end + backtickCount,
 					html:          codeHTML,
 					placeholderID: placeholderID,
 				})
-				// 跳过代码块
+				// Skip the code block
 				i = end + backtickCount
 				continue
 			} else {
-				// 没有找到匹配的结束反引号，当作普通文本处理
+				// No matching closing backticks found, treat as plain text
 				i++
 				continue
 			}
@@ -409,32 +409,32 @@ func renderInline(line string) string {
 		i++
 	}
 
-	// 第二步：构建带有占位符的字符串
-	// 为了简化，我们从左到右构建新字符串
+	// Step 2: Build string with placeholders
+	// For simplicity, we build the new string from left to right
 	var processed strings.Builder
 	lastPos := 0
 	for _, ph := range placeholders {
-		// 添加占位符之前的文本
+		// Add text before the placeholder
 		if ph.start > lastPos {
 			processed.WriteString(line[lastPos:ph.start])
 		}
-		// 添加占位符
+		// Add the placeholder
 		processed.WriteString(ph.placeholderID)
 		lastPos = ph.end
 	}
-	// 添加剩余文本
+	// Add remaining text
 	if lastPos < len(line) {
 		processed.WriteString(line[lastPos:])
 	}
 	processedStr := processed.String()
 
-	// 第三步：HTML 转义整个字符串（占位符不受影响，因为它们不包含特殊字符）
+	// Step 3: HTML escape the entire string (placeholders are unaffected as they contain no special characters)
 	escapedStr := html.EscapeString(processedStr)
 
-	// 第四步：应用 markdown 格式化
+	// Step 4: Apply markdown formatting
 	formattedStr := applyFormatting(escapedStr)
 
-	// 第五步：将占位符替换为实际的 HTML
+	// Step 5: Replace placeholders with actual HTML
 	result := formattedStr
 	for _, ph := range placeholders {
 		result = strings.Replace(result, ph.placeholderID, ph.html, 1)
@@ -443,13 +443,13 @@ func renderInline(line string) string {
 	return result
 }
 
-// applyFormatting 应用 markdown 格式化到已转义的文本
+// applyFormatting applies markdown formatting to escaped text
 func applyFormatting(text string) string {
 	if text == "" {
 		return ""
 	}
 
-	// 应用格式化
+	// Apply formatting
 	text = boldItalicRe.ReplaceAllString(text, "<b><i>$1</i></b>")
 	text = boldStarRe.ReplaceAllString(text, "<b>$1</b>")
 	text = boldUndRe.ReplaceAllString(text, "<b>$1</b>")

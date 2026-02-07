@@ -2273,7 +2273,7 @@ func (b *Bot) formatStreamingDisplays(content string) []string {
 
 	displays := make([]string, 0, len(chunks))
 	for _, chunk := range chunks {
-		// 只输出内容，不添加任何进度指示器或分页头部
+		// Only output content, no progress indicators or pagination headers
 		displays = append(displays, chunk)
 	}
 	return displays
@@ -2292,7 +2292,7 @@ func (b *Bot) paginateDisplayText(content string, streaming bool) []string {
 
 	displays := make([]string, 0, len(chunks))
 	for _, chunk := range chunks {
-		// 只添加内容，不添加分页头部
+		// Only add content, no pagination headers
 		displays = append(displays, chunk)
 	}
 	return displays
@@ -2351,7 +2351,7 @@ func (b *Bot) handleFinalResponse(c telebot.Context, state *streamingState, cont
 
 	// Check if content fits in one message.
 	if len(content) <= 3500 {
-		// 只输出内容，不添加完成标记
+		// Only output content, no completion markers
 		b.updateTelegramMessage(c, state.telegramMessages[0], content, false)
 		return
 	}
@@ -2374,7 +2374,7 @@ func (b *Bot) handleFinalResponse(c telebot.Context, state *streamingState, cont
 	}
 
 	for i, chunk := range chunks {
-		// 只输出内容，不添加分页头部或完成标记
+		// Only output content, no pagination headers or completion markers
 		b.updateTelegramMessage(c, state.telegramMessages[i], chunk, false)
 	}
 }
