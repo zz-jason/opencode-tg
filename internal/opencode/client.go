@@ -158,7 +158,15 @@ type MessagePart struct {
 
 // SendMessageRequest represents a request to send a message
 type SendMessageRequest struct {
-	Parts []MessagePart `json:"parts"`
+	MessageID string        `json:"messageID,omitempty"`
+	Parts     []MessagePart `json:"parts"`
+	Model     *MessageModel `json:"model,omitempty"`
+}
+
+// MessageModel represents a model selection for a message
+type MessageModel struct {
+	ProviderID string `json:"providerID"`
+	ModelID    string `json:"modelID"`
 }
 
 // ErrorResponse represents an error response from OpenCode API
@@ -456,7 +464,7 @@ func (c *Client) GetModels(ctx context.Context) ([]Model, error) {
 func generateMessageID() string {
 	bytes := make([]byte, 8)
 	rand.Read(bytes)
-	return fmt.Sprintf("msg-%s", hex.EncodeToString(bytes))
+	return fmt.Sprintf("msg%s", hex.EncodeToString(bytes))
 }
 
 // InitSessionWithModel initializes a session with a specific model
@@ -509,16 +517,25 @@ func (c *Client) InitSessionWithModel(ctx context.Context, sessionID string, pro
 }
 
 // StreamMessage sends a message and streams the response
-func (c *Client) StreamMessage(ctx context.Context, sessionID string, content string, callback func(string) error) error {
+func (c *Client) StreamMessage(ctx context.Context, sessionID string, content string, model *MessageModel, callback func(string) error) error {
 	log.Debugf("Starting stream message for session %s, content length: %d", sessionID, len(content))
 
 	reqBody := SendMessageRequest{
+		MessageID: generateMessageID(),
 		Parts: []MessagePart{
 			{
 				Type: "text",
 				Text: content,
 			},
 		},
+	}
+	if model != nil {
+		reqBody.Model = model
+		log.Debugf("Using model %s/%s for message", model.ProviderID, model.ModelID)
+	} else {
+		// This should not happen if handleText is working correctly
+		// But we'll log a warning and proceed without model
+		log.Warnf("No model specified for session %s, sending message without model field", sessionID)
 	}
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
@@ -886,7 +903,7 @@ func (c *Client) RenameSession(ctx context.Context, sessionID string, newName st
 		},
 	}
 
-	resp, err := c.request(ctx, "PUT", fmt.Sprintf("/session/%s", sessionID), reqBody)
+	resp, err := c.request(ctx, "PATCH", fmt.Sprintf("/session/%s", sessionID), reqBody)
 	if err != nil {
 		return err
 	}
