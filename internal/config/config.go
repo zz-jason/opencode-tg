@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pelletier/go-toml/v2"
 	log "github.com/sirupsen/logrus"
@@ -14,6 +15,7 @@ type Config struct {
 	Proxy    ProxyConfig    `toml:"proxy"`
 	OpenCode OpenCodeConfig `toml:"opencode"`
 	Storage  StorageConfig  `toml:"storage"`
+	Render   RenderConfig   `toml:"render"`
 	Logging  LoggingConfig  `toml:"logging"`
 }
 
@@ -40,6 +42,11 @@ type OpenCodeConfig struct {
 type StorageConfig struct {
 	Type     string `toml:"type"`
 	FilePath string `toml:"file_path"` // path to JSON file for session storage
+}
+
+// RenderConfig controls Telegram rendering behavior for OpenCode output
+type RenderConfig struct {
+	Mode string `toml:"mode"` // plain | markdown_final | markdown_stream
 }
 
 // LoggingConfig contains logging settings
@@ -107,6 +114,9 @@ func setDefaults(cfg *Config) {
 	if cfg.Storage.FilePath == "" && cfg.Storage.Type == "file" {
 		cfg.Storage.FilePath = "bot-state.json"
 	}
+	if cfg.Render.Mode == "" {
+		cfg.Render.Mode = "markdown_stream"
+	}
 	if cfg.Logging.Level == "" {
 		cfg.Logging.Level = "info"
 	}
@@ -125,6 +135,11 @@ func (c *Config) Validate() error {
 	}
 	if c.OpenCode.URL == "" {
 		return &ConfigError{Field: "opencode.url", Message: "OpenCode URL is required"}
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Render.Mode)) {
+	case "", "plain", "markdown_final", "markdown_stream":
+	default:
+		return &ConfigError{Field: "render.mode", Message: "must be one of: plain, markdown_final, markdown_stream"}
 	}
 	return nil
 }

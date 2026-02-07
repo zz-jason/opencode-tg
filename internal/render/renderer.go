@@ -1,0 +1,534 @@
+package render
+
+import (
+	"fmt"
+	"html"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	ModePlain          = "plain"
+	ModeMarkdownFinal  = "markdown_final"
+	ModeMarkdownStream = "markdown_stream"
+)
+
+// Result describes how a message should be sent to Telegram.
+type Result struct {
+	Text         string
+	FallbackText string
+	UseHTML      bool
+}
+
+// Renderer formats OpenCode output for Telegram.
+type Renderer struct {
+	mode string
+	// Cache for rendered content to avoid re-rendering unchanged text
+	cacheMu sync.RWMutex
+	cache   map[string]cachedRender
+}
+
+type cachedRender struct {
+	html      string
+	plain     string
+	timestamp time.Time
+}
+
+func New(mode string) *Renderer {
+	return &Renderer{
+		mode:  NormalizeMode(mode),
+		cache: make(map[string]cachedRender),
+	}
+}
+
+func NormalizeMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case ModePlain:
+		return ModePlain
+	case ModeMarkdownFinal:
+		return ModeMarkdownFinal
+	case ModeMarkdownStream:
+		return ModeMarkdownStream
+	default:
+		return ModeMarkdownStream
+	}
+}
+
+func IsValidMode(mode string) bool {
+	switch NormalizeMode(mode) {
+	case ModePlain, ModeMarkdownFinal, ModeMarkdownStream:
+		return true
+	default:
+		return false
+	}
+}
+
+func (r *Renderer) Mode() string {
+	if r == nil {
+		return ModeMarkdownStream
+	}
+	return r.mode
+}
+
+// ClearCache clears the render cache
+func (r *Renderer) ClearCache() {
+	if r == nil {
+		return
+	}
+
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
+	r.cache = make(map[string]cachedRender)
+}
+
+// Render converts markdown text to Telegram-safe HTML depending on mode.
+func (r *Renderer) Render(text string, streaming bool) Result {
+	mode := ModeMarkdownStream
+	if r != nil {
+		mode = r.mode
+	}
+
+	result := Result{
+		Text:         text,
+		FallbackText: text,
+		UseHTML:      false,
+	}
+
+	if mode == ModePlain {
+		return result
+	}
+	if mode == ModeMarkdownFinal && streaming {
+		return result
+	}
+
+	// Check cache first for non-streaming or completed streaming
+	if !streaming {
+		if cached := r.getFromCache(text); cached != "" {
+			result.Text = cached
+			result.UseHTML = true
+			return result
+		}
+	}
+
+	// Render and cache
+	rendered := MarkdownToTelegramHTML(text)
+	result.Text = rendered
+	result.UseHTML = true
+
+	// Cache non-streaming results
+	if !streaming {
+		r.addToCache(text, rendered)
+	}
+
+	return result
+}
+
+func (r *Renderer) getFromCache(text string) string {
+	if r == nil {
+		return ""
+	}
+
+	r.cacheMu.RLock()
+	defer r.cacheMu.RUnlock()
+
+	if cached, ok := r.cache[text]; ok {
+		// Cache valid for 5 minutes
+		if time.Since(cached.timestamp) < 5*time.Minute {
+			return cached.html
+		}
+	}
+	return ""
+}
+
+func (r *Renderer) addToCache(text, html string) {
+	if r == nil {
+		return
+	}
+
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
+
+	// Limit cache size to prevent memory issues
+	if len(r.cache) > 100 {
+		// Remove oldest entries
+		var oldestKey string
+		var oldestTime time.Time
+		for key, entry := range r.cache {
+			if oldestTime.IsZero() || entry.timestamp.Before(oldestTime) {
+				oldestTime = entry.timestamp
+				oldestKey = key
+			}
+		}
+		if oldestKey != "" {
+			delete(r.cache, oldestKey)
+		}
+	}
+
+	r.cache[text] = cachedRender{
+		html:      html,
+		timestamp: time.Now(),
+	}
+}
+
+var (
+	// 链接：匹配 [label](url)，使用自定义解析处理括号
+	linkRe = regexp.MustCompile(`\[([^\[\]]*)\]\(([^)]+)\)`)
+
+	// 粗斜体：非贪婪匹配
+	boldItalicRe = regexp.MustCompile(`\*\*\*([^*]+?)\*\*\*`)
+
+	// 粗体：允许包含单个星号（用于嵌套斜体）
+	boldStarRe = regexp.MustCompile(`\*\*([^*]+?(?:\*[^*]+?)*?)\*\*`)
+	boldUndRe  = regexp.MustCompile(`__([^_]+?(?:_[^_]+?)*?)__`)
+
+	// 删除线
+	strikeRe = regexp.MustCompile(`~~([^~]+?)~~`)
+
+	// 斜体：非贪婪匹配
+	italicStarRe = regexp.MustCompile(`\*([^*]+?)\*`)
+	italicUndRe  = regexp.MustCompile(`_([^_]+?)_`)
+
+	// 标题
+	headingRe = regexp.MustCompile(`^(#{1,6})\s+(.+)$`)
+)
+
+// MarkdownToTelegramHTML converts a conservative markdown subset to Telegram HTML.
+// It intentionally avoids complex constructs that are fragile during streaming updates.
+func MarkdownToTelegramHTML(input string) string {
+	if input == "" {
+		return ""
+	}
+
+	// 输入验证：限制最大长度防止 DoS 攻击
+	const maxInputSize = 100000 // 100KB
+	if len(input) > maxInputSize {
+		// 返回截断的版本，避免处理过大的输入
+		truncated := input[:maxInputSize]
+		return html.EscapeString(truncated) + "... (truncated)"
+	}
+
+	input = strings.ReplaceAll(input, "\r\n", "\n")
+	lines := strings.Split(input, "\n")
+	rendered := make([]string, 0, len(lines))
+	inFence := false
+	fenceStart := ""
+	fenceLines := make([]string, 0, 16)
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// 检查是否是代码块开始/结束
+		// 注意：单行的 ```code``` 应该被当作行内代码，而不是代码块
+		if strings.HasPrefix(trimmed, "```") {
+			// 计算反引号数量
+			backtickCount := 0
+			for i := 0; i < len(trimmed) && trimmed[i] == '`'; i++ {
+				backtickCount++
+			}
+
+			// 检查是否在同一行结束
+			if !inFence {
+				// 查找行内是否有关闭的反引号
+				if strings.HasSuffix(trimmed, strings.Repeat("`", backtickCount)) && len(trimmed) > backtickCount*2 {
+					// 单行代码块，当作行内处理
+					rendered = append(rendered, renderMarkdownLine(line))
+					continue
+				}
+
+				// 多行代码块开始
+				inFence = true
+				fenceStart = line
+				fenceLines = fenceLines[:0]
+			} else {
+				// 代码块结束
+				inFence = false
+				rendered = append(rendered, renderFenceBlock(fenceLines))
+			}
+			continue
+		}
+
+		if inFence {
+			fenceLines = append(fenceLines, line)
+			continue
+		}
+
+		rendered = append(rendered, renderMarkdownLine(line))
+	}
+
+	if inFence {
+		// Keep unfinished fence raw while streaming.
+		rendered = append(rendered, html.EscapeString(fenceStart))
+		for _, line := range fenceLines {
+			rendered = append(rendered, html.EscapeString(line))
+		}
+	}
+
+	return strings.Join(rendered, "\n")
+}
+
+func renderMarkdownLine(line string) string {
+	// Check if it's a heading first
+	matches := headingRe.FindStringSubmatch(line)
+	if matches != nil {
+		return renderHeading(matches[1], matches[2])
+	}
+	return renderInline(line)
+}
+
+func renderHeading(levelMarkers, title string) string {
+	// Simply convert heading to bold text without adding any emoji or prefixes
+	// This respects the principle of not modifying OpenCode's output content
+
+	// Apply inline formatting to the title (but don't escape HTML tags)
+	formattedTitle := applyInlineFormatting(title)
+
+	return fmt.Sprintf("<b>%s</b>", formattedTitle)
+}
+
+// applyInlineFormatting applies markdown formatting with proper HTML escaping
+// Used for headings to ensure security while preserving formatting
+func applyInlineFormatting(text string) string {
+	if text == "" {
+		return ""
+	}
+
+	// First escape HTML to prevent injection
+	escaped := html.EscapeString(text)
+
+	// Then apply markdown formatting on the escaped text
+	// This is safe because the text is already escaped
+	return renderInline(escaped)
+}
+
+func renderInline(line string) string {
+	if line == "" {
+		return ""
+	}
+
+	// 第一步：处理链接和代码块，将它们标记出来
+	var parts []string
+	i := 0
+
+	for i < len(line) {
+		// 检查是否是链接开始
+		if line[i] == '[' {
+			label, url, ok := parseLink(line[i:])
+			if ok {
+				// 安全检查：只允许 http:// 或 https:// 协议
+				if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
+					// 处理 URL 中的括号
+					url = balanceParentheses(url)
+					// 标记为链接
+					parts = append(parts, "LINK:"+label+"|"+url)
+					// 跳过已处理的部分
+					i += len(label) + len(url) + 4 // []() 四个字符
+					continue
+				} else {
+					// 不安全的 URL，当作普通文本处理
+					// 我们只跳过 '[' 字符，让后续处理处理其余部分
+					parts = append(parts, line[i:i+1])
+					i++
+					continue
+				}
+			}
+		}
+
+		// 检查是否是代码块开始
+		if line[i] == '`' {
+			// 找到代码块开始
+			backtickCount := 1
+			for i+backtickCount < len(line) && line[i+backtickCount] == '`' {
+				backtickCount++
+			}
+
+			// 查找匹配的结束反引号
+			end := -1
+			for j := i + backtickCount; j < len(line); j++ {
+				if line[j] == '`' {
+					endCount := 1
+					for j+endCount < len(line) && line[j+endCount] == '`' {
+						endCount++
+					}
+
+					if endCount == backtickCount {
+						end = j
+						break
+					}
+
+					j += endCount - 1
+				}
+			}
+
+			if end != -1 {
+				// 提取代码内容
+				code := line[i+backtickCount : end]
+				// 转义代码内容中的 HTML 特殊字符
+				escapedCode := html.EscapeString(code)
+				// 标记为代码块
+				parts = append(parts, "CODE:"+escapedCode)
+				// 跳过代码块
+				i = end + backtickCount
+				continue
+			} else {
+				// 没有找到匹配的结束反引号，当作普通文本处理
+				parts = append(parts, line[i:i+1])
+				i++
+				continue
+			}
+		}
+
+		// 不是链接也不是代码块，收集字符
+		start := i
+		for i < len(line) && line[i] != '[' && line[i] != '`' {
+			i++
+		}
+		if start < i {
+			parts = append(parts, line[start:i])
+		}
+	}
+
+	// 第二步：处理每个部分
+	var result strings.Builder
+	for _, part := range parts {
+		if strings.HasPrefix(part, "CODE:") {
+			// 代码部分：添加 <code> 标签
+			codeContent := part[5:] // 去掉 "CODE:" 前缀
+			result.WriteString("<code>" + codeContent + "</code>")
+		} else if strings.HasPrefix(part, "LINK:") {
+			// 链接部分：创建链接 HTML
+			linkPart := part[5:] // 去掉 "LINK:" 前缀
+			// 格式是 "label|url"
+			sepIndex := strings.Index(linkPart, "|")
+			if sepIndex != -1 {
+				label := linkPart[:sepIndex]
+				url := linkPart[sepIndex+1:]
+				// 转义 label 和 url
+				escapedLabel := html.EscapeString(label)
+				escapedUrl := html.EscapeString(url)
+				result.WriteString(fmt.Sprintf(`<a href="%s">%s</a>`, escapedUrl, escapedLabel))
+			} else {
+				// 格式错误，当作普通文本处理
+				escapedText := html.EscapeString(part)
+				formattedText := applyFormatting(escapedText)
+				result.WriteString(formattedText)
+			}
+		} else {
+			// 文本部分：转义 HTML 并应用格式化
+			escapedText := html.EscapeString(part)
+			formattedText := applyFormatting(escapedText)
+			result.WriteString(formattedText)
+		}
+	}
+
+	return result.String()
+}
+
+// applyFormatting 应用 markdown 格式化到已转义的文本
+func applyFormatting(text string) string {
+	if text == "" {
+		return ""
+	}
+
+	// 应用格式化
+	text = boldItalicRe.ReplaceAllString(text, "<b><i>$1</i></b>")
+	text = boldStarRe.ReplaceAllString(text, "<b>$1</b>")
+	text = boldUndRe.ReplaceAllString(text, "<b>$1</b>")
+	text = strikeRe.ReplaceAllString(text, "<s>$1</s>")
+	text = italicStarRe.ReplaceAllString(text, "<i>$1</i>")
+	text = italicUndRe.ReplaceAllString(text, "<i>$1</i>")
+
+	return text
+}
+
+// parseLink 解析 markdown 链接，正确处理括号
+func parseLink(input string) (label, url string, ok bool) {
+	// 查找第一个 '['
+	start := strings.Index(input, "[")
+	if start == -1 {
+		return "", "", false
+	}
+
+	// 查找匹配的 ']'
+	balance := 0
+	end := -1
+	for i := start; i < len(input); i++ {
+		if input[i] == '[' {
+			balance++
+		} else if input[i] == ']' {
+			balance--
+			if balance == 0 {
+				end = i
+				break
+			}
+		}
+	}
+	if end == -1 {
+		return "", "", false
+	}
+
+	label = input[start+1 : end]
+
+	// 查找 '('
+	if end+1 >= len(input) || input[end+1] != '(' {
+		return "", "", false
+	}
+
+	// 查找匹配的 ')'
+	balance = 0
+	urlStart := end + 2
+	urlEnd := -1
+	for i := urlStart - 1; i < len(input); i++ {
+		if input[i] == '(' {
+			balance++
+		} else if input[i] == ')' {
+			balance--
+			if balance == 0 {
+				urlEnd = i
+				break
+			}
+		}
+	}
+	if urlEnd == -1 {
+		return "", "", false
+	}
+
+	url = input[urlStart:urlEnd]
+	return label, url, true
+}
+
+// balanceParentheses 处理 URL 中的括号，确保括号平衡
+func balanceParentheses(url string) string {
+	balance := 0
+	lastValidIndex := len(url)
+
+	for i, ch := range url {
+		if ch == '(' {
+			balance++
+		} else if ch == ')' {
+			balance--
+			if balance < 0 {
+				// 多余的右括号，截断到这里
+				return url[:i]
+			} else if balance == 0 {
+				// 记录最后一个平衡的位置
+				lastValidIndex = i + 1
+			}
+		}
+	}
+
+	// 如果左括号多于右括号，使用最后一个平衡位置
+	if balance > 0 {
+		return url[:lastValidIndex]
+	}
+
+	return url
+}
+
+func renderFenceBlock(lines []string) string {
+	if len(lines) == 0 {
+		return "<pre><code></code></pre>"
+	}
+	return "<pre><code>" + html.EscapeString(strings.Join(lines, "\n")) + "</code></pre>"
+}

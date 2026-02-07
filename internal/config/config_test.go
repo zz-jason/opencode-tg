@@ -29,6 +29,9 @@ timeout = 30
 type = "file"
 file_path = "bot-state.json"
 
+[render]
+mode = "markdown_stream"
+
 [logging]
 level = "info"
 output = "bot.log"
@@ -65,6 +68,9 @@ output = "bot.log"
 	}
 	if cfg.Storage.Type != "file" {
 		t.Errorf("Expected storage type 'file', got %s", cfg.Storage.Type)
+	}
+	if cfg.Render.Mode != "markdown_stream" {
+		t.Errorf("Expected render mode 'markdown_stream', got %s", cfg.Render.Mode)
 	}
 	if cfg.Logging.Level != "info" {
 		t.Errorf("Expected log level 'info', got %s", cfg.Logging.Level)
@@ -108,6 +114,9 @@ url = "http://192.168.50.100:8080"
 	}
 	if cfg.Storage.FilePath != "bot-state.json" {
 		t.Errorf("Expected default file path 'bot-state.json', got %s", cfg.Storage.FilePath)
+	}
+	if cfg.Render.Mode != "markdown_stream" {
+		t.Errorf("Expected default render mode 'markdown_stream', got %s", cfg.Render.Mode)
 	}
 	if cfg.Logging.Level != "info" {
 		t.Errorf("Expected default log level 'info', got %s", cfg.Logging.Level)
@@ -162,6 +171,15 @@ func TestValidateConfig(t *testing.T) {
 				Proxy:    ProxyConfig{Enabled: true, URL: "http://proxy:7890"},
 			},
 			wantErr: false,
+		},
+		{
+			name: "invalid render mode",
+			config: &Config{
+				Telegram: TelegramConfig{Token: "valid_token"},
+				OpenCode: OpenCodeConfig{URL: "http://localhost:8080"},
+				Render:   RenderConfig{Mode: "invalid"},
+			},
+			wantErr: true,
 		},
 	}
 

@@ -35,6 +35,8 @@ type telegramRecorder struct {
 	editCount            int
 	notModifiedEditCount int
 	failOnNotModified    bool
+	failOnHTMLParse      bool
+	htmlParseErrorCount  int
 }
 
 func newTelegramRecorder(t *testing.T) *telegramRecorder {
@@ -76,6 +78,7 @@ func (r *telegramRecorder) handleSendLike(w http.ResponseWriter, req *http.Reque
 	}
 
 	text, _ := payload["text"].(string)
+	parseMode, _ := payload["parse_mode"].(string)
 	chatID := parseChatID(payload["chat_id"])
 
 	r.mu.Lock()
@@ -107,6 +110,16 @@ func (r *telegramRecorder) handleSendLike(w http.ResponseWriter, req *http.Reque
 	default:
 		msgID = r.nextID
 		r.nextID++
+	}
+	if r.failOnHTMLParse && parseMode == "HTML" {
+		r.htmlParseErrorCount++
+		r.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"ok":          false,
+			"error_code":  400,
+			"description": "Bad Request: can't parse entities: unsupported start tag",
+		})
+		return
 	}
 	r.messageTextByID[msgID] = text
 	r.mu.Unlock()
@@ -141,6 +154,18 @@ func (r *telegramRecorder) counts() (sendCount, editCount, notModifiedEditCount 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.sendCount, r.editCount, r.notModifiedEditCount
+}
+
+func (r *telegramRecorder) enableHTMLParseFailure() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.failOnHTMLParse = true
+}
+
+func (r *telegramRecorder) htmlParseFailures() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.htmlParseErrorCount
 }
 
 func pathMethod(p string) string {
@@ -854,6 +879,400 @@ func TestIntegration_HandleCoreCommandsCumulativeStreamNoDup(t *testing.T) {
 	}
 }
 
+func TestIntegration_HandleCoreCommandsMarkdownStreamRenderedHTML(t *testing.T) {
+	t.Helper()
+
+	const sessionID = "session-markdown-render-html-1"
+	opencodeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/global/health":
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == "GET" && r.URL.Path == "/provider":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"all": []map[string]interface{}{},
+			})
+			return
+		case r.Method == "GET" && r.URL.Path == "/session":
+			_ = json.NewEncoder(w).Encode([]map[string]interface{}{})
+			return
+		case r.Method == "POST" && r.URL.Path == "/session":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"id":    sessionID,
+				"title": "Telegram Session",
+				"time": map[string]interface{}{
+					"created": time.Now().UnixMilli(),
+					"updated": time.Now().UnixMilli(),
+				},
+			})
+			return
+		case r.Method == "POST" && r.URL.Path == "/session/"+sessionID+"/message":
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			flusher, _ := w.(http.Flusher)
+			markdown := "**bold**\n```go\nfmt.Println(\"hi\")\n```"
+			_, _ = io.WriteString(w, fmt.Sprintf("data: {\"parts\":[{\"type\":\"text\",\"text\":%q}]}\n\n", markdown))
+			if flusher != nil {
+				flusher.Flush()
+			}
+			return
+		case r.Method == "GET" && r.URL.Path == "/session/"+sessionID+"/message":
+			_ = json.NewEncoder(w).Encode([]map[string]interface{}{})
+			return
+		}
+
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer opencodeServer.Close()
+
+	rec := newTelegramRecorder(t)
+	tgServer := httptest.NewServer(http.HandlerFunc(rec.serveHTTP))
+	defer tgServer.Close()
+
+	tgBot, err := telebot.NewBot(telebot.Settings{
+		Token:       "integration-token",
+		URL:         tgServer.URL,
+		Client:      tgServer.Client(),
+		Offline:     true,
+		Synchronous: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to create telegram bot: %v", err)
+	}
+
+	cfg := &config.Config{
+		Telegram: config.TelegramConfig{
+			Token:          "integration-token",
+			PollingTimeout: 5,
+			PollingLimit:   100,
+		},
+		OpenCode: config.OpenCodeConfig{
+			URL:     opencodeServer.URL,
+			Timeout: 30,
+		},
+		Storage: config.StorageConfig{
+			Type:     "file",
+			FilePath: filepath.Join(t.TempDir(), "bot-state.json"),
+		},
+		Logging: config.LoggingConfig{
+			Level:  "error",
+			Output: "stdout",
+		},
+	}
+
+	bot, err := NewBot(cfg)
+	if err != nil {
+		t.Fatalf("failed to create handler bot: %v", err)
+	}
+	defer func() {
+		if closeErr := bot.Close(); closeErr != nil {
+			t.Fatalf("failed to close handler bot: %v", closeErr)
+		}
+	}()
+
+	bot.SetTelegramBot(tgBot)
+	bot.Start()
+
+	const userID int64 = 30009
+	tgBot.ProcessUpdate(telebot.Update{
+		ID: 801,
+		Message: &telebot.Message{
+			ID:       801,
+			Text:     "render markdown now",
+			Unixtime: time.Now().Unix(),
+			Sender: &telebot.User{
+				ID:        userID,
+				FirstName: "Integration",
+			},
+			Chat: &telebot.Chat{
+				ID:   userID,
+				Type: telebot.ChatPrivate,
+			},
+		},
+	})
+
+	finalMsg := waitForTelegramMessageWithPrefix(t, rec.messages, "✅", 10*time.Second)
+	if !strings.Contains(finalMsg, "<b>bold</b>") {
+		t.Fatalf("expected markdown bold rendered to HTML tag, got: %q", finalMsg)
+	}
+	if !strings.Contains(finalMsg, "<pre><code>fmt.Println(") {
+		t.Fatalf("expected fenced code rendered as pre/code, got: %q", finalMsg)
+	}
+	if strings.Contains(finalMsg, "**bold**") || strings.Contains(finalMsg, "```go") {
+		t.Fatalf("expected markdown syntax removed from final HTML-rendered message, got: %q", finalMsg)
+	}
+}
+
+func TestIntegration_HandleCoreCommandsMarkdownRenderFallbackToPlainOnParseError(t *testing.T) {
+	t.Helper()
+
+	const sessionID = "session-markdown-render-fallback-1"
+	opencodeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/global/health":
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == "GET" && r.URL.Path == "/provider":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"all": []map[string]interface{}{},
+			})
+			return
+		case r.Method == "GET" && r.URL.Path == "/session":
+			_ = json.NewEncoder(w).Encode([]map[string]interface{}{})
+			return
+		case r.Method == "POST" && r.URL.Path == "/session":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"id":    sessionID,
+				"title": "Telegram Session",
+				"time": map[string]interface{}{
+					"created": time.Now().UnixMilli(),
+					"updated": time.Now().UnixMilli(),
+				},
+			})
+			return
+		case r.Method == "POST" && r.URL.Path == "/session/"+sessionID+"/message":
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			flusher, _ := w.(http.Flusher)
+			_, _ = io.WriteString(w, `data: {"parts":[{"type":"text","text":"**bold**"}]}`+"\n\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+			return
+		case r.Method == "GET" && r.URL.Path == "/session/"+sessionID+"/message":
+			_ = json.NewEncoder(w).Encode([]map[string]interface{}{})
+			return
+		}
+
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer opencodeServer.Close()
+
+	rec := newTelegramRecorder(t)
+	rec.enableHTMLParseFailure()
+	tgServer := httptest.NewServer(http.HandlerFunc(rec.serveHTTP))
+	defer tgServer.Close()
+
+	tgBot, err := telebot.NewBot(telebot.Settings{
+		Token:       "integration-token",
+		URL:         tgServer.URL,
+		Client:      tgServer.Client(),
+		Offline:     true,
+		Synchronous: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to create telegram bot: %v", err)
+	}
+
+	cfg := &config.Config{
+		Telegram: config.TelegramConfig{
+			Token:          "integration-token",
+			PollingTimeout: 5,
+			PollingLimit:   100,
+		},
+		OpenCode: config.OpenCodeConfig{
+			URL:     opencodeServer.URL,
+			Timeout: 30,
+		},
+		Storage: config.StorageConfig{
+			Type:     "file",
+			FilePath: filepath.Join(t.TempDir(), "bot-state.json"),
+		},
+		Logging: config.LoggingConfig{
+			Level:  "error",
+			Output: "stdout",
+		},
+	}
+
+	bot, err := NewBot(cfg)
+	if err != nil {
+		t.Fatalf("failed to create handler bot: %v", err)
+	}
+	defer func() {
+		if closeErr := bot.Close(); closeErr != nil {
+			t.Fatalf("failed to close handler bot: %v", closeErr)
+		}
+	}()
+
+	bot.SetTelegramBot(tgBot)
+	bot.Start()
+
+	const userID int64 = 30008
+	tgBot.ProcessUpdate(telebot.Update{
+		ID: 701,
+		Message: &telebot.Message{
+			ID:       701,
+			Text:     "show markdown fallback",
+			Unixtime: time.Now().Unix(),
+			Sender: &telebot.User{
+				ID:        userID,
+				FirstName: "Integration",
+			},
+			Chat: &telebot.Chat{
+				ID:   userID,
+				Type: telebot.ChatPrivate,
+			},
+		},
+	})
+
+	finalMsg := waitForTelegramMessageWithPrefix(t, rec.messages, "✅", 10*time.Second)
+	if !strings.Contains(finalMsg, "**bold**") {
+		t.Fatalf("expected plain-text markdown fallback, got: %q", finalMsg)
+	}
+	if strings.Contains(finalMsg, "<b>") {
+		t.Fatalf("expected fallback plain text without HTML tags, got: %q", finalMsg)
+	}
+	if rec.htmlParseFailures() == 0 {
+		t.Fatalf("expected simulated HTML parse failure to be triggered")
+	}
+}
+
+func TestIntegration_HandleCoreCommandsCodeFenceStreamingAcrossPagesRendered(t *testing.T) {
+	t.Helper()
+
+	const sessionID = "session-code-fence-paging-render-1"
+	opencodeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/global/health":
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == "GET" && r.URL.Path == "/provider":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"all": []map[string]interface{}{},
+			})
+			return
+		case r.Method == "GET" && r.URL.Path == "/session":
+			_ = json.NewEncoder(w).Encode([]map[string]interface{}{})
+			return
+		case r.Method == "POST" && r.URL.Path == "/session":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"id":    sessionID,
+				"title": "Telegram Session",
+				"time": map[string]interface{}{
+					"created": time.Now().UnixMilli(),
+					"updated": time.Now().UnixMilli(),
+				},
+			})
+			return
+		case r.Method == "POST" && r.URL.Path == "/session/"+sessionID+"/message":
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			flusher, _ := w.(http.Flusher)
+
+			code1 := "```bash\n" + strings.Repeat("echo one\n", 140) + "```"
+			code2 := "```bash\n" + strings.Repeat("echo one\n", 420) + "```"
+			events := []string{
+				fmt.Sprintf("data: {\"parts\":[{\"type\":\"text\",\"text\":%q}]}\n\n", code1),
+				fmt.Sprintf("data: {\"parts\":[{\"type\":\"text\",\"text\":%q}]}\n\n", code2),
+			}
+
+			for i, evt := range events {
+				_, _ = io.WriteString(w, evt)
+				if flusher != nil {
+					flusher.Flush()
+				}
+				if i == 0 {
+					time.Sleep(700 * time.Millisecond)
+				}
+			}
+			time.Sleep(2 * time.Second)
+			return
+		case r.Method == "GET" && r.URL.Path == "/session/"+sessionID+"/message":
+			_ = json.NewEncoder(w).Encode([]map[string]interface{}{})
+			return
+		}
+
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer opencodeServer.Close()
+
+	rec := newTelegramRecorder(t)
+	tgServer := httptest.NewServer(http.HandlerFunc(rec.serveHTTP))
+	defer tgServer.Close()
+
+	tgBot, err := telebot.NewBot(telebot.Settings{
+		Token:       "integration-token",
+		URL:         tgServer.URL,
+		Client:      tgServer.Client(),
+		Offline:     true,
+		Synchronous: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to create telegram bot: %v", err)
+	}
+
+	cfg := &config.Config{
+		Telegram: config.TelegramConfig{
+			Token:          "integration-token",
+			PollingTimeout: 5,
+			PollingLimit:   100,
+		},
+		OpenCode: config.OpenCodeConfig{
+			URL:     opencodeServer.URL,
+			Timeout: 30,
+		},
+		Storage: config.StorageConfig{
+			Type:     "file",
+			FilePath: filepath.Join(t.TempDir(), "bot-state.json"),
+		},
+		Logging: config.LoggingConfig{
+			Level:  "error",
+			Output: "stdout",
+		},
+	}
+
+	bot, err := NewBot(cfg)
+	if err != nil {
+		t.Fatalf("failed to create handler bot: %v", err)
+	}
+	defer func() {
+		if closeErr := bot.Close(); closeErr != nil {
+			t.Fatalf("failed to close handler bot: %v", closeErr)
+		}
+	}()
+
+	bot.SetTelegramBot(tgBot)
+	bot.Start()
+
+	const userID int64 = 30010
+	tgBot.ProcessUpdate(telebot.Update{
+		ID: 901,
+		Message: &telebot.Message{
+			ID:       901,
+			Text:     "stream long code block",
+			Unixtime: time.Now().Unix(),
+			Sender: &telebot.User{
+				ID:        userID,
+				FirstName: "Integration",
+			},
+			Chat: &telebot.Chat{
+				ID:   userID,
+				Type: telebot.ChatPrivate,
+			},
+		},
+	})
+
+	_ = waitForTelegramMessage(t, rec.messages) // initial processing message
+
+	// Wait for second message (should contain code block)
+	part2Msg, _ := waitForTelegramMessageContaining(t, rec.messages, "<pre><code>", 10*time.Second)
+	if strings.HasPrefix(part2Msg, "✅") {
+		t.Fatalf("expected streaming-time second message, got final-style message: %q", part2Msg)
+	}
+	if !strings.Contains(part2Msg, "<pre><code>") {
+		t.Fatalf("expected code fence to render as pre/code on second message, got: %q", part2Msg)
+	}
+	if strings.Contains(part2Msg, "```") {
+		t.Fatalf("expected no raw markdown fence markers in rendered second message, got: %q", part2Msg)
+	}
+}
+
 func TestIntegration_HandleCoreCommandsStreamingStartsSecondMessageBeforeCompletion(t *testing.T) {
 	t.Helper()
 
@@ -889,7 +1308,7 @@ func TestIntegration_HandleCoreCommandsStreamingStartsSecondMessageBeforeComplet
 			flusher, _ := w.(http.Flusher)
 
 			// Emit cumulative snapshots without newlines to ensure long single-line
-			// content still starts Part 2/Part 3 streaming before completion.
+			// content still triggers multiple messages before completion.
 			base := strings.Repeat("A", 2400)
 			mid := base + strings.Repeat("B", 2300)
 			long := mid + strings.Repeat("C", 2800)
@@ -990,24 +1409,30 @@ func TestIntegration_HandleCoreCommandsStreamingStartsSecondMessageBeforeComplet
 
 	_ = waitForTelegramMessage(t, rec.messages) // initial processing message
 
-	part2Msg, part2At := waitForTelegramMessageContaining(t, rec.messages, "Part 2/", 8*time.Second)
+	// Wait for second message (should contain content)
+	part2Msg, part2At := waitForTelegramMessage(t, rec.messages, 8*time.Second)
 	if strings.HasPrefix(part2Msg, "✅") {
-		t.Fatalf("expected streaming-time part 2 message, got final-style message: %q", part2Msg)
+		t.Fatalf("expected streaming-time second message, got final-style message: %q", part2Msg)
 	}
 	if part2At.Sub(started) >= 4*time.Second {
-		t.Fatalf("expected Part 2 to appear before stream completion, elapsed=%v message=%q", part2At.Sub(started), part2Msg)
+		t.Fatalf("expected second message to appear before stream completion, elapsed=%v message=%q", part2At.Sub(started), part2Msg)
 	}
 
-	part3Msg, part3At := waitForTelegramMessageContaining(t, rec.messages, "Part 3/", 8*time.Second)
+	// Wait for third message
+	part3Msg, part3At := waitForTelegramMessage(t, rec.messages, 8*time.Second)
 	if strings.HasPrefix(part3Msg, "✅") {
-		t.Fatalf("expected streaming-time part 3 message, got final-style message: %q", part3Msg)
+		t.Fatalf("expected streaming-time third message, got final-style message: %q", part3Msg)
 	}
 	if part3At.Sub(started) >= 4*time.Second {
-		t.Fatalf("expected Part 3 to appear before stream completion, elapsed=%v message=%q", part3At.Sub(started), part3Msg)
+		t.Fatalf("expected third message to appear before stream completion, elapsed=%v message=%q", part3At.Sub(started), part3Msg)
 	}
 
-	finalMsg := waitForTelegramMessageWithPrefix(t, rec.messages, "✅", 8*time.Second)
-	assertContains(t, finalMsg, "Part 1/")
+	// Wait for final message (no completion notice expected)
+	finalMsg := waitForTelegramMessage(t, rec.messages, 8*time.Second)
+	// No completion notice should be added to the content
+	if strings.Contains(finalMsg, "--- ✅ Task completed ---") {
+		t.Fatalf("unexpected completion notice in final message, got: %q", finalMsg)
+	}
 }
 
 func TestIntegration_HandleCoreCommandsPeriodicFallbackStreamsPart2BeforeCompletion(t *testing.T) {
@@ -1169,16 +1594,21 @@ func TestIntegration_HandleCoreCommandsPeriodicFallbackStreamsPart2BeforeComplet
 
 	_ = waitForTelegramMessage(t, rec.messages) // initial processing message
 
-	part2Msg, part2At := waitForTelegramMessageContaining(t, rec.messages, "Part 2/", 10*time.Second)
+	// Wait for second message
+	part2Msg, part2At := waitForTelegramMessage(t, rec.messages, 10*time.Second)
 	if strings.HasPrefix(part2Msg, "✅") {
-		t.Fatalf("expected streaming-time part 2 message, got final-style message: %q", part2Msg)
+		t.Fatalf("expected streaming-time second message, got final-style message: %q", part2Msg)
 	}
 	if part2At.Sub(started) >= 8*time.Second {
-		t.Fatalf("expected Part 2 to appear before stream completion, elapsed=%v message=%q", part2At.Sub(started), part2Msg)
+		t.Fatalf("expected second message to appear before stream completion, elapsed=%v message=%q", part2At.Sub(started), part2Msg)
 	}
 
-	finalMsg := waitForTelegramMessageWithPrefix(t, rec.messages, "✅", 12*time.Second)
-	assertContains(t, finalMsg, "Part 1/")
+	// Wait for final message (no completion notice expected)
+	finalMsg := waitForTelegramMessage(t, rec.messages, 12*time.Second)
+	// No completion notice should be added to the content
+	if strings.Contains(finalMsg, "--- ✅ Task completed ---") {
+		t.Fatalf("unexpected completion notice in final message, got: %q", finalMsg)
+	}
 }
 
 func TestIntegration_HandleCoreCommandsRealtimeToolProgressSameMessageID(t *testing.T) {
