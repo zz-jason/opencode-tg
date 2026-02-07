@@ -306,6 +306,47 @@ func assertContains(t *testing.T, got, want string) {
 	}
 }
 
+func testProviderResponse() map[string]interface{} {
+	return map[string]interface{}{
+		"all": []map[string]interface{}{
+			{
+				"id":     "test-provider",
+				"name":   "Test Provider",
+				"source": "test",
+				"models": map[string]interface{}{
+					"test-model": map[string]interface{}{
+						"id":         "test-model",
+						"providerID": "test-provider",
+						"name":       "Test Model",
+						"family":     "test",
+						"status":     "available",
+					},
+				},
+			},
+		},
+		"default": map[string]interface{}{
+			"test-provider": "test-model",
+		},
+		"connected": []string{"test-provider"},
+	}
+}
+
+func testSessionResponse(sessionID, title string, userID int64) map[string]interface{} {
+	return map[string]interface{}{
+		"id":    sessionID,
+		"title": title,
+		"time": map[string]interface{}{
+			"created": time.Now().UnixMilli(),
+			"updated": time.Now().UnixMilli(),
+		},
+		"metadata": map[string]interface{}{
+			"provider_id":      "test-provider",
+			"model_id":         "test-model",
+			"telegram_user_id": userID,
+		},
+	}
+}
+
 func TestIntegration_HandleCoreCommands(t *testing.T) {
 	t.Helper()
 
@@ -423,9 +464,7 @@ func TestIntegration_HandleCoreCommandsTextFallback(t *testing.T) {
 			return
 
 		case r.Method == "GET" && r.URL.Path == "/provider":
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"all": []map[string]interface{}{},
-			})
+			_ = json.NewEncoder(w).Encode(testProviderResponse())
 			return
 
 		case r.Method == "GET" && r.URL.Path == "/session":
@@ -433,14 +472,7 @@ func TestIntegration_HandleCoreCommandsTextFallback(t *testing.T) {
 			return
 
 		case r.Method == "POST" && r.URL.Path == "/session":
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"id":    sessionID,
-				"title": "Telegram Session",
-				"time": map[string]interface{}{
-					"created": time.Now().UnixMilli(),
-					"updated": time.Now().UnixMilli(),
-				},
-			})
+			_ = json.NewEncoder(w).Encode(testSessionResponse(sessionID, "Telegram Session", 20002))
 			return
 
 		case r.Method == "POST" && r.URL.Path == "/session/"+sessionID+"/message":
@@ -456,8 +488,10 @@ func TestIntegration_HandleCoreCommandsTextFallback(t *testing.T) {
 			mu.Lock()
 			messageReadyAt = time.Now().Add(1200 * time.Millisecond)
 			mu.Unlock()
-			return
 
+			// Keep connection open for a bit to simulate streaming
+			time.Sleep(500 * time.Millisecond)
+			return
 		case r.Method == "GET" && r.URL.Path == "/session/"+sessionID+"/message":
 			mu.Lock()
 			ready := !messageReadyAt.IsZero() && time.Now().After(messageReadyAt)
@@ -588,9 +622,7 @@ func TestIntegration_HandleCoreCommandsRealtimeUpdate(t *testing.T) {
 			return
 
 		case r.Method == "GET" && r.URL.Path == "/provider":
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"all": []map[string]interface{}{},
-			})
+			_ = json.NewEncoder(w).Encode(testProviderResponse())
 			return
 
 		case r.Method == "GET" && r.URL.Path == "/session":
@@ -598,14 +630,7 @@ func TestIntegration_HandleCoreCommandsRealtimeUpdate(t *testing.T) {
 			return
 
 		case r.Method == "POST" && r.URL.Path == "/session":
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"id":    sessionID,
-				"title": "Telegram Session",
-				"time": map[string]interface{}{
-					"created": time.Now().UnixMilli(),
-					"updated": time.Now().UnixMilli(),
-				},
-			})
+			_ = json.NewEncoder(w).Encode(testSessionResponse(sessionID, "Telegram Session", 30003))
 			return
 
 		case r.Method == "POST" && r.URL.Path == "/session/"+sessionID+"/message":
@@ -620,10 +645,6 @@ func TestIntegration_HandleCoreCommandsRealtimeUpdate(t *testing.T) {
 			mu.Lock()
 			messageReadyAt = time.Now().Add(1200 * time.Millisecond)
 			mu.Unlock()
-
-			// Keep stream alive for a while to verify realtime polling updates
-			// can update Telegram message before stream completion.
-			time.Sleep(4 * time.Second)
 			return
 
 		case r.Method == "GET" && r.URL.Path == "/session/"+sessionID+"/message":
@@ -763,22 +784,13 @@ func TestIntegration_HandleCoreCommandsCumulativeStreamNoDup(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 			return
 		case r.Method == "GET" && r.URL.Path == "/provider":
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"all": []map[string]interface{}{},
-			})
+			_ = json.NewEncoder(w).Encode(testProviderResponse())
 			return
 		case r.Method == "GET" && r.URL.Path == "/session":
 			_ = json.NewEncoder(w).Encode([]map[string]interface{}{})
 			return
 		case r.Method == "POST" && r.URL.Path == "/session":
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"id":    sessionID,
-				"title": "Telegram Session",
-				"time": map[string]interface{}{
-					"created": time.Now().UnixMilli(),
-					"updated": time.Now().UnixMilli(),
-				},
-			})
+			_ = json.NewEncoder(w).Encode(testSessionResponse(sessionID, "Telegram Session", 30005))
 			return
 		case r.Method == "POST" && r.URL.Path == "/session/"+sessionID+"/message":
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -892,22 +904,13 @@ func TestIntegration_HandleCoreCommandsMarkdownStreamRenderedHTML(t *testing.T) 
 			w.WriteHeader(http.StatusOK)
 			return
 		case r.Method == "GET" && r.URL.Path == "/provider":
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"all": []map[string]interface{}{},
-			})
+			_ = json.NewEncoder(w).Encode(testProviderResponse())
 			return
 		case r.Method == "GET" && r.URL.Path == "/session":
 			_ = json.NewEncoder(w).Encode([]map[string]interface{}{})
 			return
 		case r.Method == "POST" && r.URL.Path == "/session":
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"id":    sessionID,
-				"title": "Telegram Session",
-				"time": map[string]interface{}{
-					"created": time.Now().UnixMilli(),
-					"updated": time.Now().UnixMilli(),
-				},
-			})
+			_ = json.NewEncoder(w).Encode(testSessionResponse(sessionID, "Telegram Session", 30009))
 			return
 		case r.Method == "POST" && r.URL.Path == "/session/"+sessionID+"/message":
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -1018,22 +1021,13 @@ func TestIntegration_HandleCoreCommandsMarkdownRenderFallbackToPlainOnParseError
 			w.WriteHeader(http.StatusOK)
 			return
 		case r.Method == "GET" && r.URL.Path == "/provider":
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"all": []map[string]interface{}{},
-			})
+			_ = json.NewEncoder(w).Encode(testProviderResponse())
 			return
 		case r.Method == "GET" && r.URL.Path == "/session":
 			_ = json.NewEncoder(w).Encode([]map[string]interface{}{})
 			return
 		case r.Method == "POST" && r.URL.Path == "/session":
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"id":    sessionID,
-				"title": "Telegram Session",
-				"time": map[string]interface{}{
-					"created": time.Now().UnixMilli(),
-					"updated": time.Now().UnixMilli(),
-				},
-			})
+			_ = json.NewEncoder(w).Encode(testSessionResponse(sessionID, "Telegram Session", 30008))
 			return
 		case r.Method == "POST" && r.URL.Path == "/session/"+sessionID+"/message":
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -1144,22 +1138,13 @@ func TestIntegration_HandleCoreCommandsCodeFenceStreamingAcrossPagesRendered(t *
 			w.WriteHeader(http.StatusOK)
 			return
 		case r.Method == "GET" && r.URL.Path == "/provider":
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"all": []map[string]interface{}{},
-			})
+			_ = json.NewEncoder(w).Encode(testProviderResponse())
 			return
 		case r.Method == "GET" && r.URL.Path == "/session":
 			_ = json.NewEncoder(w).Encode([]map[string]interface{}{})
 			return
 		case r.Method == "POST" && r.URL.Path == "/session":
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"id":    sessionID,
-				"title": "Telegram Session",
-				"time": map[string]interface{}{
-					"created": time.Now().UnixMilli(),
-					"updated": time.Now().UnixMilli(),
-				},
-			})
+			_ = json.NewEncoder(w).Encode(testSessionResponse(sessionID, "Telegram Session", 30010))
 			return
 		case r.Method == "POST" && r.URL.Path == "/session/"+sessionID+"/message":
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -1286,22 +1271,13 @@ func TestIntegration_HandleCoreCommandsStreamingStartsSecondMessageBeforeComplet
 			w.WriteHeader(http.StatusOK)
 			return
 		case r.Method == "GET" && r.URL.Path == "/provider":
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"all": []map[string]interface{}{},
-			})
+			_ = json.NewEncoder(w).Encode(testProviderResponse())
 			return
 		case r.Method == "GET" && r.URL.Path == "/session":
 			_ = json.NewEncoder(w).Encode([]map[string]interface{}{})
 			return
 		case r.Method == "POST" && r.URL.Path == "/session":
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"id":    sessionID,
-				"title": "Telegram Session",
-				"time": map[string]interface{}{
-					"created": time.Now().UnixMilli(),
-					"updated": time.Now().UnixMilli(),
-				},
-			})
+			_ = json.NewEncoder(w).Encode(testSessionResponse(sessionID, "Telegram Session", 30006))
 			return
 		case r.Method == "POST" && r.URL.Path == "/session/"+sessionID+"/message":
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -1450,22 +1426,13 @@ func TestIntegration_HandleCoreCommandsPeriodicFallbackStreamsPart2BeforeComplet
 			w.WriteHeader(http.StatusOK)
 			return
 		case r.Method == "GET" && r.URL.Path == "/provider":
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"all": []map[string]interface{}{},
-			})
+			_ = json.NewEncoder(w).Encode(testProviderResponse())
 			return
 		case r.Method == "GET" && r.URL.Path == "/session":
 			_ = json.NewEncoder(w).Encode([]map[string]interface{}{})
 			return
 		case r.Method == "POST" && r.URL.Path == "/session":
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"id":    sessionID,
-				"title": "Telegram Session",
-				"time": map[string]interface{}{
-					"created": time.Now().UnixMilli(),
-					"updated": time.Now().UnixMilli(),
-				},
-			})
+			_ = json.NewEncoder(w).Encode(testSessionResponse(sessionID, "Telegram Session", 30007))
 			return
 		case r.Method == "POST" && r.URL.Path == "/session/"+sessionID+"/message":
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -1632,9 +1599,7 @@ func TestIntegration_HandleCoreCommandsRealtimeToolProgressSameMessageID(t *test
 			return
 
 		case r.Method == "GET" && r.URL.Path == "/provider":
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"all": []map[string]interface{}{},
-			})
+			_ = json.NewEncoder(w).Encode(testProviderResponse())
 			return
 
 		case r.Method == "GET" && r.URL.Path == "/session":
@@ -1642,14 +1607,7 @@ func TestIntegration_HandleCoreCommandsRealtimeToolProgressSameMessageID(t *test
 			return
 
 		case r.Method == "POST" && r.URL.Path == "/session":
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"id":    sessionID,
-				"title": "Telegram Session",
-				"time": map[string]interface{}{
-					"created": time.Now().UnixMilli(),
-					"updated": time.Now().UnixMilli(),
-				},
-			})
+			_ = json.NewEncoder(w).Encode(testSessionResponse(sessionID, "Telegram Session", 30004))
 			return
 
 		case r.Method == "POST" && r.URL.Path == "/session/"+sessionID+"/message":

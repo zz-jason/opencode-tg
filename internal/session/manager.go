@@ -369,6 +369,16 @@ func (m *Manager) GetOrCreateSession(ctx context.Context, userID int64) (string,
 		MessageCount: 1,
 	}
 
+	// Extract model information from session metadata if available
+	if session.Metadata != nil {
+		if providerID := getMetadataString(session.Metadata, "provider_id", "providerID"); providerID != "" {
+			meta.ProviderID = providerID
+		}
+		if modelID := getMetadataString(session.Metadata, "model_id", "modelID"); modelID != "" {
+			meta.ModelID = modelID
+		}
+	}
+
 	// Store metadata
 	if err := m.store.StoreSessionMeta(meta); err != nil {
 		return "", err
