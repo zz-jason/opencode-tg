@@ -307,10 +307,17 @@ func renderInline(line string) string {
 		return ""
 	}
 
-	// 第一步：处理链接和代码块，将它们标记出来
-	var parts []string
-	i := 0
+	// 第一步：提取链接和代码块，用占位符替换
+	type placeholder struct {
+		start, end    int
+		html          string
+		placeholderID string
+	}
+	var placeholders []placeholder
+	placeholderIndex := 0
 
+	// 扫描字符串，识别链接和代码块
+	i := 0
 	for i < len(line) {
 		// 检查是否是链接开始
 		if line[i] == '[' {
@@ -320,15 +327,26 @@ func renderInline(line string) string {
 				if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
 					// 处理 URL 中的括号
 					url = balanceParentheses(url)
-					// 标记为链接
-					parts = append(parts, "LINK:"+label+"|"+url)
-					// 跳过已处理的部分
-					i += len(label) + len(url) + 4 // []() 四个字符
+					// 转义 label 和 url
+					escapedLabel := html.EscapeString(label)
+					escapedUrl := html.EscapeString(url)
+					// 生成链接 HTML
+					linkHTML := fmt.Sprintf(`<a href="%s">%s</a>`, escapedUrl, escapedLabel)
+					// 创建占位符
+					placeholderID := fmt.Sprintf("{{LINK%d}}", placeholderIndex)
+					placeholderIndex++
+					// 记录占位符
+					placeholders = append(placeholders, placeholder{
+						start:         i,
+						end:           i + len(label) + len(url) + 4, // []() 四个字符
+						html:          linkHTML,
+						placeholderID: placeholderID,
+					})
+					// 跳过链接
+					i += len(label) + len(url) + 4
 					continue
 				} else {
 					// 不安全的 URL，当作普通文本处理
-					// 我们只跳过 '[' 字符，让后续处理处理其余部分
-					parts = append(parts, line[i:i+1])
 					i++
 					continue
 				}
@@ -366,63 +384,63 @@ func renderInline(line string) string {
 				code := line[i+backtickCount : end]
 				// 转义代码内容中的 HTML 特殊字符
 				escapedCode := html.EscapeString(code)
-				// 标记为代码块
-				parts = append(parts, "CODE:"+escapedCode)
+				// 生成代码 HTML
+				codeHTML := "<code>" + escapedCode + "</code>"
+				// 创建占位符
+				placeholderID := fmt.Sprintf("{{CODE%d}}", placeholderIndex)
+				placeholderIndex++
+				// 记录占位符
+				placeholders = append(placeholders, placeholder{
+					start:         i,
+					end:           end + backtickCount,
+					html:          codeHTML,
+					placeholderID: placeholderID,
+				})
 				// 跳过代码块
 				i = end + backtickCount
 				continue
 			} else {
 				// 没有找到匹配的结束反引号，当作普通文本处理
-				parts = append(parts, line[i:i+1])
 				i++
 				continue
 			}
 		}
 
-		// 不是链接也不是代码块，收集字符
-		start := i
-		for i < len(line) && line[i] != '[' && line[i] != '`' {
-			i++
-		}
-		if start < i {
-			parts = append(parts, line[start:i])
-		}
+		i++
 	}
 
-	// 第二步：处理每个部分
-	var result strings.Builder
-	for _, part := range parts {
-		if strings.HasPrefix(part, "CODE:") {
-			// 代码部分：添加 <code> 标签
-			codeContent := part[5:] // 去掉 "CODE:" 前缀
-			result.WriteString("<code>" + codeContent + "</code>")
-		} else if strings.HasPrefix(part, "LINK:") {
-			// 链接部分：创建链接 HTML
-			linkPart := part[5:] // 去掉 "LINK:" 前缀
-			// 格式是 "label|url"
-			sepIndex := strings.Index(linkPart, "|")
-			if sepIndex != -1 {
-				label := linkPart[:sepIndex]
-				url := linkPart[sepIndex+1:]
-				// 转义 label 和 url
-				escapedLabel := html.EscapeString(label)
-				escapedUrl := html.EscapeString(url)
-				result.WriteString(fmt.Sprintf(`<a href="%s">%s</a>`, escapedUrl, escapedLabel))
-			} else {
-				// 格式错误，当作普通文本处理
-				escapedText := html.EscapeString(part)
-				formattedText := applyFormatting(escapedText)
-				result.WriteString(formattedText)
-			}
-		} else {
-			// 文本部分：转义 HTML 并应用格式化
-			escapedText := html.EscapeString(part)
-			formattedText := applyFormatting(escapedText)
-			result.WriteString(formattedText)
+	// 第二步：构建带有占位符的字符串
+	// 为了简化，我们从左到右构建新字符串
+	var processed strings.Builder
+	lastPos := 0
+	for _, ph := range placeholders {
+		// 添加占位符之前的文本
+		if ph.start > lastPos {
+			processed.WriteString(line[lastPos:ph.start])
 		}
+		// 添加占位符
+		processed.WriteString(ph.placeholderID)
+		lastPos = ph.end
+	}
+	// 添加剩余文本
+	if lastPos < len(line) {
+		processed.WriteString(line[lastPos:])
+	}
+	processedStr := processed.String()
+
+	// 第三步：HTML 转义整个字符串（占位符不受影响，因为它们不包含特殊字符）
+	escapedStr := html.EscapeString(processedStr)
+
+	// 第四步：应用 markdown 格式化
+	formattedStr := applyFormatting(escapedStr)
+
+	// 第五步：将占位符替换为实际的 HTML
+	result := formattedStr
+	for _, ph := range placeholders {
+		result = strings.Replace(result, ph.placeholderID, ph.html, 1)
 	}
 
-	return result.String()
+	return result
 }
 
 // applyFormatting 应用 markdown 格式化到已转义的文本

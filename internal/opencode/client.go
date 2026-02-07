@@ -546,14 +546,16 @@ func (c *Client) StreamMessage(ctx context.Context, sessionID string, content st
 		// Clone the transport and adjust timeouts for streaming
 		transport = baseTransport.Clone()
 		transport.TLSHandshakeTimeout = 30 * time.Second
-		transport.ResponseHeaderTimeout = 60 * time.Second
+		// Increased from 60s to 300s to accommodate slow OpenCode server header responses
+		transport.ResponseHeaderTimeout = 300 * time.Second
 		transport.ExpectContinueTimeout = 10 * time.Second
 	} else {
 		// Fallback to default transport
 		transport = &http.Transport{
-			Proxy:                 nil, // Disable proxy
-			TLSHandshakeTimeout:   30 * time.Second,
-			ResponseHeaderTimeout: 60 * time.Second,
+			Proxy:               nil, // Disable proxy
+			TLSHandshakeTimeout: 30 * time.Second,
+			// Increased from 60s to 300s to accommodate slow OpenCode server header responses
+			ResponseHeaderTimeout: 300 * time.Second,
 			ExpectContinueTimeout: 10 * time.Second,
 			IdleConnTimeout:       300 * time.Second,
 			MaxIdleConns:          100,
@@ -578,8 +580,15 @@ func (c *Client) StreamMessage(ctx context.Context, sessionID string, content st
 		if err != nil {
 			log.Errorf("Stream request failed after %v (attempt %d/%d): %v", elapsed, attempt, maxRetries, err)
 
+			// Log warning for ContentLength mismatch errors (potential OpenCode server bug)
+			errStr := err.Error()
+			if strings.Contains(errStr, "ContentLength=") && strings.Contains(errStr, "Body length 0") {
+				log.Warnf("OpenCode server returned mismatched Content-Length header (possible server bug)")
+			}
+
 			// Check if we should retry
 			if attempt < maxRetries && isRetryableError(err) {
+				log.Debugf("Error is retryable: %v", err)
 				waitTime := time.Duration(attempt) * 2 * time.Second
 				log.Debugf("Retrying in %v...", waitTime)
 				select {
@@ -766,7 +775,10 @@ func isRetryableError(err error) bool {
 		strings.Contains(errStr, "deadline exceeded") ||
 		strings.Contains(errStr, "connection refused") ||
 		strings.Contains(errStr, "connection reset") ||
-		strings.Contains(errStr, "network is unreachable") {
+		strings.Contains(errStr, "network is unreachable") ||
+		strings.Contains(errStr, "EOF") ||
+		// ContentLength mismatch indicates OpenCode server bug (sends header but empty body)
+		(strings.Contains(errStr, "ContentLength=") && strings.Contains(errStr, "Body length 0")) {
 		return true
 	}
 
