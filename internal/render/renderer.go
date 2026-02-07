@@ -176,21 +176,21 @@ var (
 	// Links: match [label](url), uses custom parsing to handle parentheses
 	linkRe = regexp.MustCompile(`\[([^\[\]]*)\]\(([^)]+)\)`)
 
-	// 粗斜体：非贪婪匹配
+	// Bold italic: non-greedy match
 	boldItalicRe = regexp.MustCompile(`\*\*\*([^*]+?)\*\*\*`)
 
-	// 粗体：允许包含单个星号（用于嵌套斜体）
+	// Bold: allows single asterisk (for nested italic)
 	boldStarRe = regexp.MustCompile(`\*\*([^*]+?(?:\*[^*]+?)*?)\*\*`)
 	boldUndRe  = regexp.MustCompile(`__([^_]+?(?:_[^_]+?)*?)__`)
 
-	// 删除线
+	// Strikethrough
 	strikeRe = regexp.MustCompile(`~~([^~]+?)~~`)
 
-	// 斜体：非贪婪匹配
+	// Italic: non-greedy match
 	italicStarRe = regexp.MustCompile(`\*([^*]+?)\*`)
 	italicUndRe  = regexp.MustCompile(`_([^_]+?)_`)
 
-	// 标题
+	// Heading
 	headingRe = regexp.MustCompile(`^(#{1,6})\s+(.+)$`)
 )
 
@@ -201,10 +201,10 @@ func MarkdownToTelegramHTML(input string) string {
 		return ""
 	}
 
-	// 输入验证：限制最大长度防止 DoS 攻击
+	// Input validation: limit maximum length to prevent DoS attacks
 	const maxInputSize = 100000 // 100KB
 	if len(input) > maxInputSize {
-		// 返回截断的版本，避免处理过大的输入
+		// Return truncated version to avoid processing oversized input
 		truncated := input[:maxInputSize]
 		return html.EscapeString(truncated) + "... (truncated)"
 	}
@@ -219,10 +219,10 @@ func MarkdownToTelegramHTML(input string) string {
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 
-		// 检查是否是代码块开始/结束
-		// 注意：单行的 ```code``` 应该被当作行内代码，而不是代码块
+		// Check if it's the start/end of a code block
+		// Note: single-line ```code``` should be treated as inline code, not code block
 		if strings.HasPrefix(trimmed, "```") {
-			// 计算反引号数量
+			// Count number of backticks
 			backtickCount := 0
 			for i := 0; i < len(trimmed) && trimmed[i] == '`'; i++ {
 				backtickCount++
@@ -230,19 +230,19 @@ func MarkdownToTelegramHTML(input string) string {
 
 			// 检查是否在同一行结束
 			if !inFence {
-				// 查找行内是否有关闭的反引号
+				// Check if there are closing backticks on the same line
 				if strings.HasSuffix(trimmed, strings.Repeat("`", backtickCount)) && len(trimmed) > backtickCount*2 {
-					// 单行代码块，当作行内处理
+					// Single-line code block, treat as inline
 					rendered = append(rendered, renderMarkdownLine(line))
 					continue
 				}
 
-				// 多行代码块开始
+				// Multi-line code block starts
 				inFence = true
 				fenceStart = line
 				fenceLines = fenceLines[:0]
 			} else {
-				// 代码块结束
+				// Code block ends
 				inFence = false
 				rendered = append(rendered, renderFenceBlock(fenceLines))
 			}
@@ -338,7 +338,7 @@ func renderInline(line string) string {
 					// Record the placeholder
 					placeholders = append(placeholders, placeholder{
 						start:         i,
-						end:           i + len(label) + len(url) + 4, // []() 四个字符
+						end:           i + len(label) + len(url) + 4, // []() four characters
 						html:          linkHTML,
 						placeholderID: placeholderID,
 					})
@@ -460,15 +460,15 @@ func applyFormatting(text string) string {
 	return text
 }
 
-// parseLink 解析 markdown 链接，正确处理括号
+// parseLink parses markdown link, correctly handles parentheses
 func parseLink(input string) (label, url string, ok bool) {
-	// 查找第一个 '['
+	// Find first '['
 	start := strings.Index(input, "[")
 	if start == -1 {
 		return "", "", false
 	}
 
-	// 查找匹配的 ']'
+	// Find matching ']'
 	balance := 0
 	end := -1
 	for i := start; i < len(input); i++ {
@@ -488,12 +488,12 @@ func parseLink(input string) (label, url string, ok bool) {
 
 	label = input[start+1 : end]
 
-	// 查找 '('
+	// Find '('
 	if end+1 >= len(input) || input[end+1] != '(' {
 		return "", "", false
 	}
 
-	// 查找匹配的 ')'
+	// Find matching ')'
 	balance = 0
 	urlStart := end + 2
 	urlEnd := -1
@@ -516,7 +516,7 @@ func parseLink(input string) (label, url string, ok bool) {
 	return label, url, true
 }
 
-// balanceParentheses 处理 URL 中的括号，确保括号平衡
+// balanceParentheses handles parentheses in URL, ensures balanced parentheses
 func balanceParentheses(url string) string {
 	balance := 0
 	lastValidIndex := len(url)
@@ -527,16 +527,16 @@ func balanceParentheses(url string) string {
 		} else if ch == ')' {
 			balance--
 			if balance < 0 {
-				// 多余的右括号，截断到这里
+				// Extra closing parenthesis, truncate here
 				return url[:i]
 			} else if balance == 0 {
-				// 记录最后一个平衡的位置
+				// Record last balanced position
 				lastValidIndex = i + 1
 			}
 		}
 	}
 
-	// 如果左括号多于右括号，使用最后一个平衡位置
+	// If more opening than closing parentheses, use last balanced position
 	if balance > 0 {
 		return url[:lastValidIndex]
 	}

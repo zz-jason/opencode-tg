@@ -522,7 +522,7 @@ func TestFormatStreamingDisplays_LongSingleLineCreatesMultipleParts(t *testing.T
 		t.Fatalf("expected multiple streaming displays, got %d", len(displays))
 	}
 
-	// 验证没有分页头部或光标
+	// Verify no pagination headers or cursors
 	for i, display := range displays {
 		if strings.Contains(display, "Part ") && strings.Contains(display, "/") {
 			t.Errorf("display %d contains page header, should be plain content: %q", i, display)
@@ -535,7 +535,7 @@ func TestFormatStreamingDisplays_LongSingleLineCreatesMultipleParts(t *testing.T
 		}
 	}
 
-	// 验证内容完整性（总长度应匹配）
+	// Verify content integrity (total length should match)
 	totalLength := 0
 	for _, display := range displays {
 		totalLength += len(display)
