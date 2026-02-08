@@ -55,13 +55,11 @@ func (m *Manager) Initialize(ctx context.Context) error {
 
 	// Synchronize sessions first
 	if err := m.SyncSessions(ctx); err != nil {
-		log.Warnf("Failed to synchronize sessions from OpenCode: %v", err)
-		// Continue to try loading models even if sessions fail
+		return fmt.Errorf("failed to synchronize sessions: %w", err)
 	}
 
 	// Synchronize models
 	if err := m.SyncModels(ctx); err != nil {
-		log.Warnf("Failed to synchronize models from OpenCode: %v", err)
 		return fmt.Errorf("failed to synchronize models: %w", err)
 	}
 
@@ -261,89 +259,89 @@ func (m *Manager) GetOrCreateSession(ctx context.Context, userID int64) (string,
 	// First, check if user has existing sessions in OpenCode
 	opencodeSessions, err := m.client.ListSessions(ctx)
 	if err != nil {
-		log.Warnf("Failed to get sessions from OpenCode: %v, creating new session", err)
-	} else {
-		// Look for sessions belonging to this user
-		var userSessions []opencode.Session
-		for _, ocSession := range opencodeSessions {
+		return "", fmt.Errorf("failed to get sessions from OpenCode: %w", err)
+	}
+
+	// Look for sessions belonging to this user
+	var userSessions []opencode.Session
+	for _, ocSession := range opencodeSessions {
+		if ocSession.Metadata != nil {
+			if tgUserID, ok := ocSession.Metadata["telegram_user_id"].(float64); ok && int64(tgUserID) == userID {
+				userSessions = append(userSessions, ocSession)
+			}
+		}
+	}
+
+	if len(userSessions) > 0 {
+		// Use the most recent session (assuming later in list is newer)
+		ocSession := userSessions[0]
+
+		// Check if we already have metadata for this session
+		meta, exists, err := m.store.GetSessionMeta(ocSession.ID)
+		if err != nil {
+			return "", err
+		}
+		if !exists {
+			// Create new metadata
+			meta = &storage.SessionMeta{
+				SessionID:  ocSession.ID,
+				UserID:     userID,
+				Status:     "owned",
+				CreatedAt:  time.Now(),
+				LastUsedAt: time.Now(),
+			}
+
+			// Extract name from OpenCode session title, metadata, or use default
+			if ocSession.Title != "" {
+				meta.Name = ocSession.Title
+			} else if ocSession.Metadata != nil {
+				if sessionName, ok := ocSession.Metadata["session_name"].(string); ok && sessionName != "" {
+					meta.Name = sessionName
+				} else if metadataTitle, ok := ocSession.Metadata["title"].(string); ok && metadataTitle != "" {
+					meta.Name = metadataTitle
+				}
+			}
+			if meta.Name == "" {
+				meta.Name = "Telegram Session"
+			}
+
+			// Extract model information if available
 			if ocSession.Metadata != nil {
-				if tgUserID, ok := ocSession.Metadata["telegram_user_id"].(float64); ok && int64(tgUserID) == userID {
-					userSessions = append(userSessions, ocSession)
+				if providerID, ok := ocSession.Metadata["provider_id"].(string); ok {
+					meta.ProviderID = providerID
 				}
+				if modelID, ok := ocSession.Metadata["model_id"].(string); ok {
+					meta.ModelID = modelID
+				}
+			}
+
+			if err := m.store.StoreSessionMeta(meta); err != nil {
+				return "", err
+			}
+		} else {
+			// Update existing metadata
+			meta.LastUsedAt = time.Now()
+			meta.UserID = userID  // Ensure user ID is correct
+			meta.Status = "owned" // Ensure status is correct
+			if err := m.store.StoreSessionMeta(meta); err != nil {
+				return "", err
 			}
 		}
 
-		if len(userSessions) > 0 {
-			// Use the most recent session (assuming later in list is newer)
-			ocSession := userSessions[0]
+		meta.MessageCount++
 
-			// Check if we already have metadata for this session
-			meta, exists, err := m.store.GetSessionMeta(ocSession.ID)
-			if err != nil {
-				return "", err
-			}
-			if !exists {
-				// Create new metadata
-				meta = &storage.SessionMeta{
-					SessionID:  ocSession.ID,
-					UserID:     userID,
-					Status:     "owned",
-					CreatedAt:  time.Now(),
-					LastUsedAt: time.Now(),
-				}
-
-				// Extract name from OpenCode session title, metadata, or use default
-				if ocSession.Title != "" {
-					meta.Name = ocSession.Title
-				} else if ocSession.Metadata != nil {
-					if sessionName, ok := ocSession.Metadata["session_name"].(string); ok && sessionName != "" {
-						meta.Name = sessionName
-					} else if metadataTitle, ok := ocSession.Metadata["title"].(string); ok && metadataTitle != "" {
-						meta.Name = metadataTitle
-					}
-				}
-				if meta.Name == "" {
-					meta.Name = "Telegram Session"
-				}
-
-				// Extract model information if available
-				if ocSession.Metadata != nil {
-					if providerID, ok := ocSession.Metadata["provider_id"].(string); ok {
-						meta.ProviderID = providerID
-					}
-					if modelID, ok := ocSession.Metadata["model_id"].(string); ok {
-						meta.ModelID = modelID
-					}
-				}
-
-				if err := m.store.StoreSessionMeta(meta); err != nil {
-					return "", err
-				}
-			} else {
-				// Update existing metadata
-				meta.LastUsedAt = time.Now()
-				meta.UserID = userID  // Ensure user ID is correct
-				meta.Status = "owned" // Ensure status is correct
-				if err := m.store.StoreSessionMeta(meta); err != nil {
-					return "", err
-				}
-			}
-
-			meta.MessageCount++
-
-			// Store user mapping
-			if err := m.store.StoreUserSession(userID, ocSession.ID); err != nil {
-				return "", err
-			}
-
-			// Update last session preference
-			if err := m.store.StoreUserLastSession(userID, ocSession.ID); err != nil {
-				log.Warnf("Failed to update user last session: %v", err)
-			}
-
-			log.Infof("Using existing OpenCode session %s for user %d", ocSession.ID, userID)
-			return ocSession.ID, nil
+		// Store user mapping
+		if err := m.store.StoreUserSession(userID, ocSession.ID); err != nil {
+			return "", err
 		}
+
+		// Update last session preference
+		if err := m.store.StoreUserLastSession(userID, ocSession.ID); err != nil {
+			log.Warnf("Failed to update user last session: %v", err)
+		}
+
+		log.Infof("Using existing OpenCode session %s for user %d", ocSession.ID, userID)
+		return ocSession.ID, nil
 	}
 
 	// No existing sessions found, create new session in OpenCode
@@ -462,9 +460,9 @@ func (m *Manager) ListUserSessions(ctx context.Context, userID int64) ([]*Sessio
 	// Get all sessions from OpenCode
 	opencodeSessions, err := m.client.ListSessions(ctx)
 	if err != nil {
-		// Fall back to local sessions if OpenCode API fails
-		log.Warnf("Failed to get sessions from OpenCode: %v, falling back to local sessions", err)
-		return m.listLocalUserSessions(userID), nil
+		// Prototype mode: surface upstream failures to caller instead of masking them
+		// with local fallback, so Telegram users can see the real availability issue.
+		return nil, fmt.Errorf("failed to get sessions from OpenCode: %w", err)
 	}
 
 	var allSessions []*SessionMeta

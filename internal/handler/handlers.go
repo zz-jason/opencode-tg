@@ -134,8 +134,8 @@ func NewBot(cfg *config.Config) (*Bot, error) {
 	defer healthCancel()
 
 	if healthErr := client.HealthCheck(healthCtx); healthErr != nil {
-		log.Warnf("OpenCode health check failed: %v", healthErr)
-		// Continue anyway, as the server might become available later
+		returnErr = fmt.Errorf("OpenCode health check failed: %w", healthErr)
+		return nil, returnErr
 	} else {
 		log.Info("OpenCode connection successful")
 	}
@@ -166,21 +166,18 @@ func NewBot(cfg *config.Config) (*Bot, error) {
 		renderer:           render.New(cfg.Render.Mode),
 	}
 
-	// Initialize session manager asynchronously to preload sessions and models
-	go func() {
-		initCtx, initCancel := context.WithTimeout(ctx, 10*time.Second)
-		defer initCancel()
+	// Initialize session manager before serving requests to ensure startup is healthy.
+	initCtx, initCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer initCancel()
 
-		if err := sessionManager.Initialize(initCtx); err != nil {
-			log.Warnf("Failed to initialize session manager (preloading sessions/models): %v", err)
-			log.Warn("Bot will start without preloaded sessions and models. Users will need to run /sessions and /models manually.")
-		} else {
-			log.Info("Session manager initialized successfully with preloaded sessions and models")
+	if err := sessionManager.Initialize(initCtx); err != nil {
+		returnErr = fmt.Errorf("failed to initialize session manager: %w", err)
+		return nil, returnErr
+	}
+	log.Info("Session manager initialized successfully with preloaded sessions and models")
 
-			// Build global model mapping after successful initialization
-			bot.buildGlobalModelMapping(initCtx)
-		}
-	}()
+	// Build global model mapping after successful initialization.
+	bot.buildGlobalModelMapping(initCtx)
 
 	return bot, nil
 }
@@ -188,6 +185,31 @@ func NewBot(cfg *config.Config) (*Bot, error) {
 // SetTelegramBot sets the Telegram bot instance
 func (b *Bot) SetTelegramBot(tgBot *telebot.Bot) {
 	b.tgBot = tgBot
+}
+
+func (b *Bot) withTelegramInterfaceLog(interfaceName string, handler func(telebot.Context) error) func(telebot.Context) error {
+	return func(c telebot.Context) error {
+		var userID int64
+		var chatID int64
+		var messageID int
+		var textLen int
+
+		if c != nil {
+			if sender := c.Sender(); sender != nil {
+				userID = sender.ID
+			}
+			if chat := c.Chat(); chat != nil {
+				chatID = chat.ID
+			}
+			if msg := c.Message(); msg != nil {
+				messageID = msg.ID
+				textLen = len(msg.Text)
+			}
+		}
+
+		log.Infof("TG interface triggered: interface=%s user=%d chat=%d message_id=%d text_len=%d", interfaceName, userID, chatID, messageID, textLen)
+		return handler(c)
+	}
 }
 
 // Start starts the bot and registers handlers
@@ -198,28 +220,28 @@ func (b *Bot) Start() {
 	}
 
 	// Register command handlers
-	b.tgBot.Handle("/start", b.handleStart)
-	b.tgBot.Handle("/help", b.handleHelp)
-	b.tgBot.Handle("/sessions", b.handleSessions)
-	b.tgBot.Handle("/new", b.handleNew)
-	b.tgBot.Handle("/switch", b.handleSwitch)
-	b.tgBot.Handle("/current", b.handleCurrent)
-	b.tgBot.Handle("/abort", b.handleAbort)
-	b.tgBot.Handle("/files", b.handleFiles)
-	b.tgBot.Handle("/search", b.handleSearch)
-	b.tgBot.Handle("/findfile", b.handleFindFile)
-	b.tgBot.Handle("/symbol", b.handleSymbol)
-	b.tgBot.Handle("/agent", b.handleAgent)
-	b.tgBot.Handle("/command", b.handleCommand)
-	b.tgBot.Handle("/status", b.handleStatus)
-	b.tgBot.Handle("/models", b.handleModels)
-	b.tgBot.Handle("/providers", b.handleProviders)
-	b.tgBot.Handle("/setmodel", b.handleSetModel)
-	b.tgBot.Handle("/rename", b.handleRename)
-	b.tgBot.Handle("/delete", b.handleDelete)
+	b.tgBot.Handle("/start", b.withTelegramInterfaceLog("/start", b.handleStart))
+	b.tgBot.Handle("/help", b.withTelegramInterfaceLog("/help", b.handleHelp))
+	b.tgBot.Handle("/sessions", b.withTelegramInterfaceLog("/sessions", b.handleSessions))
+	b.tgBot.Handle("/new", b.withTelegramInterfaceLog("/new", b.handleNew))
+	b.tgBot.Handle("/switch", b.withTelegramInterfaceLog("/switch", b.handleSwitch))
+	b.tgBot.Handle("/current", b.withTelegramInterfaceLog("/current", b.handleCurrent))
+	b.tgBot.Handle("/abort", b.withTelegramInterfaceLog("/abort", b.handleAbort))
+	b.tgBot.Handle("/files", b.withTelegramInterfaceLog("/files", b.handleFiles))
+	b.tgBot.Handle("/search", b.withTelegramInterfaceLog("/search", b.handleSearch))
+	b.tgBot.Handle("/findfile", b.withTelegramInterfaceLog("/findfile", b.handleFindFile))
+	b.tgBot.Handle("/symbol", b.withTelegramInterfaceLog("/symbol", b.handleSymbol))
+	b.tgBot.Handle("/agent", b.withTelegramInterfaceLog("/agent", b.handleAgent))
+	b.tgBot.Handle("/command", b.withTelegramInterfaceLog("/command", b.handleCommand))
+	b.tgBot.Handle("/status", b.withTelegramInterfaceLog("/status", b.handleStatus))
+	b.tgBot.Handle("/models", b.withTelegramInterfaceLog("/models", b.handleModels))
+	b.tgBot.Handle("/providers", b.withTelegramInterfaceLog("/providers", b.handleProviders))
+	b.tgBot.Handle("/setmodel", b.withTelegramInterfaceLog("/setmodel", b.handleSetModel))
+	b.tgBot.Handle("/rename", b.withTelegramInterfaceLog("/rename", b.handleRename))
+	b.tgBot.Handle("/delete", b.withTelegramInterfaceLog("/delete", b.handleDelete))
 
 	// Handle plain text messages (non-commands)
-	b.tgBot.Handle(telebot.OnText, b.handleText)
+	b.tgBot.Handle(telebot.OnText, b.withTelegramInterfaceLog("OnText", b.handleText))
 }
 
 // handleStart handles the /start command
@@ -298,8 +320,8 @@ Notes:
 func (b *Bot) handleSessions(c telebot.Context) error {
 	// Synchronize sessions from OpenCode to local storage
 	if err := b.sessionManager.SyncSessions(b.ctx); err != nil {
-		log.Warnf("Failed to synchronize sessions: %v", err)
-		// Continue to show sessions anyway
+		log.Errorf("Failed to synchronize sessions: %v", err)
+		return c.Send(fmt.Sprintf("Failed to get session list: %v", err))
 	}
 
 	userID := c.Sender().ID
@@ -1070,8 +1092,8 @@ func (b *Bot) handleStatus(c telebot.Context) error {
 func (b *Bot) handleModels(c telebot.Context) error {
 	// Synchronize models from OpenCode to local storage
 	if err := b.sessionManager.SyncModels(b.ctx); err != nil {
-		log.Warnf("Failed to synchronize models: %v", err)
-		// Continue to show models anyway
+		log.Errorf("Failed to synchronize models: %v", err)
+		return c.Send(fmt.Sprintf("Failed to get model list: %v", err))
 	}
 
 	providersResp, err := b.opencodeClient.GetProviders(b.ctx)
@@ -1394,7 +1416,8 @@ func (b *Bot) handleText(c telebot.Context) error {
 	defer healthCancel()
 
 	if healthErr := b.opencodeClient.HealthCheck(healthCtx); healthErr != nil {
-		log.Warnf("OpenCode health check failed before sending message: %v", healthErr)
+		log.Errorf("OpenCode health check failed before sending message: %v", healthErr)
+		return c.Send(fmt.Sprintf("Failed to send message: %v", healthErr))
 	} else {
 		log.Debugf("OpenCode health check passed before sending message")
 	}

@@ -260,8 +260,16 @@ func (c *Client) request(ctx context.Context, method, path string, body interfac
 	}
 	req.Header.Set("Accept", "application/json")
 
-	log.Debugf("Making %s request to %s", method, url)
-	return c.client.Do(req)
+	startTime := time.Now()
+	log.Infof("OpenCode API request: method=%s path=%s", method, path)
+	resp, err := c.client.Do(req)
+	elapsed := time.Since(startTime)
+	if err != nil {
+		log.Warnf("OpenCode API request failed: method=%s path=%s elapsed=%v err=%v", method, path, elapsed, err)
+		return nil, err
+	}
+	log.Infof("OpenCode API response: method=%s path=%s status=%d elapsed=%v", method, path, resp.StatusCode, elapsed)
+	return resp, nil
 }
 
 // decodeResponse decodes the JSON response
@@ -517,55 +525,6 @@ func GenerateMessageID() string {
 	return generateMessageID()
 }
 
-// InitSessionWithModel initializes a session with a specific model
-func (c *Client) InitSessionWithModel(ctx context.Context, sessionID string, providerID, modelID string) error {
-	log.Debugf("InitSessionWithModel called for session %s with provider %s model %s", sessionID, providerID, modelID)
-	messageID := generateMessageID()
-	reqBody := map[string]interface{}{
-		"modelID":    modelID,
-		"providerID": providerID,
-		"messageID":  messageID,
-	}
-	log.Debugf("Initializing session %s with model %s/%s (messageID: %s)", sessionID, providerID, modelID, messageID)
-
-	// Log the full URL being called
-	url := c.baseURL + fmt.Sprintf("/session/%s/init", sessionID)
-	log.Debugf("Making POST request to: %s", url)
-	log.Debugf("Request body: %+v", reqBody)
-
-	startTime := time.Now()
-	resp, err := c.request(ctx, "POST", fmt.Sprintf("/session/%s/init", sessionID), reqBody)
-	elapsed := time.Since(startTime)
-
-	if err != nil {
-		log.Errorf("Failed to send init request for session %s after %v: %v", sessionID, elapsed, err)
-		return err
-	}
-	defer resp.Body.Close()
-
-	log.Debugf("Init request for session %s completed with status %d after %v", sessionID, resp.StatusCode, elapsed)
-
-	if resp.StatusCode >= 400 {
-		// Try to read error body for more information
-		body, _ := io.ReadAll(resp.Body)
-		if len(body) > 0 {
-			log.Errorf("Init session failed with status %d after %v: %s", resp.StatusCode, elapsed, string(body))
-			return fmt.Errorf("failed to initialize session with model: status %d: %s", resp.StatusCode, string(body))
-		}
-		log.Errorf("Init session failed with status %d after %v (no body)", resp.StatusCode, elapsed)
-		return fmt.Errorf("failed to initialize session with model: status %d", resp.StatusCode)
-	}
-
-	// Read successful response body for debugging
-	body, _ := io.ReadAll(resp.Body)
-	if len(body) > 0 {
-		log.Debugf("Init session successful response body: %s", string(body))
-	}
-
-	log.Infof("Successfully initialized session %s with model %s/%s after %v", sessionID, providerID, modelID, elapsed)
-	return nil
-}
-
 // StreamMessage sends a message and streams the response
 func (c *Client) StreamMessage(ctx context.Context, sessionID string, content string, model *MessageModel, callback func(string) error) error {
 	log.Debugf("Starting stream message for session %s, content length: %d", sessionID, len(content))
@@ -595,6 +554,7 @@ func (c *Client) StreamMessage(ctx context.Context, sessionID string, content st
 
 	url := c.baseURL + "/session/" + sessionID + "/message"
 	log.Debugf("Streaming to URL: %s", url)
+	log.Infof("OpenCode API request: method=POST path=/session/%s/message stream=true", sessionID)
 
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonData))
 	if err != nil {
@@ -668,6 +628,7 @@ func (c *Client) StreamMessage(ctx context.Context, sessionID string, content st
 			return err
 		}
 
+		log.Infof("OpenCode API response: method=POST path=/session/%s/message status=%d elapsed=%v stream=true", sessionID, resp.StatusCode, elapsed)
 		log.Debugf("Stream request completed with status %d after %v (attempt %d/%d)", resp.StatusCode, elapsed, attempt, maxRetries)
 		break
 	}
@@ -790,11 +751,16 @@ func (c *Client) StreamSessionEvents(ctx context.Context, callback func(SessionE
 		Timeout:   0, // Keep stream open until context cancellation.
 	}
 
+	log.Infof("OpenCode API request: method=GET path=/event stream=true")
+	startTime := time.Now()
 	resp, err := streamClient.Do(req)
+	elapsed := time.Since(startTime)
 	if err != nil {
+		log.Warnf("OpenCode API request failed: method=GET path=/event elapsed=%v err=%v", elapsed, err)
 		return err
 	}
 	defer resp.Body.Close()
+	log.Infof("OpenCode API response: method=GET path=/event status=%d elapsed=%v stream=true", resp.StatusCode, elapsed)
 
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)

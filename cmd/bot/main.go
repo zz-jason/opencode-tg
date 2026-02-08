@@ -60,6 +60,7 @@ func main() {
 	log.SetOutput(logger.Out)
 	log.SetFormatter(logger.Formatter)
 	log.SetLevel(logger.GetLevel())
+	log.SetReportCaller(logger.ReportCaller)
 
 	tgClient, err := newTelegramHTTPClient(cfg)
 	if err != nil {

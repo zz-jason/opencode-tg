@@ -514,6 +514,73 @@ func TestCleanupInactiveSessions(t *testing.T) {
 	}
 }
 
+func TestGetOrCreateSessionFailsWhenListSessionsFails(t *testing.T) {
+	var createCalls int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/session":
+			http.Error(w, "upstream unavailable", http.StatusServiceUnavailable)
+		case r.Method == "POST" && r.URL.Path == "/session":
+			atomic.AddInt32(&createCalls, 1)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(opencode.Session{
+				ID:   "unexpected-created-session",
+				Slug: "unexpected-created-session",
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := opencode.NewClient(server.URL, 5)
+	manager := createTestManager(t, client)
+
+	_, err := manager.GetOrCreateSession(context.Background(), 12345)
+	if err == nil {
+		t.Fatal("expected GetOrCreateSession to fail when ListSessions fails")
+	}
+	if !strings.Contains(err.Error(), "failed to get sessions from OpenCode") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls := atomic.LoadInt32(&createCalls); calls != 0 {
+		t.Fatalf("expected no CreateSession calls when ListSessions fails, got %d", calls)
+	}
+}
+
+func TestInitializeFailsFastWhenSyncSessionsFails(t *testing.T) {
+	var providerCalls int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/session":
+			http.Error(w, "upstream unavailable", http.StatusServiceUnavailable)
+		case r.Method == "GET" && r.URL.Path == "/provider":
+			atomic.AddInt32(&providerCalls, 1)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(opencode.ProvidersResponse{})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := opencode.NewClient(server.URL, 5)
+	manager := createTestManager(t, client)
+
+	err := manager.Initialize(context.Background())
+	if err == nil {
+		t.Fatal("expected Initialize to fail when SyncSessions fails")
+	}
+	if !strings.Contains(err.Error(), "failed to synchronize sessions") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls := atomic.LoadInt32(&providerCalls); calls != 0 {
+		t.Fatalf("expected SyncModels not to run after SyncSessions failure, provider calls=%d", calls)
+	}
+}
+
 func TestSetSessionModelPrototypeModeSkipsInit(t *testing.T) {
 	var initCalls int32
 	sessionCounter := 0
