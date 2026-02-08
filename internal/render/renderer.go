@@ -238,7 +238,11 @@ func MarkdownToTelegramHTML(input string) string {
 			} else {
 				// Code block ends
 				inFence = false
-				rendered = append(rendered, renderFenceBlock(fenceLines))
+				if fenceHasQuote {
+					rendered = append(rendered, renderQuotedFenceBlock(fenceLines))
+				} else {
+					rendered = append(rendered, renderFenceBlock(fenceLines))
+				}
 
 			}
 			continue
@@ -658,4 +662,8 @@ func renderBlockquote(lines []string) string {
 	content := strings.Join(formattedLines, "\n")
 	// Use quoted attribute value for better compatibility
 	return "<blockquote expandable=\"\">" + content + "</blockquote>"
+}
+
+func renderQuotedFenceBlock(lines []string) string {
+	return "<blockquote expandable=\"\">" + renderFenceBlock(lines) + "</blockquote>"
 }

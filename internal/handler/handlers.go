@@ -65,6 +65,7 @@ type Bot struct {
 type streamingState struct {
 	ctx    context.Context
 	cancel context.CancelFunc
+	done   chan struct{}
 
 	telegramMsg      *telebot.Message
 	telegramMessages []*telebot.Message
@@ -92,17 +93,21 @@ type streamingState struct {
 	requestMessageID string
 
 	// Event-driven stream state for /event updates.
-	requestStartedAt  int64
-	initialMessageIDs map[string]bool
-	eventMessages     map[string]*eventMessageState
-	activeMessageID   string
-	displayOrder      []string
-	displaySet        map[string]bool
-	pendingOrder      []string
-	pendingSet        map[string]bool
-	lastEventAt       time.Time
-	hasEventUpdates   bool
-	revision          uint64
+	requestStartedAt      int64
+	initialMessageIDs     map[string]bool
+	initialMessageDigests map[string]string
+	eventMessages         map[string]*eventMessageState
+	activeMessageID       string
+	displayOrder          []string
+	displaySet            map[string]bool
+	pendingOrder          []string
+	pendingSet            map[string]bool
+	lastEventAt           time.Time
+	hasEventUpdates       bool
+	revision              uint64
+	requestObserved       bool
+	reconcileInFlight     bool
+	lastReconcileAt       time.Time
 
 	isStreaming bool
 	isComplete  bool
@@ -646,7 +651,6 @@ func formatMessagePartsWithOptions(parts []interface{}, includeReplyContent bool
 			continue
 		}
 
-		log.Infof("[DEBUG zz-jason] Processing opencode.MessagePartResponse")
 		switch partResp.Type {
 		case "text":
 			if partResp.Text != "" {
@@ -696,22 +700,9 @@ func formatToolCallPart(toolName, snapshot string, state interface{}, text strin
 	if toolName == "" {
 		toolName = extractToolName(snapshotData)
 	}
-	if toolName == "" {
-		toolName = "tool"
-	}
-
 	sourceData := toStringAnyMap(state)
 	if sourceData == nil {
 		sourceData = snapshotData
-	}
-
-	emoji := "🛠️"
-	if sourceData != nil {
-		if status, _ := sourceData["status"].(string); strings.EqualFold(status, "completed") {
-			emoji = "✅"
-		} else if status, _ := sourceData["status"].(string); strings.EqualFold(status, "error") || strings.EqualFold(status, "failed") {
-			emoji = "❌"
-		}
 	}
 
 	description := extractToolDescription(sourceData, text)
@@ -720,22 +711,47 @@ func formatToolCallPart(toolName, snapshot string, state interface{}, text strin
 	if output == "" && text != "" && text != description {
 		output = text
 	}
+	description = strings.TrimSpace(description)
+	if strings.EqualFold(description, "executed") {
+		description = ""
+	}
+	command = strings.TrimSpace(command)
+	output = strings.TrimSpace(strings.ReplaceAll(output, "\r\n", "\n"))
 
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "• %s %s: %s\n", emoji, toolName, description)
+	lines := make([]string, 0, 24)
+	if comment := normalizeToolBlockComment(description); comment != "" {
+		lines = append(lines, "# "+comment)
+	}
 	if command != "" {
-		fmt.Fprintf(&sb, "  $ %s\n", truncateAndInline(command, 300))
+		if len(lines) > 0 {
+			lines = append(lines, "")
+		}
+		lines = append(lines, "$ "+truncateAndInline(command, 500))
 	}
 	if output != "" {
-		outputText := truncateMultiline(output, 700)
-		outputText = strings.ReplaceAll(outputText, "\r\n", "\n")
-		outputText = strings.TrimSpace(outputText)
+		outputText := truncateMultiline(output, 2500)
 		if outputText != "" {
-			sb.WriteString("  output:\n")
-			sb.WriteString("    " + strings.ReplaceAll(outputText, "\n", "\n    ") + "\n")
+			if len(lines) > 0 {
+				lines = append(lines, "")
+			}
+			lines = append(lines, strings.Split(outputText, "\n")...)
 		}
 	}
-	return sb.String()
+
+	if len(lines) == 0 {
+		fallbackComment := "tool output"
+		if name := strings.TrimSpace(toolName); name != "" {
+			fallbackComment = name + " output"
+		}
+		lines = append(lines, "# "+fallbackComment)
+	}
+
+	var block strings.Builder
+	fmt.Fprintf(&block, "```%s\n", toolBlockLanguage(toolName, command))
+	block.WriteString(strings.Join(lines, "\n"))
+	block.WriteString("\n```")
+
+	return wrapInExpandableBlockquote(block.String())
 }
 
 // formatMessageWithMetadata formats a single OpenCode message with role, timestamp, parts, and content
@@ -991,6 +1007,60 @@ func truncateMultiline(text string, maxLen int) string {
 		return text[:maxLen] + "..."
 	}
 	return text
+}
+
+func normalizeToolBlockComment(comment string) string {
+	comment = strings.TrimSpace(comment)
+	if comment == "" {
+		return ""
+	}
+	comment = strings.ReplaceAll(comment, "\r\n", " ")
+	comment = strings.ReplaceAll(comment, "\n", " ")
+	comment = strings.Join(strings.Fields(comment), " ")
+	if len(comment) > 200 {
+		return comment[:200] + "..."
+	}
+	return comment
+}
+
+func toolBlockLanguage(toolName, command string) string {
+	toolName = strings.ToLower(strings.TrimSpace(toolName))
+	switch toolName {
+	case "bash", "sh", "shell", "zsh", "fish", "terminal", "command":
+		return "bash"
+	case "python", "python3":
+		return "python"
+	case "javascript", "node":
+		return "javascript"
+	case "typescript", "ts-node":
+		return "typescript"
+	case "sql":
+		return "sql"
+	}
+	if strings.TrimSpace(command) != "" {
+		return "bash"
+	}
+	return "text"
+}
+
+func wrapInExpandableBlockquote(markdown string) string {
+	markdown = strings.TrimSpace(strings.ReplaceAll(markdown, "\r\n", "\n"))
+	if markdown == "" {
+		return ""
+	}
+
+	lines := strings.Split(markdown, "\n")
+	var sb strings.Builder
+	for _, line := range lines {
+		if line == "" {
+			sb.WriteString(">\n")
+			continue
+		}
+		sb.WriteString("> ")
+		sb.WriteString(line)
+		sb.WriteString("\n")
+	}
+	return sb.String()
 }
 
 // handleStatus handles the /status command
@@ -1340,16 +1410,27 @@ func (b *Bot) handleText(c telebot.Context) error {
 		return c.Send("⚠️ No AI model configured for this session.\n\nPlease use `/models` to view available models, then use `/setmodel <number>` to set a model for this session.")
 	}
 
-	// Cancel any existing streaming for this session
+	// Cancel any existing streaming for this session.
+	// Wait briefly for prior goroutine shutdown to avoid overlapping reconcile loops.
 	cancelledExistingStream := false
+	var previousState *streamingState
 	b.streamingStateMu.Lock()
 	if existingState, ok := b.streamingStates[sessionID]; ok && existingState.isStreaming {
 		existingState.cancel()
 		existingState.isStreaming = false
 		log.Infof("Cancelled existing streaming for session %s before starting new request", sessionID)
 		cancelledExistingStream = true
+		previousState = existingState
 	}
 	b.streamingStateMu.Unlock()
+	if previousState != nil && previousState.done != nil {
+		select {
+		case <-previousState.done:
+			log.Infof("Previous streaming goroutine exited for session %s", sessionID)
+		case <-time.After(2 * time.Second):
+			log.Warnf("Timed out waiting for previous streaming goroutine to exit for session %s", sessionID)
+		}
+	}
 	if cancelledExistingStream {
 		abortCtx, abortCancel := context.WithTimeout(b.ctx, 5*time.Second)
 		if abortErr := b.opencodeClient.AbortSession(abortCtx, sessionID); abortErr != nil {
@@ -1372,40 +1453,29 @@ func (b *Bot) handleText(c telebot.Context) error {
 
 	// Track streaming state
 	streamingState := &streamingState{
-		ctx:                 ctx,
-		cancel:              cancel,
-		telegramMsg:         processingMsg,
-		telegramMessages:    []*telebot.Message{processingMsg},
-		lastRendered:        []string{"🤖 Processing..."},
-		telegramCtx:         c,
-		content:             &strings.Builder{},
-		lastUpdate:          time.Now(),
-		updateMutex:         &sync.Mutex{},
-		renderedMessageIDs:  make(map[string]bool),
-		cachedMessageChunks: make(map[string][]string),
-		allDisplayChunks:    nil,
-		sessionInfoAdded:    false,
-		sessionID:           sessionID,
-		requestMessageID:    requestMessageID,
-		requestStartedAt:    time.Now().UnixMilli(),
-		initialMessageIDs:   make(map[string]bool),
-		eventMessages:       make(map[string]*eventMessageState),
-		displaySet:          make(map[string]bool),
-		pendingSet:          make(map[string]bool),
-		isStreaming:         true,
-	}
-
-	// Capture existing message IDs before sending the new request.
-	// Event-driven rendering will ignore these historical IDs.
-	if existingMessages, getErr := b.opencodeClient.GetMessages(ctx, sessionID); getErr == nil {
-		for _, msg := range existingMessages {
-			if msg.ID == "" {
-				continue
-			}
-			streamingState.initialMessageIDs[msg.ID] = true
-		}
-	} else {
-		log.Warnf("Failed to preload existing messages for event stream filtering: %v", getErr)
+		ctx:                   ctx,
+		cancel:                cancel,
+		done:                  make(chan struct{}),
+		telegramMsg:           processingMsg,
+		telegramMessages:      []*telebot.Message{processingMsg},
+		lastRendered:          []string{"🤖 Processing..."},
+		telegramCtx:           c,
+		content:               &strings.Builder{},
+		lastUpdate:            time.Now(),
+		updateMutex:           &sync.Mutex{},
+		renderedMessageIDs:    make(map[string]bool),
+		cachedMessageChunks:   make(map[string][]string),
+		allDisplayChunks:      nil,
+		sessionInfoAdded:      false,
+		sessionID:             sessionID,
+		requestMessageID:      requestMessageID,
+		requestStartedAt:      time.Now().UnixMilli(),
+		initialMessageIDs:     make(map[string]bool),
+		initialMessageDigests: make(map[string]string),
+		eventMessages:         make(map[string]*eventMessageState),
+		displaySet:            make(map[string]bool),
+		pendingSet:            make(map[string]bool),
+		isStreaming:           true,
 	}
 
 	// Store streaming state for potential abort
@@ -1415,29 +1485,24 @@ func (b *Bot) handleText(c telebot.Context) error {
 
 	// Clean up streaming state when done
 	defer func() {
+		if streamingState.done != nil {
+			close(streamingState.done)
+		}
 		b.streamingStateMu.Lock()
 		delete(b.streamingStates, sessionID)
 		b.streamingStateMu.Unlock()
 		streamingState.isStreaming = false
 	}()
 
+	updateCh := make(chan struct{}, 1)
+	eventErrCh := make(chan error, 1)
+
 	// Start event stream updates as the single real-time source.
 	eventDone := make(chan struct{})
 	go func() {
 		defer close(eventDone)
-		b.consumeSessionEvents(ctx, streamingState, sessionID)
+		b.consumeSessionEvents(ctx, streamingState, sessionID, updateCh, eventErrCh)
 	}()
-
-	// Check if OpenCode server is reachable before sending the request.
-	healthCtx, healthCancel := context.WithTimeout(ctx, 5*time.Second)
-	defer healthCancel()
-
-	if healthErr := b.opencodeClient.HealthCheck(healthCtx); healthErr != nil {
-		log.Errorf("OpenCode health check failed before sending message: %v", healthErr)
-		return c.Send(fmt.Sprintf("Failed to send message: %v", healthErr))
-	} else {
-		log.Debugf("OpenCode health check passed before sending message")
-	}
 
 	sendReq := &opencode.SendMessageRequest{
 		MessageID: requestMessageID,
@@ -1458,99 +1523,97 @@ func (b *Bot) handleText(c telebot.Context) error {
 	}
 	log.Infof("Dispatching OpenCode message: session=%s request_message_id=%s model=%s text_len=%d", sessionID, requestMessageID, modelLabel, len(text))
 
-	sendErrCh := make(chan error, 1)
-	go func() {
-		sendErrCh <- b.opencodeClient.PostMessage(ctx, sessionID, sendReq)
-	}()
-
-	sendCompleted := false
-	var sendErr error
-
-	// Always reconcile against final snapshots to close any missed event gaps.
-	b.reconcileEventStateWithLatestMessages(streamingState)
-
-	settleTimeout := 2 * time.Duration(b.config.OpenCode.Timeout) * time.Second
-	if settleTimeout < 2*time.Minute {
-		settleTimeout = 2 * time.Minute
+	if sendErr := b.opencodeClient.PostMessage(ctx, sessionID, sendReq); sendErr != nil {
+		log.Warnf("OpenCode PostMessage failed for session %s request_message_id=%s: %v", sessionID, requestMessageID, sendErr)
+		cancel()
+		select {
+		case <-eventDone:
+		case <-time.After(2 * time.Second):
+			log.Warnf("Timed out waiting for event stream to stop after send failure for session %s", sessionID)
+		}
+		errorMsg := fmt.Sprintf("Processing error: %v", sendErr)
+		b.updateTelegramMessage(c, processingMsg, errorMsg, false)
+		return nil
 	}
-	if settleTimeout > 30*time.Minute {
-		settleTimeout = 30 * time.Minute
+
+	log.Infof("OpenCode PostMessage acknowledged for session %s request_message_id=%s", sessionID, requestMessageID)
+
+	const settleGrace = 600 * time.Millisecond
+	const noOutputGrace = 12 * time.Second
+
+	waitTimeout := 2 * time.Duration(b.config.OpenCode.Timeout) * time.Second
+	if waitTimeout < 90*time.Second {
+		waitTimeout = 90 * time.Second
 	}
-	settleDeadline := time.Now().Add(settleTimeout)
-	lastReconcileAt := time.Now()
-	settleStablePasses := 0
-	noOutputPasses := 0
-	var settleCandidateRevision uint64
-	hasSettleCandidateRevision := false
+	if waitTimeout > 30*time.Minute {
+		waitTimeout = 30 * time.Minute
+	}
+
+	deadline := time.Now().Add(waitTimeout)
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+
+	stableSettledPasses := 0
+	stableNoOutputPasses := 0
+	settleSince := time.Time{}
+	acknowledgedAt := time.Now()
+
+renderLoop:
 	for {
-		if !sendCompleted {
-			select {
-			case sendErr = <-sendErrCh:
-				sendCompleted = true
-				streamingState.isComplete = true
-				if sendErr != nil {
-					log.Warnf("OpenCode PostMessage finished with error for session %s request_message_id=%s: %v", sessionID, requestMessageID, sendErr)
-				} else {
-					log.Infof("OpenCode PostMessage acknowledged for session %s request_message_id=%s", sessionID, requestMessageID)
-				}
-			default:
-			}
+		if time.Now().After(deadline) {
+			log.Warnf("Timed out waiting for assistant stream completion: session=%s request_message_id=%s", sessionID, requestMessageID)
+			break
 		}
 
-		performedReconcile := false
-		if time.Since(lastReconcileAt) >= time.Second {
-			b.reconcileEventStateWithLatestMessages(streamingState)
-			lastReconcileAt = time.Now()
-			performedReconcile = true
+		select {
+		case <-ctx.Done():
+			break renderLoop
+		case <-updateCh:
+		case streamErr := <-eventErrCh:
+			if streamErr != nil && ctx.Err() == nil {
+				log.Warnf("Event stream warning for session %s request_message_id=%s: %v", sessionID, requestMessageID, streamErr)
+			}
+		case <-ticker.C:
 		}
 
 		streamingState.updateMutex.Lock()
 		for b.tryPromoteNextActiveMessage(streamingState) {
 		}
-		b.flushEventDisplaysLocked(streamingState, true)
-		hasEventUpdates := streamingState.hasEventUpdates
-		settleCandidate := b.eventPipelineSettledLocked(streamingState, sendCompleted || hasEventUpdates)
-		noOutputCandidate := b.eventPipelineNoOutputCandidateLocked(streamingState, sendCompleted)
-		revision := streamingState.revision
+		displays := b.buildEventDrivenDisplaysLocked(streamingState)
+		settled := b.eventPipelineSettledLocked(streamingState, true)
+		noOutputCandidate := b.eventPipelineNoOutputCandidateLocked(streamingState, true)
 		streamingState.updateMutex.Unlock()
 
-		if performedReconcile {
-			if settleCandidate {
-				if hasSettleCandidateRevision && revision == settleCandidateRevision {
-					settleStablePasses++
-				} else {
-					settleStablePasses = 1
-					settleCandidateRevision = revision
-					hasSettleCandidateRevision = true
-				}
-			} else {
-				settleStablePasses = 0
-				hasSettleCandidateRevision = false
-			}
-
-			if noOutputCandidate {
-				noOutputPasses++
-			} else {
-				noOutputPasses = 0
-			}
+		if len(displays) > 0 {
+			b.updateStreamingTelegramMessages(streamingState, displays)
 		}
 
-		settled := settleStablePasses >= eventSettleStableReconciles || noOutputPasses >= noOutputStableReconciles
+		if settled {
+			stableSettledPasses++
+		} else {
+			stableSettledPasses = 0
+		}
+		if noOutputCandidate && time.Since(acknowledgedAt) >= noOutputGrace {
+			stableNoOutputPasses++
+		} else {
+			stableNoOutputPasses = 0
+		}
 
-		if settled || time.Now().After(settleDeadline) {
+		if stableSettledPasses >= eventSettleStableReconciles {
+			if settleSince.IsZero() {
+				settleSince = time.Now()
+			}
+			if time.Since(settleSince) >= settleGrace {
+				break
+			}
+		} else {
+			settleSince = time.Time{}
+		}
+
+		if stableNoOutputPasses >= noOutputStableReconciles {
 			break
 		}
-		time.Sleep(120 * time.Millisecond)
 	}
-
-	// Run one final reconciliation pass before stopping event consumption so
-	// snapshot-persisted tail content can still be reflected in Telegram.
-	b.reconcileEventStateWithLatestMessages(streamingState)
-	streamingState.updateMutex.Lock()
-	for b.tryPromoteNextActiveMessage(streamingState) {
-	}
-	b.flushEventDisplaysLocked(streamingState, true)
-	streamingState.updateMutex.Unlock()
 
 	cancel()
 	select {
@@ -1558,35 +1621,20 @@ func (b *Bot) handleText(c telebot.Context) error {
 	case <-time.After(2 * time.Second):
 		log.Warnf("Timed out waiting for event stream to stop for session %s", sessionID)
 	}
-	if !sendCompleted {
-		select {
-		case sendErr = <-sendErrCh:
-			sendCompleted = true
-			streamingState.isComplete = true
-		case <-time.After(300 * time.Millisecond):
-		}
-	}
 
 	streamingState.updateMutex.Lock()
 	for b.tryPromoteNextActiveMessage(streamingState) {
 	}
+	streamingState.isComplete = true
+	hasRenderableOutput := len(streamingState.displayOrder) > 0
 	displays := b.buildEventDrivenDisplaysLocked(streamingState)
-	if len(displays) > 0 {
-		b.updateStreamingTelegramMessages(streamingState, displays)
-		streamingState.updateMutex.Unlock()
-		if sendCompleted && sendErr != nil {
-			log.Warnf("SendMessage returned error after event rendering completed: %v", sendErr)
-		}
-		return nil
-	}
 	streamingState.updateMutex.Unlock()
-
-	if sendCompleted && sendErr != nil {
-		errorMsg := fmt.Sprintf("Processing error: %v", sendErr)
-		b.updateTelegramMessage(c, processingMsg, errorMsg, false)
+	if hasRenderableOutput && len(displays) > 0 {
+		b.updateStreamingTelegramMessages(streamingState, displays)
 		return nil
 	}
 
+	log.Infof("No renderable assistant output for session %s request_message_id=%s", sessionID, requestMessageID)
 	b.updateTelegramMessage(c, processingMsg, "🤖 Response completed with no content.", false)
 	return nil
 }
@@ -1958,7 +2006,27 @@ func (b *Bot) clearModelMapping(userID int64) {
 	delete(b.modelMapping, userID)
 }
 
-func (b *Bot) consumeSessionEvents(ctx context.Context, state *streamingState, sessionID string) {
+func notifyStreamUpdate(ch chan<- struct{}) {
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+func notifyStreamError(ch chan<- error, err error) {
+	if ch == nil || err == nil {
+		return
+	}
+	select {
+	case ch <- err:
+	default:
+	}
+}
+
+func (b *Bot) consumeSessionEvents(ctx context.Context, state *streamingState, sessionID string, updateCh chan<- struct{}, eventErrCh chan<- error) {
 	if state == nil || b.opencodeClient == nil {
 		return
 	}
@@ -1973,7 +2041,7 @@ func (b *Bot) consumeSessionEvents(ctx context.Context, state *streamingState, s
 		err := b.opencodeClient.StreamSessionEvents(ctx, func(event opencode.SessionEvent) error {
 			receivedEvents = true
 			state.updateMutex.Lock()
-			changed, forceFlush := b.applySessionEventLocked(state, sessionID, event)
+			changed, _ := b.applySessionEventLocked(state, sessionID, event)
 			if !changed {
 				state.updateMutex.Unlock()
 				return nil
@@ -1984,8 +2052,8 @@ func (b *Bot) consumeSessionEvents(ctx context.Context, state *streamingState, s
 			state.revision++
 			for b.tryPromoteNextActiveMessage(state) {
 			}
-			b.flushEventDisplaysLocked(state, forceFlush)
 			state.updateMutex.Unlock()
+			notifyStreamUpdate(updateCh)
 			return nil
 		})
 
@@ -1994,14 +2062,12 @@ func (b *Bot) consumeSessionEvents(ctx context.Context, state *streamingState, s
 		}
 		if err != nil {
 			log.Warnf("Event stream disconnected for session %s: %v", sessionID, err)
+			notifyStreamError(eventErrCh, err)
 		} else {
 			log.Warnf("Event stream closed unexpectedly for session %s", sessionID)
 		}
 
-		// Only reconcile after a stream that had events. This avoids turning
-		// repeated connection failures into high-frequency snapshot polling.
 		if receivedEvents {
-			b.reconcileEventStateWithLatestMessages(state)
 			backoff = 200 * time.Millisecond
 		} else if backoff < 3*time.Second {
 			backoff *= 2
@@ -2017,6 +2083,38 @@ func (b *Bot) consumeSessionEvents(ctx context.Context, state *streamingState, s
 		case <-time.After(wait):
 		}
 	}
+}
+
+func (b *Bot) tryReconcileEventStateWithLatestMessages(state *streamingState, minInterval time.Duration, force bool, reason string) (performed bool, requestObserved bool) {
+	if state == nil || state.sessionID == "" || b.opencodeClient == nil {
+		return false, false
+	}
+
+	now := time.Now()
+	state.updateMutex.Lock()
+	requestObserved = state.requestObserved
+	if state.reconcileInFlight {
+		state.updateMutex.Unlock()
+		log.Debugf("Skip reconcile while in-flight: session=%s reason=%s", state.sessionID, reason)
+		return false, requestObserved
+	}
+	if !force && minInterval > 0 && !state.lastReconcileAt.IsZero() && now.Sub(state.lastReconcileAt) < minInterval {
+		state.updateMutex.Unlock()
+		return false, requestObserved
+	}
+	state.reconcileInFlight = true
+	state.updateMutex.Unlock()
+
+	defer func() {
+		state.updateMutex.Lock()
+		state.reconcileInFlight = false
+		state.lastReconcileAt = time.Now()
+		requestObserved = state.requestObserved
+		state.updateMutex.Unlock()
+	}()
+
+	requestObserved = b.reconcileEventStateWithLatestMessages(state)
+	return true, requestObserved
 }
 
 func (b *Bot) applySessionEventLocked(state *streamingState, sessionID string, event opencode.SessionEvent) (changed bool, forceFlush bool) {
@@ -2096,9 +2194,6 @@ func (b *Bot) shouldTrackEventMessageLocked(state *streamingState, messageID str
 		return true
 	}
 	if state.initialMessageIDs != nil && state.initialMessageIDs[messageID] {
-		return false
-	}
-	if created > 0 && state.requestStartedAt > 0 && created+500 < state.requestStartedAt {
 		return false
 	}
 	return true
@@ -2313,6 +2408,9 @@ func (b *Bot) buildEventDrivenDisplaysLocked(state *streamingState) []string {
 		renderedMessages = append(renderedMessages, block)
 	}
 	if len(renderedMessages) == 0 {
+		if state.isComplete {
+			return nil
+		}
 		return []string{"🤖 Processing..."}
 	}
 
@@ -2408,9 +2506,9 @@ func formatEventMessageParts(parts []opencode.MessagePartResponse) string {
 	return strings.TrimSpace(strings.Join(sections, "\n\n"))
 }
 
-func (b *Bot) reconcileEventStateWithLatestMessages(state *streamingState) {
+func (b *Bot) reconcileEventStateWithLatestMessages(state *streamingState) bool {
 	if state == nil || state.sessionID == "" || b.opencodeClient == nil {
-		return
+		return false
 	}
 
 	ctx, cancel := context.WithTimeout(state.ctx, 4*time.Second)
@@ -2419,15 +2517,30 @@ func (b *Bot) reconcileEventStateWithLatestMessages(state *streamingState) {
 	messages, err := b.opencodeClient.GetMessages(ctx, state.sessionID)
 	if err != nil {
 		log.Warnf("Failed to reconcile event state from message snapshots: %v", err)
-		return
+		return false
 	}
 	sort.Slice(messages, func(i, j int) bool {
 		return messages[i].CreatedAt.Before(messages[j].CreatedAt)
 	})
 
+	requestObserved := false
+	if state.requestMessageID != "" {
+		for _, msg := range messages {
+			if msg.ID == state.requestMessageID {
+				requestObserved = true
+				break
+			}
+		}
+	}
+
 	state.updateMutex.Lock()
 	defer state.updateMutex.Unlock()
+	if requestObserved && !state.requestObserved {
+		state.requestObserved = true
+		log.Infof("Observed request message in OpenCode snapshot: session=%s request_message_id=%s", state.sessionID, state.requestMessageID)
+	}
 	b.reconcileEventStateWithMessagesLocked(state, messages)
+	return state.requestObserved
 }
 
 func (b *Bot) reconcileEventStateWithMessagesLocked(state *streamingState, messages []opencode.Message) {
@@ -2444,8 +2557,12 @@ func (b *Bot) reconcileEventStateWithMessagesLocked(state *streamingState, messa
 		if !msg.CreatedAt.IsZero() {
 			created = msg.CreatedAt.UnixMilli()
 		}
-		if !b.shouldTrackEventMessageLocked(state, msg.ID, created) {
+		track, fromChangedInitial := b.shouldTrackSnapshotMessageLocked(state, msg, created)
+		if !track {
 			continue
+		}
+		if fromChangedInitial {
+			log.Infof("Tracking updated initial message from snapshot: session=%s message_id=%s", state.sessionID, msg.ID)
 		}
 
 		msgState := b.getOrCreateEventMessageStateLocked(state, msg.ID)
@@ -2492,6 +2609,76 @@ func (b *Bot) reconcileEventStateWithMessagesLocked(state *streamingState, messa
 		state.lastEventAt = time.Now()
 		state.revision++
 	}
+}
+
+func (b *Bot) shouldTrackSnapshotMessageLocked(state *streamingState, msg opencode.Message, created int64) (track bool, fromChangedInitial bool) {
+	if state == nil || msg.ID == "" {
+		return false, false
+	}
+	if _, tracked := state.eventMessages[msg.ID]; tracked {
+		return true, false
+	}
+	if state.initialMessageIDs != nil && state.initialMessageIDs[msg.ID] {
+		if state.initialMessageDigests == nil {
+			return false, false
+		}
+		baselineDigest, hasBaseline := state.initialMessageDigests[msg.ID]
+		if !hasBaseline {
+			return false, false
+		}
+		currentDigest := snapshotMessageDigest(msg)
+		if baselineDigest == currentDigest {
+			return false, false
+		}
+		return true, true
+	}
+	if created > 0 && state.requestStartedAt > 0 && created+500 < state.requestStartedAt {
+		return false, false
+	}
+	return true, false
+}
+
+func snapshotMessageDigest(msg opencode.Message) string {
+	var sb strings.Builder
+	sb.WriteString(strings.TrimSpace(msg.ID))
+	sb.WriteString("|")
+	sb.WriteString(strings.TrimSpace(msg.Role))
+	sb.WriteString("|")
+	sb.WriteString(strings.TrimSpace(msg.Finish))
+	sb.WriteString("|")
+	sb.WriteString(strings.TrimSpace(msg.ModelID))
+	sb.WriteString("|")
+	sb.WriteString(strings.TrimSpace(msg.ProviderID))
+	sb.WriteString("|")
+	if !msg.CreatedAt.IsZero() {
+		sb.WriteString(strconv.FormatInt(msg.CreatedAt.UnixMilli(), 10))
+	}
+	sb.WriteString("|parts=")
+	sb.WriteString(strconv.Itoa(len(msg.Parts)))
+
+	for _, rawPart := range msg.Parts {
+		part, ok := rawPart.(opencode.MessagePartResponse)
+		if !ok {
+			continue
+		}
+		sb.WriteString("|")
+		sb.WriteString(strings.TrimSpace(part.ID))
+		sb.WriteString("|")
+		sb.WriteString(strings.TrimSpace(part.Type))
+		sb.WriteString("|")
+		sb.WriteString(strings.TrimSpace(part.Text))
+		sb.WriteString("|")
+		sb.WriteString(strings.TrimSpace(part.Tool))
+		sb.WriteString("|")
+		sb.WriteString(strings.TrimSpace(part.Snapshot))
+		sb.WriteString("|")
+		sb.WriteString(strings.TrimSpace(part.Reason))
+		sb.WriteString("|")
+		sb.WriteString(strings.TrimSpace(part.CallID))
+		sb.WriteString("|")
+		sb.WriteString(strings.TrimSpace(stringifyToolValue(part.State)))
+	}
+	return sb.String()
 }
 
 func upsertEventPartLocked(msgState *eventMessageState, part opencode.MessagePartResponse, delta string) bool {
@@ -3462,6 +3649,7 @@ func (b *Bot) splitLongContentPreserveCodeBlocks(content string) []string {
 	var currentChunk strings.Builder
 	inCodeBlock := false
 	codeBlockMarker := ""
+	codeBlockQuotePrefix := ""
 	truncated := false
 
 	for i, line := range lines {
@@ -3471,15 +3659,17 @@ func (b *Bot) splitLongContentPreserveCodeBlocks(content string) []string {
 		}
 		// Check if this line starts or ends a code block
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "```") {
+		normalizedFenceLine, quotePrefix := normalizeFenceLineForSplit(trimmed)
+		if strings.HasPrefix(normalizedFenceLine, "```") {
 			if !inCodeBlock {
 				// Starting a code block
 				inCodeBlock = true
-				codeBlockMarker = trimmed
+				codeBlockMarker = normalizedFenceLine
+				codeBlockQuotePrefix = quotePrefix
 			} else {
 				// Check if this ends the current code block
-				if strings.HasPrefix(trimmed, codeBlockMarker) ||
-					(len(trimmed) >= 3 && trimmed[:3] == "```") {
+				if strings.HasPrefix(normalizedFenceLine, codeBlockMarker) ||
+					(len(normalizedFenceLine) >= 3 && normalizedFenceLine[:3] == "```") {
 					// Ending the code block
 					inCodeBlock = false
 				}
@@ -3493,7 +3683,7 @@ func (b *Bot) splitLongContentPreserveCodeBlocks(content string) []string {
 			// Current chunk is full, start a new one
 			// If we're in a code block, close it before ending the chunk
 			if inCodeBlock {
-				currentChunk.WriteString("```\n")
+				currentChunk.WriteString(codeBlockQuotePrefix + "```\n")
 			}
 
 			chunkStr := strings.TrimSuffix(currentChunk.String(), "\n")
@@ -3511,7 +3701,7 @@ func (b *Bot) splitLongContentPreserveCodeBlocks(content string) []string {
 
 			// If we were in a code block, reopen it in the new chunk
 			if inCodeBlock {
-				currentChunk.WriteString(codeBlockMarker + "\n")
+				currentChunk.WriteString(codeBlockQuotePrefix + codeBlockMarker + "\n")
 			}
 		}
 
@@ -3532,6 +3722,21 @@ func (b *Bot) splitLongContentPreserveCodeBlocks(content string) []string {
 	}
 
 	return chunks
+}
+
+func normalizeFenceLineForSplit(trimmedLine string) (fenceLine string, quotePrefix string) {
+	trimmedLine = strings.TrimSpace(trimmedLine)
+	if strings.HasPrefix(trimmedLine, "```") {
+		return trimmedLine, ""
+	}
+
+	if strings.HasPrefix(trimmedLine, ">") {
+		noQuote := strings.TrimSpace(strings.TrimPrefix(trimmedLine, ">"))
+		if strings.HasPrefix(noQuote, "```") {
+			return noQuote, "> "
+		}
+	}
+	return trimmedLine, ""
 }
 
 // formatLatestMessage formats the latest message from a session for display

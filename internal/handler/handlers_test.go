@@ -1,9 +1,13 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"tg-bot/internal/opencode"
 	"tg-bot/internal/render"
@@ -82,7 +86,10 @@ func TestFormatMessageParts(t *testing.T) {
 					Snapshot: `{"name": "bash", "status": "completed", "args": {"command": "ls -la"}}`,
 				},
 			},
-			contains: []string{"• ✅ bash:", "executed"},
+			contains: []string{"```bash", "$ ls -la"},
+			notContains: []string{
+				"✅",
+			},
 		},
 		{
 			name: "tool call with snapshot containing type",
@@ -92,7 +99,7 @@ func TestFormatMessageParts(t *testing.T) {
 					Snapshot: `{"type": "read", "result": "file content"}`,
 				},
 			},
-			contains: []string{"• 🛠️ read:", "executed"},
+			contains: []string{"```text", "file content"},
 		},
 		{
 			name: "tool call with snapshot containing tool field",
@@ -102,7 +109,7 @@ func TestFormatMessageParts(t *testing.T) {
 					Snapshot: `{"tool": "write", "output": "File written successfully"}`,
 				},
 			},
-			contains: []string{"• 🛠️ write:", "executed"},
+			contains: []string{"```text", "File written successfully"},
 		},
 		{
 			name: "tool call with snapshot containing function field",
@@ -112,7 +119,7 @@ func TestFormatMessageParts(t *testing.T) {
 					Snapshot: `{"function": "edit", "error": "permission denied"}`,
 				},
 			},
-			contains: []string{"• 🛠️ edit:", "executed"},
+			contains: []string{"```text", "permission denied"},
 		},
 		{
 			name: "tool call with text content",
@@ -123,7 +130,7 @@ func TestFormatMessageParts(t *testing.T) {
 					Snapshot: `{"name": "bash", "args": {"command": "ls"}}`,
 				},
 			},
-			contains: []string{"• 🛠️ bash:", "Command executed successfully"},
+			contains: []string{"```bash", "# Command executed successfully", "$ ls"},
 		},
 		{
 			name: "tool call with multiple arguments truncated",
@@ -133,7 +140,7 @@ func TestFormatMessageParts(t *testing.T) {
 					Snapshot: `{"name": "edit", "args": {"filePath": "/path/to/file", "oldString": "` + strings.Repeat("x", 200) + `", "newString": "updated", "another": "value", "more": "data", "extra": "field"}}`,
 				},
 			},
-			contains: []string{"• 🛠️ edit:", "executed"},
+			contains: []string{"```text", "# edit output"},
 		},
 		{
 			name: "tool call with malformed JSON snapshot",
@@ -144,7 +151,7 @@ func TestFormatMessageParts(t *testing.T) {
 					Text:     "Raw snapshot data",
 				},
 			},
-			contains: []string{"• 🛠️ tool:", "Raw snapshot data"},
+			contains: []string{"```text", "# Raw snapshot data"},
 		},
 		{
 			name: "tool call with ID",
@@ -155,7 +162,7 @@ func TestFormatMessageParts(t *testing.T) {
 					Snapshot: `{"name": "read", "result": "content"}`,
 				},
 			},
-			contains: []string{"• 🛠️ read:", "executed"},
+			contains: []string{"```text", "content"},
 		},
 		{
 			name: "tool call with reason",
@@ -166,7 +173,7 @@ func TestFormatMessageParts(t *testing.T) {
 					Snapshot: `{"name": "bash", "status": "success"}`,
 				},
 			},
-			contains: []string{"• 🛠️ bash:", "executed"},
+			contains: []string{"```bash", "# bash output"},
 		},
 		{
 			name: "tool call with long result truncated",
@@ -176,7 +183,7 @@ func TestFormatMessageParts(t *testing.T) {
 					Snapshot: `{"name": "read", "result": "` + strings.Repeat("x", 400) + `"}`,
 				},
 			},
-			contains: []string{"• 🛠️ read:", "executed"},
+			contains: []string{"```text", strings.Repeat("x", 50)},
 		},
 		{
 			name: "multiple parts",
@@ -194,7 +201,7 @@ func TestFormatMessageParts(t *testing.T) {
 					Text: "Done!",
 				},
 			},
-			contains: []string{"> Thinking:", "First, I need to analyze.", "• 🛠️ read:", "executed", "• ✅ Reply content:", "Done!"},
+			contains: []string{"> Thinking:", "First, I need to analyze.", "```text", "file content", "• ✅ Reply content:", "Done!"},
 		},
 		{
 			name: "unknown part type",
@@ -215,7 +222,7 @@ func TestFormatMessageParts(t *testing.T) {
 					Text:     "Tool executed",
 				},
 			},
-			contains: []string{"• 🛠️ tool:", "Tool executed"},
+			contains: []string{"```text", "# Tool executed"},
 		},
 		{
 			name: "tool call with empty text",
@@ -226,7 +233,7 @@ func TestFormatMessageParts(t *testing.T) {
 					Text:     "",
 				},
 			},
-			contains: []string{"• 🛠️ read:", "executed"},
+			contains: []string{"```text", "# read output"},
 		},
 		{
 			name: "very long reasoning text",
@@ -272,7 +279,7 @@ func TestFormatMessageParts(t *testing.T) {
 					},
 				},
 			},
-			contains: []string{"• ✅ bash:", "List files", "$ ls -la", "output:", "total 0"},
+			contains: []string{"```bash", "# List files", "$ ls -la", "total 0"},
 		},
 		{
 			name: "tool call with only Tool field",
@@ -282,7 +289,7 @@ func TestFormatMessageParts(t *testing.T) {
 					Tool: "read",
 				},
 			},
-			contains: []string{"• 🛠️ read:", "executed"},
+			contains: []string{"```text", "# read output"},
 		},
 	}
 
@@ -354,7 +361,7 @@ func TestFormatMessageForDisplay_StillShowsToolDetailsWhenMessageContentExists(t
 	if !strings.Contains(got, "$ git diff origin/main HEAD") {
 		t.Fatalf("expected tool command in details, got: %s", got)
 	}
-	if !strings.Contains(got, "output:") {
+	if !strings.Contains(got, "diff --git a/file b/file") {
 		t.Fatalf("expected tool output in details, got: %s", got)
 	}
 }
@@ -466,6 +473,30 @@ func TestSplitLongContent_LeadingNewlineNoDataLoss(t *testing.T) {
 	}
 }
 
+func TestSplitLongContentPreserveCodeBlocks_QuotedFenceReopensCorrectly(t *testing.T) {
+	b := &Bot{}
+	var sb strings.Builder
+	sb.WriteString("> ```bash\n")
+	sb.WriteString("> # long tool output\n")
+	for i := 0; i < 800; i++ {
+		sb.WriteString("> line ")
+		sb.WriteString(strings.Repeat("x", 8))
+		sb.WriteString("\n")
+	}
+	sb.WriteString("> ```\n")
+	input := sb.String()
+
+	chunks := b.splitLongContentPreserveCodeBlocks(input)
+	if len(chunks) < 2 {
+		t.Fatalf("expected quoted fence content to split into multiple chunks")
+	}
+	for i, chunk := range chunks {
+		if strings.Count(chunk, "> ```") < 2 {
+			t.Fatalf("expected chunk %d to include quoted fence open/close markers, got: %q", i, chunk)
+		}
+	}
+}
+
 func TestFormatStreamingDisplays_LongSingleLineCreatesMultipleParts(t *testing.T) {
 	b := &Bot{}
 	content := strings.Repeat("a", 7600)
@@ -495,6 +526,106 @@ func TestFormatStreamingDisplays_LongSingleLineCreatesMultipleParts(t *testing.T
 	}
 	if totalLength != len(content) {
 		t.Errorf("total length mismatch: got %d, expected %d", totalLength, len(content))
+	}
+}
+
+func TestTryReconcileEventStateWithLatestMessages_SerializesConcurrentCalls(t *testing.T) {
+	var getCalls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/session/ses_test/message" {
+			atomic.AddInt32(&getCalls, 1)
+			time.Sleep(120 * time.Millisecond)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte("[]"))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	b := &Bot{
+		opencodeClient: opencode.NewClient(server.URL, 5),
+	}
+	state := &streamingState{
+		ctx:               context.Background(),
+		sessionID:         "ses_test",
+		updateMutex:       &sync.Mutex{},
+		initialMessageIDs: map[string]bool{},
+		eventMessages:     make(map[string]*eventMessageState),
+		displaySet:        make(map[string]bool),
+		pendingSet:        make(map[string]bool),
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			b.tryReconcileEventStateWithLatestMessages(state, 10*time.Second, false, "test-concurrent")
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&getCalls); got != 1 {
+		t.Fatalf("expected a single GET /message call, got %d", got)
+	}
+}
+
+func TestTryReconcileEventStateWithLatestMessages_RespectsMinInterval(t *testing.T) {
+	var getCalls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/session/ses_test/message" {
+			atomic.AddInt32(&getCalls, 1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte("[]"))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	b := &Bot{
+		opencodeClient: opencode.NewClient(server.URL, 5),
+	}
+	state := &streamingState{
+		ctx:               context.Background(),
+		sessionID:         "ses_test",
+		updateMutex:       &sync.Mutex{},
+		initialMessageIDs: map[string]bool{},
+		eventMessages:     make(map[string]*eventMessageState),
+		displaySet:        make(map[string]bool),
+		pendingSet:        make(map[string]bool),
+	}
+
+	performed, _ := b.tryReconcileEventStateWithLatestMessages(state, 0, true, "first")
+	if !performed {
+		t.Fatalf("expected first reconcile to run")
+	}
+	performed, _ = b.tryReconcileEventStateWithLatestMessages(state, 30*time.Second, false, "second")
+	if performed {
+		t.Fatalf("expected second reconcile to be skipped by min interval")
+	}
+	if got := atomic.LoadInt32(&getCalls); got != 1 {
+		t.Fatalf("expected exactly one GET /message call, got %d", got)
+	}
+}
+
+func TestShouldTrackEventMessageLocked_DoesNotFilterByCreatedTime(t *testing.T) {
+	b := &Bot{}
+	state := &streamingState{
+		requestStartedAt:  time.Now().UnixMilli(),
+		initialMessageIDs: map[string]bool{},
+		eventMessages:     make(map[string]*eventMessageState),
+	}
+
+	// Even if created time is far older than request start, event updates for this
+	// session must still be tracked because some providers update existing message IDs.
+	created := state.requestStartedAt - 60_000
+	if !b.shouldTrackEventMessageLocked(state, "msg_reused", created) {
+		t.Fatalf("expected reused message ID to be tracked regardless of created time")
 	}
 }
 
@@ -668,6 +799,36 @@ func TestBuildEventDrivenDisplaysLocked_IncludesOnlyPromotedMessages(t *testing.
 	joined := strings.Join(displays, "\n")
 	if !strings.Contains(joined, "first-response") || !strings.Contains(joined, "second-response") {
 		t.Fatalf("expected both messages after promotion, got: %q", joined)
+	}
+}
+
+func TestBuildEventDrivenDisplaysLocked_NoOutputDuringStreamingShowsProcessing(t *testing.T) {
+	b := &Bot{}
+	state := &streamingState{
+		isComplete:    false,
+		eventMessages: make(map[string]*eventMessageState),
+		displaySet:    make(map[string]bool),
+		pendingSet:    make(map[string]bool),
+	}
+
+	displays := b.buildEventDrivenDisplaysLocked(state)
+	if len(displays) != 1 || displays[0] != "🤖 Processing..." {
+		t.Fatalf("expected processing placeholder while streaming, got: %v", displays)
+	}
+}
+
+func TestBuildEventDrivenDisplaysLocked_NoOutputAfterCompletionReturnsNil(t *testing.T) {
+	b := &Bot{}
+	state := &streamingState{
+		isComplete:    true,
+		eventMessages: make(map[string]*eventMessageState),
+		displaySet:    make(map[string]bool),
+		pendingSet:    make(map[string]bool),
+	}
+
+	displays := b.buildEventDrivenDisplaysLocked(state)
+	if len(displays) != 0 {
+		t.Fatalf("expected no displays after completion with no output, got: %v", displays)
 	}
 }
 
@@ -1009,6 +1170,93 @@ func TestReconcileEventStateWithMessagesLocked_EquivalentContentDoesNotBumpRevis
 	b.reconcileEventStateWithMessagesLocked(state, []opencode.Message{message})
 	if state.revision != 7 {
 		t.Fatalf("expected revision to stay stable for equivalent part content, got %d", state.revision)
+	}
+}
+
+func TestReconcileEventStateWithMessagesLocked_TracksChangedInitialMessage(t *testing.T) {
+	b := &Bot{}
+	now := time.Now()
+
+	baseline := opencode.Message{
+		ID:        "msg_initial_assistant",
+		SessionID: "ses_test",
+		Role:      "assistant",
+		CreatedAt: now.Add(-5 * time.Minute),
+		Parts: []interface{}{
+			opencode.MessagePartResponse{
+				ID:        "p1",
+				SessionID: "ses_test",
+				MessageID: "msg_initial_assistant",
+				Type:      "text",
+				Text:      "before",
+			},
+		},
+	}
+
+	state := &streamingState{
+		sessionID:             "ses_test",
+		requestStartedAt:      now.UnixMilli(),
+		initialMessageIDs:     map[string]bool{"msg_initial_assistant": true},
+		initialMessageDigests: map[string]string{"msg_initial_assistant": snapshotMessageDigest(baseline)},
+		eventMessages:         make(map[string]*eventMessageState),
+		displaySet:            make(map[string]bool),
+		pendingSet:            make(map[string]bool),
+	}
+
+	changedSnapshot := baseline
+	changedSnapshot.Parts = []interface{}{
+		opencode.MessagePartResponse{
+			ID:        "p1",
+			SessionID: "ses_test",
+			MessageID: "msg_initial_assistant",
+			Type:      "text",
+			Text:      "after",
+		},
+	}
+
+	b.reconcileEventStateWithMessagesLocked(state, []opencode.Message{changedSnapshot})
+	msgState := state.eventMessages["msg_initial_assistant"]
+	if msgState == nil {
+		t.Fatalf("expected changed initial message to be tracked")
+	}
+	if len(state.displayOrder) != 1 || state.displayOrder[0] != "msg_initial_assistant" {
+		t.Fatalf("expected changed initial message to be displayed, got order=%v", state.displayOrder)
+	}
+}
+
+func TestReconcileEventStateWithMessagesLocked_UnchangedInitialMessageIgnored(t *testing.T) {
+	b := &Bot{}
+	now := time.Now()
+
+	initial := opencode.Message{
+		ID:        "msg_initial_assistant",
+		SessionID: "ses_test",
+		Role:      "assistant",
+		CreatedAt: now.Add(-5 * time.Minute),
+		Parts: []interface{}{
+			opencode.MessagePartResponse{
+				ID:        "p1",
+				SessionID: "ses_test",
+				MessageID: "msg_initial_assistant",
+				Type:      "text",
+				Text:      "same",
+			},
+		},
+	}
+
+	state := &streamingState{
+		sessionID:             "ses_test",
+		requestStartedAt:      now.UnixMilli(),
+		initialMessageIDs:     map[string]bool{"msg_initial_assistant": true},
+		initialMessageDigests: map[string]string{"msg_initial_assistant": snapshotMessageDigest(initial)},
+		eventMessages:         make(map[string]*eventMessageState),
+		displaySet:            make(map[string]bool),
+		pendingSet:            make(map[string]bool),
+	}
+
+	b.reconcileEventStateWithMessagesLocked(state, []opencode.Message{initial})
+	if len(state.eventMessages) != 0 {
+		t.Fatalf("expected unchanged initial message to stay filtered, got tracked=%d", len(state.eventMessages))
 	}
 }
 

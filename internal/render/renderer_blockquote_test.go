@@ -35,6 +35,11 @@ func TestMarkdownToTelegramHTML_MultilineBlockquote(t *testing.T) {
 			input:    "> quote line1\nregular line\n> quote line2",
 			expected: "<blockquote expandable=\"\">quote line1</blockquote>\nregular line\n<blockquote expandable=\"\">quote line2</blockquote>",
 		},
+		{
+			name:     "blockquote fenced code block",
+			input:    "> ```bash\n> echo hi\n> ```",
+			expected: "<blockquote expandable=\"\"><pre><code>echo hi</code></pre></blockquote>",
+		},
 	}
 
 	for _, tt := range tests {
