@@ -58,14 +58,16 @@ func NewClient(baseURL string, timeout int) *Client {
 
 // Session represents an OpenCode session
 type Session struct {
-	ID        string                 `json:"id"`
-	Slug      string                 `json:"slug"`
-	Version   string                 `json:"version"`
-	ProjectID string                 `json:"projectID"`
-	Directory string                 `json:"directory"`
-	Title     string                 `json:"title"`
-	Time      SessionTime            `json:"time"`
-	Metadata  map[string]interface{} `json:"metadata,omitempty"`
+	ID         string                 `json:"id"`
+	Slug       string                 `json:"slug"`
+	Version    string                 `json:"version"`
+	ProjectID  string                 `json:"projectID"`
+	Directory  string                 `json:"directory"`
+	Title      string                 `json:"title"`
+	Time       SessionTime            `json:"time"`
+	Metadata   map[string]interface{} `json:"metadata,omitempty"`
+	ParentID   string                 `json:"parentID,omitempty"`
+	Permission json.RawMessage        `json:"permission,omitempty"`
 }
 
 // SessionTime represents the time fields in a session
@@ -894,13 +896,19 @@ func (c *Client) ListFiles(ctx context.Context, path string) ([]FileInfo, error)
 }
 
 // RenameSession renames a session by updating its title and metadata
-func (c *Client) RenameSession(ctx context.Context, sessionID string, newName string) error {
-	// Prepare update request
+func (c *Client) RenameSession(ctx context.Context, sessionID string, newName string, userID int64) error {
+	// Prepare update request with metadata
+	metadata := map[string]interface{}{
+		"session_name": newName,
+	}
+	// Include telegram_user_id if provided (non-zero)
+	if userID != 0 {
+		metadata["telegram_user_id"] = userID
+	}
+
 	reqBody := map[string]interface{}{
-		"title": newName,
-		"metadata": map[string]interface{}{
-			"session_name": newName,
-		},
+		"title":    newName,
+		"metadata": metadata,
 	}
 
 	resp, err := c.request(ctx, "PATCH", fmt.Sprintf("/session/%s", sessionID), reqBody)

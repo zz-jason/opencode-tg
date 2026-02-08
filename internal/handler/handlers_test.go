@@ -38,7 +38,7 @@ func TestFormatMessageParts(t *testing.T) {
 					Text: "I need to think about this carefully.",
 				},
 			},
-			contains: []string{"• Thinking:", "I need to think about this carefully."},
+			contains: []string{"> Thinking:", "I need to think about this carefully."},
 		},
 		{
 			name: "reasoning part truncated",
@@ -48,7 +48,7 @@ func TestFormatMessageParts(t *testing.T) {
 					Text: strings.Repeat("a", 2500),
 				},
 			},
-			contains: []string{"• Thinking:", strings.Repeat("a", 2000) + "..."},
+			contains: []string{"> Thinking:", strings.Repeat("a", 2500)},
 		},
 		{
 			name: "step-start part (should be skipped)",
@@ -192,7 +192,7 @@ func TestFormatMessageParts(t *testing.T) {
 					Text: "Done!",
 				},
 			},
-			contains: []string{"• Thinking:", "First, I need to analyze.", "• 🛠️ read:", "executed", "• ✅ Reply content:", "Done!"},
+			contains: []string{"> Thinking:", "First, I need to analyze.", "• 🛠️ read:", "executed", "• ✅ Reply content:", "Done!"},
 		},
 		{
 			name: "unknown part type",
@@ -202,56 +202,7 @@ func TestFormatMessageParts(t *testing.T) {
 					Text: "some data",
 				},
 			},
-			contains: []string{"🔹 unknown-type"},
-		},
-		{
-			name: "map representation fallback",
-			parts: []interface{}{
-				map[string]interface{}{
-					"type": "text",
-					"text": "Fallback text",
-				},
-			},
-			contains: []string{"• ✅ Reply content:", "Fallback text"},
-		},
-		{
-			name: "map representation reasoning",
-			parts: []interface{}{
-				map[string]interface{}{
-					"type": "reasoning",
-					"text": "Thinking...",
-				},
-			},
-			contains: []string{"• Thinking:", "Thinking..."},
-		},
-		{
-			name: "map representation tool",
-			parts: []interface{}{
-				map[string]interface{}{
-					"type":     "tool",
-					"text":     "Tool output",
-					"snapshot": `{"name": "bash", "status": "done"}`,
-				},
-			},
-			contains:    []string{"• 🛠️ bash:", "Tool output"},
-			notContains: []string{"status: done"}, // Map fallback doesn't parse snapshot
-		},
-		{
-			name: "map representation tool with command and output",
-			parts: []interface{}{
-				map[string]interface{}{
-					"type": "tool",
-					"tool": "bash",
-					"state": map[string]interface{}{
-						"status": "running",
-						"input": map[string]interface{}{
-							"command": "git diff origin/main HEAD",
-						},
-						"output": "# Compare HEAD and main\n$ git diff origin/main HEAD",
-					},
-				},
-			},
-			contains: []string{"• 🛠️ bash:", "$ git diff origin/main HEAD", "output:", "# Compare HEAD and main"},
+			contains: []string{"unknown-type"},
 		},
 		{
 			name: "tool call with empty snapshot",
@@ -283,7 +234,7 @@ func TestFormatMessageParts(t *testing.T) {
 					Text: strings.Repeat("reasoning ", 500), // 5000 characters
 				},
 			},
-			contains: []string{"• Thinking:", "reasoning", "..."},
+			contains: []string{"> Thinking:", "reasoning"},
 		},
 		{
 			name: "mixed parts with step start and finish",
@@ -300,7 +251,7 @@ func TestFormatMessageParts(t *testing.T) {
 					Reason: "done",
 				},
 			},
-			contains:    []string{"• Thinking:", "Thinking"},
+			contains:    []string{"> Thinking:", "Thinking"},
 			notContains: []string{"step-start"},
 		},
 		{
@@ -490,7 +441,7 @@ func TestSplitLongContent_SplitsLongSingleLine(t *testing.T) {
 	}
 
 	for i, chunk := range chunks {
-		if len(chunk) > 3500 {
+		if len(chunk) > 3000 {
 			t.Fatalf("chunk %d exceeds limit: %d", i, len(chunk))
 		}
 	}

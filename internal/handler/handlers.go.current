@@ -10,20 +10,13 @@ import (
 	"sync"
 	"time"
 
+	log "github.com/sirupsen/logrus"
+	"gopkg.in/telebot.v4"
 	"tg-bot/internal/config"
 	"tg-bot/internal/opencode"
 	"tg-bot/internal/render"
 	"tg-bot/internal/session"
 	"tg-bot/internal/storage"
-
-	log "github.com/sirupsen/logrus"
-	"gopkg.in/telebot.v4"
-)
-
-const (
-	// maxTelegramMessages is the maximum number of messages we'll send for a single response
-	// to avoid flooding the chat and hitting rate limits
-	maxTelegramMessages = 20
 )
 
 // Bot represents the Telegram bot with all dependencies
@@ -67,21 +60,6 @@ type streamingState struct {
 	content     *strings.Builder
 	lastUpdate  time.Time
 	updateMutex *sync.Mutex
-
-	// Track which OpenCode message IDs have been rendered
-	renderedMessageIDs map[string]bool
-
-	// Cache of formatted message chunks by message ID
-	cachedMessageChunks map[string][]string
-
-	// Cumulative display chunks (session info + all message chunks)
-	allDisplayChunks []string
-
-	// Whether session info has been added to display chunks
-	sessionInfoAdded bool
-
-	// Session ID for this streaming state
-	sessionID string
 
 	isStreaming bool
 	isComplete  bool
@@ -276,21 +254,31 @@ Notes:
 
 // handleSessions handles the /sessions command
 func (b *Bot) handleSessions(c telebot.Context) error {
-	// Synchronize sessions from OpenCode to local storage
-	if err := b.sessionManager.SyncSessions(b.ctx); err != nil {
+	// Synchronize sessions from OpenCode to local storage with timeout
+	syncCtx, syncCancel := context.WithTimeout(b.ctx, 10*time.Second)
+	defer syncCancel()
+
+	if err := b.sessionManager.SyncSessions(syncCtx); err != nil {
 		log.Warnf("Failed to synchronize sessions: %v", err)
 		// Continue to show sessions anyway
 	}
 
 	userID := c.Sender().ID
-	sessions, err := b.sessionManager.ListUserSessions(b.ctx, userID)
+
+	// List user sessions with timeout
+	listCtx, listCancel := context.WithTimeout(b.ctx, 5*time.Second)
+	defer listCancel()
+
+	sessions, err := b.sessionManager.ListUserSessions(listCtx, userID)
 	if err != nil {
 		log.Errorf("Failed to list sessions: %v", err)
-		return c.Send(fmt.Sprintf("Failed to get session list: %v", err))
+		_, sendErr := b.sendRenderedTelegramMessage(c, fmt.Sprintf("Failed to get session list: %v", err), false)
+		return sendErr
 	}
 
 	if len(sessions) == 0 {
-		return c.Send("You don't have any sessions yet. Use /new to create a new session.")
+		_, sendErr := b.sendRenderedTelegramMessage(c, "You don't have any sessions yet. Use /new to create a new session.", false)
+		return sendErr
 	}
 
 	// Update session mapping for this user
@@ -302,7 +290,7 @@ func (b *Bot) handleSessions(c telebot.Context) error {
 	b.sessionMappingMu.Unlock()
 
 	var sb strings.Builder
-	sb.WriteString("📋 Available Sessions\n\n")
+	sb.WriteString("## Available Sessions\n\n")
 
 	currentSessionID, hasCurrent := b.sessionManager.GetUserSession(userID)
 
@@ -310,39 +298,36 @@ func (b *Bot) handleSessions(c telebot.Context) error {
 		// Determine if this is the current session
 		isCurrent := hasCurrent && sess.SessionID == currentSessionID
 
-		// Format the header line
+		// Format the header line with markdown
 		if isCurrent {
-			fmt.Fprintf(&sb, "[✅ CURRENT] %d. %s\n", i+1, sess.Name)
+			fmt.Fprintf(&sb, "[CURRENT 👉] **%d. %s**\n", i+1, sess.Name)
 		} else {
 			fmt.Fprintf(&sb, "%d. %s\n", i+1, sess.Name)
 		}
 
-		// Add separator line (fixed length)
-		sb.WriteString("────────────────\n")
-
-		// Add session details with bullet points
-		fmt.Fprintf(&sb, "• Created: %s\n", sess.CreatedAt.Format("2006-01-02 15:04"))
-		fmt.Fprintf(&sb, "• Last used: %s\n", sess.LastUsedAt.Format("2006-01-02 15:04"))
-		fmt.Fprintf(&sb, "• Messages: %d\n", sess.MessageCount)
+		// Add session details with simple list
+		fmt.Fprintf(&sb, "- Created: %s\n", sess.CreatedAt.Format("2006-01-02 15:04"))
+		fmt.Fprintf(&sb, "- Last used: %s\n", sess.LastUsedAt.Format("2006-01-02 15:04"))
+		fmt.Fprintf(&sb, "- Messages: %d\n", sess.MessageCount)
 
 		// Add model information
 		if sess.ProviderID != "" && sess.ModelID != "" {
-			fmt.Fprintf(&sb, "• Model: %s/%s\n", sess.ProviderID, sess.ModelID)
+			fmt.Fprintf(&sb, "- Model: `%s/%s`\n", sess.ProviderID, sess.ModelID)
 		} else if sess.ModelID != "" {
-			fmt.Fprintf(&sb, "• Model: %s\n", sess.ModelID)
+			fmt.Fprintf(&sb, "- Model: `%s`\n", sess.ModelID)
 		} else if sess.ProviderID != "" {
-			fmt.Fprintf(&sb, "• Model: %s\n", sess.ProviderID)
+			fmt.Fprintf(&sb, "- Model: `%s`\n", sess.ProviderID)
 		} else {
-			sb.WriteString("• Model: Default\n")
+			sb.WriteString("- Model: Default\n")
 		}
 
 		// Add empty line between sessions
 		sb.WriteString("\n")
 	}
 
-	sb.WriteString("Use /switch <number> to switch sessions, /rename <number> <name> to rename, or /delete <number> to delete.")
+	sb.WriteString("Use `/switch <number>` to switch sessions, `/rename <number> <name>` to rename, or `/delete <number>` to delete.")
 
-	return c.Send(sb.String())
+	return b.sendPaginatedRenderedMessage(c, sb.String())
 }
 
 // handleNew handles the /new command
@@ -445,107 +430,73 @@ func (b *Bot) handleCurrent(c telebot.Context) error {
 	sessionID, exists := b.sessionManager.GetUserSession(userID)
 
 	if !exists {
-		_, err := b.sendRenderedTelegramMessage(c, "You don't have a current session. Use /new to create a new session.", false)
-		return err
+		return c.Send("You don't have a current session. Use /new to create a new session.")
 	}
 
 	meta, exists := b.sessionManager.GetSessionMeta(sessionID)
 	if !exists {
-		_, err := b.sendRenderedTelegramMessage(c, "Session information lost. Use /new to create a new session.", false)
-		return err
+		return c.Send("Session information lost. Use /new to create a new session.")
 	}
 
 	// Get recent messages
 	messages, err := b.opencodeClient.GetMessages(b.ctx, sessionID)
 	if err != nil {
 		log.Errorf("Failed to get messages: %v", err)
-		_, sendErr := b.sendRenderedTelegramMessage(c, fmt.Sprintf("Failed to get messages: %v", err), false)
-		return sendErr
-	}
-
-	// Get session details from OpenCode
-	session, err := b.opencodeClient.GetSession(b.ctx, sessionID)
-	if err != nil || session == nil {
-		log.Errorf("Failed to get session details: %v", err)
-		_, sendErr := b.sendRenderedTelegramMessage(c, fmt.Sprintf("Failed to get session details: %v", err), false)
-		return sendErr
-	}
-
-	// Determine current status
-	statusStr := "Porcessing finished."
-	if len(messages) > 0 {
-		lastMsg := messages[len(messages)-1]
-		if !(lastMsg.Role == "assistant" && lastMsg.Finish != "") {
-			statusStr = "Processing..."
-		}
-	}
-
-	// Determine model info
-	modelInfo := "Default"
-	if meta.ProviderID != "" && meta.ModelID != "" {
-		modelInfo = fmt.Sprintf("%s/%s", meta.ProviderID, meta.ModelID)
+		return c.Send(fmt.Sprintf("Failed to get messages: %v", err))
 	}
 
 	var sb strings.Builder
-
-	// Show session info in bullet points (same format as /status)
-	fmt.Fprintf(&sb, "## Session: %s\n", meta.Name)
-	fmt.Fprintf(&sb, "---\n")
-	fmt.Fprintf(&sb, "- Created: %s\n", time.UnixMilli(session.Time.Created).Format("2006-01-02 15:04"))
-	fmt.Fprintf(&sb, "- Updated: %s\n", time.UnixMilli(session.Time.Updated).Format("2006-01-02 15:04"))
+	fmt.Fprintf(&sb, "## %s\n", meta.Name)
+	fmt.Fprintf(&sb, "- Created: %s\n", meta.CreatedAt.Format("2006-01-02 15:04"))
+	fmt.Fprintf(&sb, "- Last used: %s\n", meta.LastUsedAt.Format("2006-01-02 15:04"))
 	fmt.Fprintf(&sb, "- Messages: %d\n", meta.MessageCount)
-	fmt.Fprintf(&sb, "- Model: %s\n", modelInfo)
-	fmt.Fprintf(&sb, "- Status: %s\n", statusStr)
+	if meta.ProviderID != "" && meta.ModelID != "" {
+		fmt.Fprintf(&sb, "- Model: %s/%s\n", meta.ProviderID, meta.ModelID)
+	} else {
+		sb.WriteString("- Model: Default\n")
+	}
+	sb.WriteString("---\n\n")
 
 	// Show latest message if available
 	if len(messages) > 0 {
 		msg := messages[len(messages)-1]
-		var role string
-		switch msg.Role {
-		case "user":
-			role = "User"
-		case "assistant":
-			role = "Assistant"
-		case "system":
-			role = "System"
-		}
-		messageMeta := fmt.Sprintf("[%s] [%s]", role, msg.CreatedAt.Format("15:04"))
+		timeStr := msg.CreatedAt.Format("2006-01-02 15:04")
+		fmt.Fprintf(&sb, "## Last Message [%s]\n\n", timeStr)
 
-		fmt.Fprintf(&sb, "\n")
-		fmt.Fprintf(&sb, "## Latest Message %s\n", messageMeta)
-		fmt.Fprintf(&sb, "---\n")
-
-		// Show detailed parts if available
+		// Show message content
 		if len(msg.Parts) > 0 {
-			// Only include reply content in parts if message content is empty
-			partsStr := formatMessagePartsWithOptions(msg.Parts, msg.Content == "")
+			// Always show detailed parts if available, especially for tool calls
+			partsStr := formatMessagePartsForCurrent(msg.Parts)
 			if partsStr != "No detailed content" {
 				fmt.Fprintf(&sb, "%s\n", partsStr)
+			} else if msg.Content != "" {
+				// Fallback to content if parts don't provide details
+				content := msg.Content
+				if len(content) > 400 {
+					content = content[:400] + "..."
+				}
+				fmt.Fprintf(&sb, "%s\n", content)
+			} else {
+				sb.WriteString("(No content)\n")
 			}
-			log.Infof("[DEBUG] zz-jason, partsStr: %s", partsStr)
+		} else if msg.Content != "" {
+			// No parts, just show content
+			content := msg.Content
+			if len(content) > 400 {
+				content = content[:400] + "..."
+			}
+			fmt.Fprintf(&sb, "%s\n", content)
+		} else {
+			sb.WriteString("(No content)\n")
 		}
-
-		// Show message content if available
-		if msg.Content != "" {
-			fmt.Fprintf(&sb, "%s\n", msg.Content)
-		}
-
 	} else {
-		sb.WriteString("No messages yet.\n")
+		sb.WriteString("## Last Message\n\nNo messages yet.\n")
 	}
 
 	result := sb.String()
 
-	pages := b.paginateDisplayText(result, false)
-	var sendErr error
-	for i, page := range pages {
-		_, err := b.sendRenderedTelegramMessage(c, page, false)
-		if err != nil {
-			sendErr = err
-			log.Errorf("Failed to send page %d/%d: %v", i+1, len(pages), err)
-		}
-	}
-	return sendErr
+	// Use paginated sending to handle large messages
+	return b.sendPaginatedRenderedMessage(c, result)
 }
 
 // handleAbort handles the /abort command
@@ -581,6 +532,74 @@ func formatMessageParts(parts []interface{}) string {
 	return formatMessagePartsWithOptions(parts, true)
 }
 
+func formatMessagePartsForCurrent(parts []interface{}) string {
+	if len(parts) == 0 {
+		return "No detailed content"
+	}
+
+	var sb strings.Builder
+	hasTextContent := false
+	var textContent strings.Builder
+	var hasReasoning bool
+
+	for _, part := range parts {
+		// Try to cast to opencode.MessagePartResponse
+		if partResp, ok := part.(opencode.MessagePartResponse); ok {
+			switch partResp.Type {
+			case "text":
+				if partResp.Text != "" {
+					hasTextContent = true
+					textContent.WriteString(partResp.Text)
+					if !strings.HasSuffix(partResp.Text, "\n") {
+						textContent.WriteString("\n")
+					}
+				}
+			case "reasoning":
+				// Show reasoning text if available
+				if partResp.Text != "" {
+					reasoningText := partResp.Text
+					if len(reasoningText) > 2000 {
+						reasoningText = reasoningText[:2000] + "..."
+					}
+					if !hasReasoning {
+						// Ensure each line of reasoning text is properly quoted
+						quotedReasoning := "> Thinking: " + strings.ReplaceAll(reasoningText, "\n", "\n> ")
+						sb.WriteString(quotedReasoning + "\n\n")
+						hasReasoning = true
+					}
+				}
+			case "step-start":
+				// Skip "Task start" message as it's redundant
+			case "step-finish":
+				// Skip step-finish
+			case "tool":
+				sb.WriteString(formatToolCallPartForCurrent(partResp.Tool, partResp.Snapshot, partResp.State, partResp.Text))
+			default:
+				// Skip other types for current command
+			}
+
+	}
+	}
+
+	// Add text content at the end if we have any
+	if hasTextContent {
+		text := strings.TrimSpace(textContent.String())
+		if text != "" {
+			// Truncate if too long
+			if len(text) > 3000 {
+				text = text[:3000] + "...\n(Reply content too long, truncated)"
+			}
+			fmt.Fprintf(&sb, "%s\n", text)
+		}
+	}
+
+	result := strings.TrimSpace(sb.String())
+	if result == "" {
+		return "No detailed content"
+	}
+	return result
+}
+
 func formatMessagePartsWithOptions(parts []interface{}, includeReplyContent bool) string {
 	if len(parts) == 0 {
 		return "No detailed content"
@@ -589,36 +608,54 @@ func formatMessagePartsWithOptions(parts []interface{}, includeReplyContent bool
 	var sb strings.Builder
 	hasTextContent := false
 	var textContent strings.Builder
+	var hasReasoning bool
 
 	for _, part := range parts {
-		partResp, ok := part.(opencode.MessagePartResponse)
-		if !ok {
-			log.Warnf("Unknown message part type: %T", part)
-			continue
-		}
-
-		log.Infof("[DEBUG zz-jason] Processing opencode.MessagePartResponse")
-		switch partResp.Type {
-		case "text":
-			if partResp.Text != "" {
-				hasTextContent = true
-				textContent.WriteString(partResp.Text)
-				if !strings.HasSuffix(partResp.Text, "\n") {
-					textContent.WriteString("\n")
+		// Try to cast to opencode.MessagePartResponse
+		if partResp, ok := part.(opencode.MessagePartResponse); ok {
+			switch partResp.Type {
+			case "text":
+				if partResp.Text != "" {
+					hasTextContent = true
+					textContent.WriteString(partResp.Text)
+					if !strings.HasSuffix(partResp.Text, "\n") {
+						textContent.WriteString("\n")
+					}
 				}
+			case "reasoning":
+				// Show reasoning text if available
+				if partResp.Text != "" {
+					reasoningText := partResp.Text
+					if len(reasoningText) > 2000 {
+						reasoningText = reasoningText[:2000] + "..."
+					}
+					if !hasReasoning {
+						// Ensure each line of reasoning text is properly quoted
+						quotedReasoning := "> Thinking: " + strings.ReplaceAll(reasoningText, "\n", "\n> ")
+						sb.WriteString(quotedReasoning + "\n\n")
+						hasReasoning = true
+					}
+				} else {
+					sb.WriteString("• Thinking: Processed\n")
+				}
+			case "step-start":
+				// Skip "Task start" message as it's redundant
+				// sb.WriteString("🚀 Task start\n")
+			case "step-finish":
+			// Skip step-finish in status display as it's redundant
+			// finishMsg := fmt.Sprintf("✅ Task completed")
+			// if partResp.Reason != "" {
+			// 	finishMsg += fmt.Sprintf(" (Reason: %s)", partResp.Reason)
+			// }
+			// if partResp.Cost > 0 {
+			// 	finishMsg += fmt.Sprintf(" [Cost: %.4f]", partResp.Cost)
+			// }
+			// sb.WriteString(finishMsg + "\n")
+			case "tool":
+				sb.WriteString(formatToolCallPart(partResp.Tool, partResp.Snapshot, partResp.State, partResp.Text))
+			default:
+				fmt.Fprintf(&sb, "🔹 %s\n", partResp.Type)
 			}
-		case "reasoning":
-			if partResp.Text != "" {
-				reasoningText := strings.ReplaceAll(partResp.Text, "\n", "\n> ")
-				fmt.Fprintf(&sb, "> Thinking: %s\n", reasoningText)
-			}
-		case "step-start":
-		case "step-finish":
-		case "tool":
-			sb.WriteString(formatToolCallPart(partResp.Tool, partResp.Snapshot, partResp.State, partResp.Text))
-		default:
-			fmt.Fprintf(&sb, "%v\n", partResp)
-		}
 	}
 
 	// Add text content at the end if we have any.
@@ -689,130 +726,43 @@ func formatToolCallPart(toolName, snapshot string, state interface{}, text strin
 	return sb.String()
 }
 
-// formatMessageWithMetadata formats a single OpenCode message with role, timestamp, parts, and content
-// Follows the same logic as /current command for displaying messages
-func formatMessageWithMetadata(msg opencode.Message) string {
+func formatToolCallPartForCurrent(toolName, snapshot string, state interface{}, text string) string {
+	snapshotData := parseJSONMap(snapshot)
+	if toolName == "" {
+		toolName = extractToolName(snapshotData)
+	}
+	if toolName == "" {
+		toolName = "tool"
+	}
+
+	sourceData := toStringAnyMap(state)
+	if sourceData == nil {
+		sourceData = snapshotData
+	}
+
+	description := extractToolDescription(sourceData, text)
+	command := extractToolCommand(sourceData)
+	output := extractToolOutput(sourceData)
+	if output == "" && text != "" && text != description {
+		output = text
+	}
+
 	var sb strings.Builder
-
-	// Determine role display
-	var role string
-	switch msg.Role {
-	case "user":
-		role = "👤 User"
-	case "assistant":
-		role = "🤖 Assistant"
-	case "system":
-		role = "⚙️ System"
-	default:
-		role = msg.Role
+	sb.WriteString("```\n")
+	fmt.Fprintf(&sb, "# %s: %s\n", toolName, description)
+	if command != "" {
+		fmt.Fprintf(&sb, "%s\n", command)
 	}
-
-	// Format timestamp
-	timeStr := msg.CreatedAt.Format("15:04")
-
-	// Write header
-	fmt.Fprintf(&sb, "[%s] [%s]\n", role, timeStr)
-	sb.WriteString("---\n")
-
-	// Show detailed parts if available
-	if len(msg.Parts) > 0 {
-		// Include reply content from parts only if message content is empty
-		// (to avoid duplicate content blocks)
-		partsStr := formatMessagePartsWithOptions(msg.Parts, msg.Content == "")
-		if partsStr != "No detailed content" {
-			fmt.Fprintf(&sb, "%s\n", partsStr)
+	if output != "" {
+		outputText := truncateMultiline(output, 700)
+		outputText = strings.ReplaceAll(outputText, "\r\n", "\n")
+		outputText = strings.TrimSpace(outputText)
+		if outputText != "" {
+			fmt.Fprintf(&sb, "%s\n", outputText)
 		}
 	}
-
-	// Show message content if available
-	if msg.Content != "" {
-		fmt.Fprintf(&sb, "%s\n", msg.Content)
-	}
-
-	return strings.TrimSpace(sb.String())
-}
-
-// formatAllMessagesForStreaming formats all messages for streaming display
-// Returns an array of display strings, each suitable for a Telegram message
-func (b *Bot) formatAllMessagesForStreaming(messages []opencode.Message, sessionMeta *session.SessionMeta) []string {
-	if len(messages) == 0 {
-		return []string{"No messages yet."}
-	}
-
-	var displays []string
-
-	// If we have session metadata, add session info at the beginning
-	if sessionMeta != nil {
-		var sb strings.Builder
-		fmt.Fprintf(&sb, "## Session: %s\n", sessionMeta.Name)
-		sb.WriteString("---\n")
-		fmt.Fprintf(&sb, "- Messages: %d\n", sessionMeta.MessageCount)
-		if sessionMeta.ProviderID != "" && sessionMeta.ModelID != "" {
-			fmt.Fprintf(&sb, "- Model: %s/%s\n", sessionMeta.ProviderID, sessionMeta.ModelID)
-		}
-		sb.WriteString("\n")
-		sessionInfo := sb.String()
-		// Split session info if needed (unlikely to be long)
-		displays = append(displays, sessionInfo)
-	}
-
-	// Format each message
-	for _, msg := range messages {
-		formatted := formatMessageWithMetadata(msg)
-
-		// Split long messages while preserving code blocks
-		chunks := b.splitLongContentPreserveCodeBlocks(formatted)
-		displays = append(displays, chunks...)
-	}
-
-	return displays
-}
-
-// buildDisplayChunksFromMessagesWithCache builds display chunks using cache to avoid re-rendering
-func (b *Bot) buildDisplayChunksFromMessagesWithCache(messages []opencode.Message, sessionMeta *session.SessionMeta, state *streamingState) []string {
-	if len(messages) == 0 {
-		return []string{"No messages yet."}
-	}
-
-	// Ensure cache maps are initialized
-	if state.cachedMessageChunks == nil {
-		state.cachedMessageChunks = make(map[string][]string)
-	}
-	if state.allDisplayChunks == nil {
-		state.allDisplayChunks = []string{}
-	}
-
-	// Add session info if needed
-	if sessionMeta != nil && !state.sessionInfoAdded {
-		var sb strings.Builder
-		fmt.Fprintf(&sb, "## Session: %s\n", sessionMeta.Name)
-		sb.WriteString("---\n")
-		fmt.Fprintf(&sb, "- Messages: %d\n", sessionMeta.MessageCount)
-		if sessionMeta.ProviderID != "" && sessionMeta.ModelID != "" {
-			fmt.Fprintf(&sb, "- Model: %s/%s\n", sessionMeta.ProviderID, sessionMeta.ModelID)
-		}
-		sb.WriteString("\n")
-		sessionInfo := sb.String()
-		// Session info is typically short, no need to split
-		state.allDisplayChunks = append(state.allDisplayChunks, sessionInfo)
-		state.sessionInfoAdded = true
-	}
-
-	// Process each message in order
-	for _, msg := range messages {
-		if _, cached := state.cachedMessageChunks[msg.ID]; cached {
-			// Already cached, skip
-			continue
-		}
-
-		// Format and split this message
-		formatted := formatMessageWithMetadata(msg)
-		chunks := b.splitLongContentPreserveCodeBlocks(formatted)
-		state.cachedMessageChunks[msg.ID] = chunks
-		state.allDisplayChunks = append(state.allDisplayChunks, chunks...)
-	}
-
-	return state.allDisplayChunks
+	sb.WriteString("```\n\n")
+	return sb.String()
 }
 
 func parseJSONMap(raw string) map[string]interface{} {
@@ -964,31 +914,35 @@ func (b *Bot) handleStatus(c telebot.Context) error {
 		return c.Send("Current session has no messages yet.")
 	}
 
+	// Get session metadata
+	meta, exists := b.sessionManager.GetSessionMeta(sessionID)
+	if !exists {
+		return c.Send("Session information lost. Use /new to create a new session.")
+	}
+
 	// Determine current status
 	statusStr := "Waiting For Your Input"
-	if len(messages) > 0 {
-		lastMsg := messages[len(messages)-1]
-		if !(lastMsg.Role == "assistant" && lastMsg.Finish != "") {
-			statusStr = "Assistant is processing..."
-		}
+	lastMsg := messages[len(messages)-1]
+	if !(lastMsg.Role == "assistant" && lastMsg.Finish != "") {
+		statusStr = "Assistant is processing..."
 	}
 
 	var sb strings.Builder
-	sb.WriteString("📊 Session Status\n")
-	sb.WriteString("────────────────\n")
+	sb.WriteString("## 📊 Session Status\n")
 
 	// Show session info
-	session, err := b.opencodeClient.GetSession(b.ctx, sessionID)
-	if err == nil && session != nil {
-		fmt.Fprintf(&sb, "• Name: %s\n", session.Title)
-		createdAt := time.UnixMilli(session.Time.Created)
-		fmt.Fprintf(&sb, "• Created: %s\n", createdAt.Format("2006-01-02 15:04"))
+	fmt.Fprintf(&sb, "### %s\n", meta.Name)
+	fmt.Fprintf(&sb, "- Created: %s\n", meta.CreatedAt.Format("2006-01-02 15:04"))
+	fmt.Fprintf(&sb, "- Last used: %s\n", meta.LastUsedAt.Format("2006-01-02 15:04"))
+	fmt.Fprintf(&sb, "- Messages: %d\n", meta.MessageCount)
+	if meta.ProviderID != "" && meta.ModelID != "" {
+		fmt.Fprintf(&sb, "- Model: %s/%s\n", meta.ProviderID, meta.ModelID)
+	} else {
+		sb.WriteString("- Model: Default\n")
 	}
+	fmt.Fprintf(&sb, "- Status: %s\n", statusStr)
 
-	fmt.Fprintf(&sb, "• Messages: %d\n", len(messages))
-	fmt.Fprintf(&sb, "• Status: %s\n\n", statusStr)
-
-	// Show last 3 messages in a cleaner format
+	sb.WriteString("---\n\n## Recent Messages\n\n")
 	start := len(messages) - 3
 	if start < 0 {
 		start = 0
@@ -1006,8 +960,7 @@ func (b *Bot) handleStatus(c telebot.Context) error {
 		}
 		timeStr := msg.CreatedAt.Format("15:04")
 
-		fmt.Fprintf(&sb, "\n[Message %d] %s [%s]\n", relIndex, role, timeStr)
-		sb.WriteString("────────────────\n")
+		fmt.Fprintf(&sb, "### Message %d [%s] %s\n", relIndex, timeStr, role)
 
 		// Show message content
 		if len(msg.Parts) > 0 {
@@ -1038,13 +991,10 @@ func (b *Bot) handleStatus(c telebot.Context) error {
 
 	}
 
-	// Truncate if too long
 	result := sb.String()
-	if len(result) > 4000 {
-		result = result[:4000] + "\n... (content too long, truncated)"
-	}
 
-	return c.Send(result)
+	// Use paginated sending instead of truncation
+	return b.sendPaginatedRenderedMessage(c, result)
 }
 
 // handleModels lists available AI models
@@ -1058,7 +1008,8 @@ func (b *Bot) handleModels(c telebot.Context) error {
 	providersResp, err := b.opencodeClient.GetProviders(b.ctx)
 	if err != nil {
 		log.Errorf("Failed to get providers: %v", err)
-		return c.Send(fmt.Sprintf("Failed to get model list: %v", err))
+		_, sendErr := b.sendRenderedTelegramMessage(c, fmt.Sprintf("Failed to get model list: %v", err), false)
+		return sendErr
 	}
 
 	var sb strings.Builder
@@ -1094,7 +1045,8 @@ func (b *Bot) handleModels(c telebot.Context) error {
 		sb.WriteString("Please configure API keys for at least one AI provider first.\n\n")
 		sb.WriteString("Use /providers to view provider connection status.")
 		b.storeModelMapping(c.Sender().ID, modelMapping)
-		return c.Send(sb.String())
+		_, err := b.sendRenderedTelegramMessage(c, sb.String(), false)
+		return err
 	}
 
 	for _, provider := range connectedProviders {
@@ -1136,10 +1088,7 @@ func (b *Bot) handleModels(c telebot.Context) error {
 	b.storeModelMapping(c.Sender().ID, modelMapping)
 
 	result := sb.String()
-	if len(result) > 4000 {
-		result = result[:4000] + "\n...(content too long, truncated)"
-	}
-	return c.Send(result)
+	return b.sendPaginatedRenderedMessage(c, result)
 }
 
 // handleProviders lists AI providers
@@ -1147,7 +1096,8 @@ func (b *Bot) handleProviders(c telebot.Context) error {
 	providersResp, err := b.opencodeClient.GetProviders(b.ctx)
 	if err != nil {
 		log.Errorf("Failed to get providers: %v", err)
-		return c.Send(fmt.Sprintf("Failed to get providers: %v", err))
+		_, sendErr := b.sendRenderedTelegramMessage(c, fmt.Sprintf("Failed to get providers: %v", err), false)
+		return sendErr
 	}
 
 	// Create a set of connected provider IDs for faster lookup
@@ -1210,10 +1160,7 @@ func (b *Bot) handleProviders(c telebot.Context) error {
 	sb.WriteString("Use /models to view available models from connected providers.")
 
 	result := sb.String()
-	if len(result) > 4000 {
-		result = result[:4000] + "\n...(content too long, truncated)"
-	}
-	return c.Send(result)
+	return b.sendPaginatedRenderedMessage(c, result)
 }
 
 // handleSetModel sets the model for the current session
@@ -1331,22 +1278,17 @@ func (b *Bot) handleText(c telebot.Context) error {
 
 	// Track streaming state
 	streamingState := &streamingState{
-		ctx:                 ctx,
-		cancel:              cancel,
-		stopUpdates:         stopUpdates,
-		telegramMsg:         processingMsg,
-		telegramMessages:    []*telebot.Message{processingMsg},
-		lastRendered:        []string{"🤖 Processing..."},
-		telegramCtx:         c,
-		content:             &strings.Builder{},
-		lastUpdate:          time.Now(),
-		updateMutex:         &sync.Mutex{},
-		renderedMessageIDs:  make(map[string]bool),
-		cachedMessageChunks: make(map[string][]string),
-		allDisplayChunks:    nil,
-		sessionInfoAdded:    false,
-		sessionID:           sessionID,
-		isStreaming:         true,
+		ctx:              ctx,
+		cancel:           cancel,
+		stopUpdates:      stopUpdates,
+		telegramMsg:      processingMsg,
+		telegramMessages: []*telebot.Message{processingMsg},
+		lastRendered:     []string{"🤖 Processing..."},
+		telegramCtx:      c,
+		content:          &strings.Builder{},
+		lastUpdate:       time.Now(),
+		updateMutex:      &sync.Mutex{},
+		isStreaming:      true,
 	}
 
 	// Store streaming state for potential abort
@@ -1505,11 +1447,13 @@ func (b *Bot) handleFiles(c telebot.Context) error {
 	files, err := b.opencodeClient.ListFiles(b.ctx, path)
 	if err != nil {
 		log.Errorf("Failed to list files: %v", err)
-		return c.Send(fmt.Sprintf("Failed to list files: %v", err))
+		_, sendErr := b.sendRenderedTelegramMessage(c, fmt.Sprintf("Failed to list files: %v", err), false)
+		return sendErr
 	}
 
 	if len(files) == 0 {
-		return c.Send(fmt.Sprintf("Directory '%s' is empty or does not exist.", path))
+		_, sendErr := b.sendRenderedTelegramMessage(c, fmt.Sprintf("Directory '%s' is empty or does not exist.", path), false)
+		return sendErr
 	}
 
 	var sb strings.Builder
@@ -1556,17 +1500,14 @@ func (b *Bot) handleFiles(c telebot.Context) error {
 	fmt.Fprintf(&sb, "Total: %d items (%d directories, %d files)", len(files), len(dirs), len(fileList))
 
 	result := sb.String()
-	if len(result) > 4000 {
-		result = result[:4000] + "\n...(content too long, truncated)"
-	}
-
-	return c.Send(result)
+	return b.sendPaginatedRenderedMessage(c, result)
 }
 
 func (b *Bot) handleSearch(c telebot.Context) error {
 	args := c.Args()
 	if len(args) == 0 {
-		return c.Send("Please specify search content.\nUsage: /search <search pattern>")
+		_, sendErr := b.sendRenderedTelegramMessage(c, "Please specify search content.\nUsage: /search <search pattern>", false)
+		return sendErr
 	}
 
 	query := strings.Join(args, " ")
@@ -1576,11 +1517,13 @@ func (b *Bot) handleSearch(c telebot.Context) error {
 	if err != nil {
 		// API not available, provide helpful message
 		log.Debugf("Search API not available: %v", err)
-		return c.Send(fmt.Sprintf("🔍 Search functionality is currently unavailable.\n\nReason: %v\n\nYou can directly send a message to the assistant to request a search, for example:\n\"Search for code containing '%s'\"", err, query))
+		_, sendErr := b.sendRenderedTelegramMessage(c, fmt.Sprintf("🔍 Search functionality is currently unavailable.\n\nReason: %v\n\nYou can directly send a message to the assistant to request a search, for example:\n\"Search for code containing '%s'\"", err, query), false)
+		return sendErr
 	}
 
 	if len(results) == 0 {
-		return c.Send(fmt.Sprintf("No code containing '%s' was found.", query))
+		_, sendErr := b.sendRenderedTelegramMessage(c, fmt.Sprintf("No code containing '%s' was found.", query), false)
+		return sendErr
 	}
 
 	var sb strings.Builder
@@ -1599,11 +1542,7 @@ func (b *Bot) handleSearch(c telebot.Context) error {
 	}
 
 	resultStr := sb.String()
-	if len(resultStr) > 4000 {
-		resultStr = resultStr[:4000] + "\n...(content too long, truncated)"
-	}
-
-	return c.Send(resultStr)
+	return b.sendPaginatedRenderedMessage(c, resultStr)
 }
 
 func (b *Bot) handleFindFile(c telebot.Context) error {
@@ -1895,22 +1834,36 @@ func (b *Bot) periodicMessageUpdates(ctx context.Context, state *streamingState,
 				continue
 			}
 
-			state.updateMutex.Lock()
-
-			// Get session metadata for formatting
-			var sessionMeta *session.SessionMeta
-			if b.sessionManager != nil {
-				if meta, exists := b.sessionManager.GetSessionMeta(sessionID); exists {
-					sessionMeta = meta
+			var latestAssistantMsg opencode.Message
+			foundAssistantMsg := false
+			for i := len(messages) - 1; i >= 0; i-- {
+				if messages[i].Role == "assistant" {
+					latestAssistantMsg = messages[i]
+					foundAssistantMsg = true
+					break
 				}
 			}
 
-			// Format all messages for streaming display (with cache)
-			displays := b.buildDisplayChunksFromMessagesWithCache(messages, sessionMeta, state)
+			state.updateMutex.Lock()
+			if !foundAssistantMsg {
+				b.updateStreamingTelegramMessages(state, []string{"🤖 Processing...\n\nModel is thinking, please wait..."})
+				state.updateMutex.Unlock()
+				continue
+			}
 
-			// If no displays (should not happen), show a placeholder
-			if len(displays) == 0 {
-				displays = []string{"🤖 Processing...\n\nModel is thinking, please wait..."}
+			// Prefer the same content-driven stream layout whenever content exists.
+			// This guarantees page 2/page 3 can start updating before completion.
+			currentContent := state.content.String()
+			displayContent := currentContent
+			if len(strings.TrimSpace(latestAssistantMsg.Content)) > len(strings.TrimSpace(displayContent)) {
+				displayContent = latestAssistantMsg.Content
+			}
+			var displays []string
+			if strings.TrimSpace(displayContent) != "" {
+				displays = b.formatStreamingDisplays(displayContent)
+			} else {
+				displayText := b.formatMessageForDisplay(latestAssistantMsg, false)
+				displays = b.paginateDisplayText(displayText, true)
 			}
 
 			b.updateStreamingTelegramMessages(state, displays)
@@ -1979,43 +1932,54 @@ func (b *Bot) updateTelegramMessage(c telebot.Context, msg *telebot.Message, con
 
 	rendered := b.buildTelegramRenderResult(content, streaming)
 	primary := b.truncateTelegramText(rendered.primaryText)
+	fallback := b.truncateTelegramText(rendered.fallback)
+
+	if rendered.primaryMode != telebot.ModeDefault && len(primary) >= 4000 {
+		primary = fallback
+		rendered.primaryMode = telebot.ModeDefault
+	}
 
 	if msg.Text == primary {
 		log.Debug("Skipping Telegram edit because message content is unchanged")
 		return
 	}
 
-	// Try to edit with the preferred mode
-	_, err := b.editTelegramWithMode(c, msg, primary, rendered.primaryMode)
-	if err != nil {
+	if _, err := b.editTelegramWithMode(c, msg, primary, rendered.primaryMode); err != nil {
 		if isMessageNotModifiedError(err) {
 			log.Debugf("Skipping no-op Telegram edit: %v", err)
 			msg.Text = primary
 			return
 		}
 
-		// If it's an HTML parse error and we're using HTML mode, try editing with plain text
-		if isHTMLParseError(err) && rendered.primaryMode == telebot.ModeHTML {
-			log.Warnf("HTML parse error during edit, trying plain text: %v", err)
-			_, err = b.editTelegramWithMode(c, msg, primary, telebot.ModeDefault)
+		if rendered.primaryMode != telebot.ModeDefault && isTelegramParseModeError(err) {
+			log.Debugf("Telegram HTML render failed on edit, falling back to plain text: %v", err)
+			if _, fallbackErr := b.editTelegramWithMode(c, msg, fallback, telebot.ModeDefault); fallbackErr == nil {
+				msg.Text = fallback
+				return
+			} else {
+				log.Warnf("Failed to update Telegram message with rendered HTML and fallback plain text: %v", fallbackErr)
+			}
 		}
 
+		log.Warnf("Failed to update Telegram message: %v", err)
+		// If editing fails, try to send a new message
+		newMsg, err := b.sendTelegramWithMode(c, primary, rendered.primaryMode)
 		if err != nil {
-			log.Warnf("Failed to update Telegram message: %v", err)
-			// If editing fails, try to send a new message with fallback handling
-			var newMsg *telebot.Message
-			newMsg, err = b.sendRenderedTelegramMessage(c, primary, streaming)
-			if err != nil {
-				log.Errorf("Failed to send new message: %v", err)
-				return
+			if rendered.primaryMode != telebot.ModeDefault && isTelegramParseModeError(err) {
+				log.Debugf("Telegram HTML render failed on resend, falling back to plain text: %v", err)
+				newMsg, err = b.sendTelegramWithMode(c, fallback, telebot.ModeDefault)
+				if err == nil {
+					newMsg.Text = fallback
+				}
 			}
-			// Update the message reference for future updates
-			*msg = *newMsg
-			log.Debugf("Sent new message due to edit failure, new message ID: %d", newMsg.ID)
-		} else {
-			msg.Text = primary
-			log.Debugf("Successfully edited message ID %d with plain text fallback", msg.ID)
 		}
+		if err != nil {
+			log.Errorf("Failed to send new message: %v", err)
+			return
+		}
+		// Update the message reference for future updates
+		*msg = *newMsg
+		log.Debugf("Sent new message due to edit failure, new message ID: %d", newMsg.ID)
 	} else {
 		msg.Text = primary
 		log.Debugf("Successfully edited message ID %d", msg.ID)
@@ -2029,34 +1993,37 @@ func isMessageNotModifiedError(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "message is not modified")
 }
 
-func isHTMLParseError(err error) bool {
-	if err == nil {
-		return false
-	}
-	errStr := strings.ToLower(err.Error())
-	return strings.Contains(errStr, "can't parse entities") ||
-		strings.Contains(errStr, "bad request") ||
-		strings.Contains(errStr, "html") ||
-		strings.Contains(errStr, "parse")
-}
-
 type telegramRenderResult struct {
 	primaryText string
 	primaryMode telebot.ParseMode
+	fallback    string
 }
 
 func (b *Bot) buildTelegramRenderResult(content string, streaming bool) telegramRenderResult {
+
 	if b.renderer == nil {
+
 		return telegramRenderResult{
 			primaryText: content,
 			primaryMode: telebot.ModeDefault,
+			fallback:    content,
 		}
 	}
 
 	rendered := b.renderer.Render(content, streaming)
+	mode := telebot.ModeDefault
+	if rendered.UseHTML {
+		mode = telebot.ModeHTML
+	}
+	fallback := rendered.FallbackText
+	if fallback == "" {
+		fallback = content
+	}
+
 	return telegramRenderResult{
 		primaryText: rendered.Text,
-		primaryMode: telebot.ModeHTML,
+		primaryMode: mode,
+		fallback:    fallback,
 	}
 }
 
@@ -2083,23 +2050,43 @@ func (b *Bot) editTelegramWithMode(c telebot.Context, msg *telebot.Message, text
 }
 
 func (b *Bot) sendRenderedTelegramMessage(c telebot.Context, content string, streaming bool) (*telebot.Message, error) {
+
 	rendered := b.buildTelegramRenderResult(content, streaming)
+
 	primary := b.truncateTelegramText(rendered.primaryText)
+	fallback := b.truncateTelegramText(rendered.fallback)
 
-	// Try sending with the preferred mode (usually HTML)
-	msg, err := b.sendTelegramWithMode(c, primary, rendered.primaryMode)
+	if rendered.primaryMode != telebot.ModeDefault && len(primary) >= 4000 {
+		primary = fallback
+		rendered.primaryMode = telebot.ModeDefault
 
-	// If it's an HTML parse error and we're using HTML mode, fall back to plain text
-	if err != nil && isHTMLParseError(err) && rendered.primaryMode == telebot.ModeHTML {
-		log.Warnf("HTML parse error, falling back to plain text: %v", err)
-		// Retry with plain text mode
-		msg, err = b.sendTelegramWithMode(c, primary, telebot.ModeDefault)
 	}
 
+	msg, err := b.sendTelegramWithMode(c, primary, rendered.primaryMode)
 	if err == nil {
 		msg.Text = primary
+
+		return msg, nil
 	}
-	return msg, err
+	if rendered.primaryMode != telebot.ModeDefault && isTelegramParseModeError(err) {
+		log.Debugf("Telegram HTML render failed on send, falling back to plain text: %v", err)
+		msg, fallbackErr := b.sendTelegramWithMode(c, fallback, telebot.ModeDefault)
+		if fallbackErr == nil {
+			msg.Text = fallback
+		}
+		return msg, fallbackErr
+	}
+	return nil, err
+}
+
+func isTelegramParseModeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	normalized := strings.ToLower(err.Error())
+	return strings.Contains(normalized, "can't parse entities") ||
+		strings.Contains(normalized, "can't find end of") ||
+		strings.Contains(normalized, "entity") && strings.Contains(normalized, "parse")
 }
 
 // handleRename handles the /rename command
@@ -2142,7 +2129,7 @@ func (b *Bot) handleRename(c telebot.Context) error {
 	}
 
 	// Rename session
-	if err := b.sessionManager.RenameSession(b.ctx, c.Sender().ID, sessionID, newName); err != nil {
+	if err := b.sessionManager.RenameSession(b.ctx, userID, sessionID, newName); err != nil {
 		log.Errorf("Failed to rename session: %v", err)
 		return c.Send(fmt.Sprintf("Failed to rename session: %v", err))
 	}
@@ -2239,32 +2226,7 @@ func (b *Bot) handleStreamChunk(state *streamingState, textChunk string) error {
 	contentGrowth := len(delta)
 
 	shouldUpdate := false
-
-	// Try to get formatted displays from latest messages
-	var formattedDisplays []string
-	var streamDisplayCount int
-
-	// Only try to fetch messages if we have a client and session ID
-	if b.opencodeClient != nil && state.sessionID != "" {
-		messages, err := b.opencodeClient.GetMessages(state.ctx, state.sessionID)
-		if err == nil && len(messages) > 0 {
-			// Get session metadata
-			var sessionMeta *session.SessionMeta
-			if b.sessionManager != nil {
-				if meta, exists := b.sessionManager.GetSessionMeta(state.sessionID); exists {
-					sessionMeta = meta
-				}
-			}
-			formattedDisplays = b.buildDisplayChunksFromMessagesWithCache(messages, sessionMeta, state)
-			streamDisplayCount = len(formattedDisplays)
-		}
-	}
-	// If we couldn't get formatted displays, fall back to raw content splitting
-	if formattedDisplays == nil {
-		formattedDisplays = b.formatStreamingDisplays(currentContent)
-		streamDisplayCount = len(formattedDisplays)
-	}
-
+	streamDisplayCount := len(b.formatStreamingDisplays(currentContent))
 	if streamDisplayCount > len(state.telegramMessages) {
 		// As soon as a new Telegram part is needed, update immediately so
 		// part 2/3... can begin streaming before completion.
@@ -2288,7 +2250,9 @@ func (b *Bot) handleStreamChunk(state *streamingState, textChunk string) error {
 	}
 
 	state.lastUpdate = now
-	b.updateStreamingTelegramMessages(state, formattedDisplays)
+
+	streamDisplays := b.formatStreamingDisplays(currentContent)
+	b.updateStreamingTelegramMessages(state, streamDisplays)
 
 	return nil
 }
@@ -2346,7 +2310,7 @@ func (b *Bot) formatStreamingDisplays(content string) []string {
 
 	// Split full content into stable streaming pages so page 1 can keep updating
 	// until full, then page 2 starts streaming, and so on.
-	chunks := b.splitLongContent(content)
+	chunks := b.splitLongContentPreserveCodeBlocks(content)
 	if len(chunks) == 0 {
 		return []string{"🤖 Processing..."}
 	}
@@ -2362,7 +2326,7 @@ func (b *Bot) formatStreamingDisplays(content string) []string {
 func (b *Bot) paginateDisplayText(content string, streaming bool) []string {
 	content = strings.TrimSpace(content)
 	if content == "" {
-		return []string{""}
+		return []string{"🤖 Processing..."}
 	}
 
 	chunks := b.splitLongContentPreserveCodeBlocks(content)
@@ -2381,18 +2345,6 @@ func (b *Bot) paginateDisplayText(content string, streaming bool) []string {
 func (b *Bot) updateStreamingTelegramMessages(state *streamingState, displays []string) {
 	if len(displays) == 0 || state.telegramCtx == nil {
 		return
-	}
-
-	// Limit number of messages to avoid flooding
-	originalCount := len(displays)
-	if originalCount > maxTelegramMessages {
-		log.Warnf("Too many messages (%d), truncating to %d", originalCount, maxTelegramMessages)
-		displays = displays[:maxTelegramMessages]
-		// Add truncation notice to last message
-		if len(displays) > 0 {
-			lastIdx := len(displays) - 1
-			displays[lastIdx] = displays[lastIdx] + "\n\n... (response too long, truncated)"
-		}
 	}
 
 	// Ensure we have enough Telegram messages.
@@ -2438,13 +2390,7 @@ func (b *Bot) handleFinalResponse(c telebot.Context, state *streamingState, cont
 			log.Errorf("Failed to create fallback message for final response: %v", err)
 			return
 		}
-		state = &streamingState{
-			telegramMessages:    []*telebot.Message{msg},
-			renderedMessageIDs:  make(map[string]bool),
-			cachedMessageChunks: make(map[string][]string),
-			allDisplayChunks:    nil,
-			sessionInfoAdded:    false,
-		}
+		state = &streamingState{telegramMessages: []*telebot.Message{msg}}
 	}
 
 	// Check if content fits in one message.
@@ -2455,7 +2401,7 @@ func (b *Bot) handleFinalResponse(c telebot.Context, state *streamingState, cont
 	}
 
 	// Content is too long: split and render all parts in-place.
-	chunks := b.splitLongContent(content)
+	chunks := b.splitLongContentPreserveCodeBlocks(content)
 	if len(chunks) == 0 {
 		b.updateTelegramMessage(c, state.telegramMessages[0], "✅ Response completed.", false)
 		return
@@ -2479,7 +2425,7 @@ func (b *Bot) handleFinalResponse(c telebot.Context, state *streamingState, cont
 
 // splitLongContent splits long content into chunks that fit in Telegram messages
 func (b *Bot) splitLongContent(content string) []string {
-	const maxChunkSize = 3000
+	const maxChunkSize = 3500
 	if content == "" {
 		return nil
 	}
@@ -2499,13 +2445,6 @@ func (b *Bot) splitLongContent(content string) []string {
 		chunk := remaining[:splitAt]
 		chunks = append(chunks, chunk)
 
-		// Stop if we've reached the maximum number of messages
-		if len(chunks) >= maxTelegramMessages {
-			// Add truncation notice to the last chunk
-			chunks[maxTelegramMessages-1] = chunks[maxTelegramMessages-1] + "\n\n... (response too long, truncated)"
-			return chunks
-		}
-
 		if splitAt < len(remaining) && remaining[splitAt] == '\n' {
 			splitAt++
 		}
@@ -2519,8 +2458,9 @@ func (b *Bot) splitLongContent(content string) []string {
 	return chunks
 }
 
+// splitLongContentPreserveCodeBlocks splits long content into chunks that preserve code block boundaries
 func (b *Bot) splitLongContentPreserveCodeBlocks(content string) []string {
-	const maxChunkSize = 3000
+	const maxChunkSize = 3500
 	if content == "" {
 		return nil
 	}
@@ -2537,13 +2477,8 @@ func (b *Bot) splitLongContentPreserveCodeBlocks(content string) []string {
 	var currentChunk strings.Builder
 	inCodeBlock := false
 	codeBlockMarker := ""
-	truncated := false
 
 	for i, line := range lines {
-		// If we've already truncated, stop processing
-		if truncated {
-			break
-		}
 		// Check if this line starts or ends a code block
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "```") {
@@ -2573,15 +2508,6 @@ func (b *Bot) splitLongContentPreserveCodeBlocks(content string) []string {
 
 			chunkStr := strings.TrimSuffix(currentChunk.String(), "\n")
 			chunks = append(chunks, chunkStr)
-
-			// Check if we've reached the maximum number of messages
-			if len(chunks) >= maxTelegramMessages {
-				// Add truncation notice to the last chunk
-				chunks[maxTelegramMessages-1] = chunks[maxTelegramMessages-1] + "\n\n... (response too long, truncated)"
-				truncated = true
-				break
-			}
-
 			currentChunk.Reset()
 
 			// If we were in a code block, reopen it in the new chunk
@@ -2593,20 +2519,33 @@ func (b *Bot) splitLongContentPreserveCodeBlocks(content string) []string {
 		currentChunk.WriteString(lineWithNewline)
 
 		// If this is the last line, finalize the chunk
-		if i == len(lines)-1 && !truncated {
+		if i == len(lines)-1 {
 			chunkStr := strings.TrimSuffix(currentChunk.String(), "\n")
-			// Check if we can add another chunk without exceeding limit
-			if len(chunks) < maxTelegramMessages {
-				chunks = append(chunks, chunkStr)
-			} else if len(chunks) == maxTelegramMessages {
-				// Already at limit, replace last chunk with current content plus truncation notice
-				// (should not happen due to earlier break)
-				chunks[maxTelegramMessages-1] = chunkStr + "\n\n... (response too long, truncated)"
-			}
+			chunks = append(chunks, chunkStr)
 		}
 	}
 
 	return chunks
+}
+
+// sendPaginatedRenderedMessage sends content as multiple Telegram messages if it's too long
+func (b *Bot) sendPaginatedRenderedMessage(c telebot.Context, content string) error {
+	// Split content into chunks preserving code block boundaries
+	chunks := b.splitLongContentPreserveCodeBlocks(content)
+	if len(chunks) == 0 {
+		return nil
+	}
+
+	// Send each chunk as a separate message (no page indicators)
+	for _, chunk := range chunks {
+
+		_, err := b.sendRenderedTelegramMessage(c, chunk, false)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // formatLatestMessage formats the latest message from a session for display

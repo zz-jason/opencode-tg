@@ -10,8 +10,6 @@ import (
 )
 
 const (
-	ModePlain          = "plain"
-	ModeMarkdownFinal  = "markdown_final"
 	ModeMarkdownStream = "markdown_stream"
 )
 
@@ -44,25 +42,11 @@ func New(mode string) *Renderer {
 }
 
 func NormalizeMode(mode string) string {
-	switch strings.ToLower(strings.TrimSpace(mode)) {
-	case ModePlain:
-		return ModePlain
-	case ModeMarkdownFinal:
-		return ModeMarkdownFinal
-	case ModeMarkdownStream:
-		return ModeMarkdownStream
-	default:
-		return ModeMarkdownStream
-	}
+	return ModeMarkdownStream
 }
 
 func IsValidMode(mode string) bool {
-	switch NormalizeMode(mode) {
-	case ModePlain, ModeMarkdownFinal, ModeMarkdownStream:
-		return true
-	default:
-		return false
-	}
+	return true // All modes are normalized to markdown_stream anyway
 }
 
 func (r *Renderer) Mode() string {
@@ -85,22 +69,10 @@ func (r *Renderer) ClearCache() {
 
 // Render converts markdown text to Telegram-safe HTML depending on mode.
 func (r *Renderer) Render(text string, streaming bool) Result {
-	mode := ModeMarkdownStream
-	if r != nil {
-		mode = r.mode
-	}
-
 	result := Result{
 		Text:         text,
 		FallbackText: text,
 		UseHTML:      false,
-	}
-
-	if mode == ModePlain {
-		return result
-	}
-	if mode == ModeMarkdownFinal && streaming {
-		return result
 	}
 
 	// Check cache first for non-streaming or completed streaming
@@ -110,6 +82,7 @@ func (r *Renderer) Render(text string, streaming bool) Result {
 			result.UseHTML = true
 			return result
 		}
+
 	}
 
 	// Render and cache
@@ -213,11 +186,18 @@ func MarkdownToTelegramHTML(input string) string {
 	lines := strings.Split(input, "\n")
 	rendered := make([]string, 0, len(lines))
 	inFence := false
+	fenceHasQuote := false
 	fenceStart := ""
 	fenceLines := make([]string, 0, 16)
 
+	// State for multi-line blockquote handling
+	inBlockquote := false
+	blockquoteLines := make([]string, 0, 8)
+
 	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
+		// Check for quote prefix
+		strippedLine, hadQuote := stripQuotePrefix(line)
+		trimmed := strings.TrimSpace(strippedLine)
 
 		// Check if it's the start/end of a code block
 		// Note: single-line ```code``` should be treated as inline code, not code block
@@ -233,39 +213,93 @@ func MarkdownToTelegramHTML(input string) string {
 				// Check if there are closing backticks on the same line
 				if strings.HasSuffix(trimmed, strings.Repeat("`", backtickCount)) && len(trimmed) > backtickCount*2 {
 					// Single-line code block, treat as inline
+					// Flush any pending blockquote first
+					if inBlockquote {
+						rendered = append(rendered, renderBlockquote(blockquoteLines))
+						inBlockquote = false
+						blockquoteLines = blockquoteLines[:0]
+					}
 					rendered = append(rendered, renderMarkdownLine(line))
 					continue
 				}
 
 				// Multi-line code block starts
+				// Flush any pending blockquote first
+				if inBlockquote {
+					rendered = append(rendered, renderBlockquote(blockquoteLines))
+					inBlockquote = false
+					blockquoteLines = blockquoteLines[:0]
+				}
 				inFence = true
+				fenceHasQuote = hadQuote
 				fenceStart = line
 				fenceLines = fenceLines[:0]
+
 			} else {
 				// Code block ends
 				inFence = false
 				rendered = append(rendered, renderFenceBlock(fenceLines))
+
 			}
 			continue
 		}
 
 		if inFence {
-			fenceLines = append(fenceLines, line)
+			// If fence has quote prefix, strip it from the line
+			if fenceHasQuote {
+				stripped, _ := stripQuotePrefix(line)
+				fenceLines = append(fenceLines, stripped)
+			} else {
+				fenceLines = append(fenceLines, line)
+			}
 			continue
 		}
 
-		rendered = append(rendered, renderMarkdownLine(line))
+		// Check if this line is a blockquote (using hadQuote from stripQuotePrefix)
+		if hadQuote {
+			// This is a blockquote line (could be empty)
+			if !inBlockquote {
+				// Start a new blockquote
+				inBlockquote = true
+				blockquoteLines = blockquoteLines[:0]
+			}
+			// Add the stripped content (could be empty for lines with just >)
+			blockquoteLines = append(blockquoteLines, strippedLine)
+		} else {
+			// Not a blockquote line
+			if inBlockquote {
+				// Flush the accumulated blockquote
+				rendered = append(rendered, renderBlockquote(blockquoteLines))
+				inBlockquote = false
+				blockquoteLines = blockquoteLines[:0]
+			}
+			// Render the non-blockquote line
+			rendered = append(rendered, renderMarkdownLine(line))
+		}
+	}
+
+	// Handle any trailing blockquote
+	if inBlockquote {
+		rendered = append(rendered, renderBlockquote(blockquoteLines))
 	}
 
 	if inFence {
 		// Keep unfinished fence raw while streaming.
-		rendered = append(rendered, html.EscapeString(fenceStart))
+		// If fence has quote prefix, strip it from fenceStart
+		if fenceHasQuote {
+			strippedStart, _ := stripQuotePrefix(fenceStart)
+			rendered = append(rendered, html.EscapeString(strippedStart))
+		} else {
+			rendered = append(rendered, html.EscapeString(fenceStart))
+		}
 		for _, line := range fenceLines {
 			rendered = append(rendered, html.EscapeString(line))
 		}
 	}
 
-	return strings.Join(rendered, "\n")
+	result := strings.Join(rendered, "\n")
+
+	return result
 }
 
 func renderMarkdownLine(line string) string {
@@ -274,7 +308,59 @@ func renderMarkdownLine(line string) string {
 	if matches != nil {
 		return renderHeading(matches[1], matches[2])
 	}
+
+	// Check if it's a horizontal rule
+	trimmed := strings.TrimSpace(line)
+	if isHorizontalRule(trimmed) {
+		// Telegram HTML mode doesn't support <hr> tag, use visual separator instead
+		return "───────────────"
+	}
+
+	// Check if it's a blockquote
+	stripped, hadQuote := stripQuotePrefix(line)
+	if hadQuote {
+		// Use renderBlockquote for consistency (single line blockquote)
+		return renderBlockquote([]string{stripped})
+	}
+
 	return renderInline(line)
+}
+
+func isHorizontalRule(line string) bool {
+	if line == "" {
+		return false
+	}
+	// Check if line consists only of 3 or more -, *, or _
+	firstChar := line[0]
+	if firstChar != '-' && firstChar != '*' && firstChar != '_' {
+		return false
+	}
+	// Ensure all characters are the same
+	for i := 1; i < len(line); i++ {
+		if line[i] != firstChar {
+			return false
+		}
+	}
+	// At least 3 characters
+	return len(line) >= 3
+}
+
+// stripQuotePrefix removes leading > characters and optional spaces
+// Returns the stripped line and whether it had a quote prefix
+func stripQuotePrefix(line string) (stripped string, hadQuote bool) {
+	stripped = line
+	hadQuote = false
+
+	// Remove leading > characters
+	for len(stripped) > 0 && stripped[0] == '>' {
+		hadQuote = true
+		stripped = stripped[1:]
+		// Remove optional space after >
+		if len(stripped) > 0 && stripped[0] == ' ' {
+			stripped = stripped[1:]
+		}
+	}
+	return stripped, hadQuote
 }
 
 func renderHeading(levelMarkers, title string) string {
@@ -549,4 +635,27 @@ func renderFenceBlock(lines []string) string {
 		return "<pre><code></code></pre>"
 	}
 	return "<pre><code>" + html.EscapeString(strings.Join(lines, "\n")) + "</code></pre>"
+}
+
+func renderBlockquote(lines []string) string {
+	if len(lines) == 0 {
+		return ""
+	}
+
+	// Apply inline formatting to each line and join with <br>
+	var formattedLines []string
+	for _, line := range lines {
+		formatted := renderInline(line)
+		formattedLines = append(formattedLines, formatted)
+	}
+
+	if len(formattedLines) == 0 {
+		return ""
+	}
+
+	// Join lines with newline characters
+	// Telegram HTML parser doesn't support <br> tag, so use \n instead
+	content := strings.Join(formattedLines, "\n")
+	// Use quoted attribute value for better compatibility
+	return "<blockquote expandable=\"\">" + content + "</blockquote>"
 }

@@ -488,8 +488,13 @@ func (m *Manager) ListUserSessions(ctx context.Context, userID int64) ([]*Sessio
 		}
 	}
 
-	// Process all OpenCode sessions
+	// Process all OpenCode sessions, filter out child sessions (those with parentID)
 	for _, ocSession := range opencodeSessions {
+		// Skip sessions with parentID (child sessions like @explore subagent)
+		if ocSession.ParentID != "" {
+			log.Debugf("Skipping child session %s (parent: %s)", ocSession.ID, ocSession.ParentID)
+			continue
+		}
 		meta := m.getOrCreateSessionMeta(ocSession.ID, userID, ocSession.Metadata, ocSession.Title)
 		allSessions = append(allSessions, meta)
 	}
@@ -640,8 +645,8 @@ func (m *Manager) SetSessionModel(ctx context.Context, sessionID, providerID, mo
 	return nil
 }
 
-// RenameSession renames a session (only allowed for owned sessions)
-func (m *Manager) RenameSession(ctx context.Context, sessionID string, newName string) error {
+// RenameSession renames a session (allowed for owned or orphaned sessions)
+func (m *Manager) RenameSession(ctx context.Context, userID int64, sessionID string, newName string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -653,13 +658,29 @@ func (m *Manager) RenameSession(ctx context.Context, sessionID string, newName s
 		return fmt.Errorf("session not found: %s", sessionID)
 	}
 
-	// Check if session belongs to current user (owned)
-	if meta.Status != "owned" {
-		return fmt.Errorf("cannot rename session: session status is %s (must be owned)", meta.Status)
+	// Check if session can be renamed by this user
+	if meta.Status == "other" {
+		return fmt.Errorf("cannot rename session: session belongs to another user")
 	}
 
-	// Rename in OpenCode
-	if err := m.client.RenameSession(ctx, sessionID, newName); err != nil {
+	// If session is orphaned, assign it to the current user
+	if meta.Status == "orphaned" {
+		meta.UserID = userID
+		meta.Status = "owned"
+		log.Infof("Assigning orphaned session %s to user %d", sessionID, userID)
+	}
+
+	// Check if session is a child session (has parent)
+	ocSession, err := m.client.GetSession(ctx, sessionID)
+	if err != nil {
+		log.Warnf("Failed to fetch session %s: %v", sessionID, err)
+		// Continue with rename - OpenCode API will fail if session doesn't exist
+	} else if ocSession.ParentID != "" {
+		return fmt.Errorf("cannot rename child session: session is a subagent (parent: %s)", ocSession.ParentID)
+	}
+
+	// Rename in OpenCode (include userID in metadata)
+	if err := m.client.RenameSession(ctx, sessionID, newName, userID); err != nil {
 		return fmt.Errorf("failed to rename session in OpenCode: %w", err)
 	}
 
@@ -670,7 +691,7 @@ func (m *Manager) RenameSession(ctx context.Context, sessionID string, newName s
 		return err
 	}
 
-	log.Infof("Renamed session %s to '%s'", sessionID, newName)
+	log.Infof("Renamed session %s to '%s' for user %d", sessionID, newName, userID)
 	return nil
 }
 
@@ -684,7 +705,15 @@ func (m *Manager) DeleteSession(ctx context.Context, sessionID string) error {
 		return err
 	}
 	if !exists {
-		// Session not in local cache, still try to delete from OpenCode
+		// Session not in local cache, check if it's a child session before deleting
+		ocSession, err := m.client.GetSession(ctx, sessionID)
+		if err != nil {
+			// If we can't fetch the session, still try to delete (will fail anyway)
+			log.Warnf("Failed to fetch session %s: %v", sessionID, err)
+		} else if ocSession.ParentID != "" {
+			return fmt.Errorf("cannot delete child session: session is a subagent (parent: %s)", ocSession.ParentID)
+		}
+		// Try to delete from OpenCode
 		if err := m.client.DeleteSession(ctx, sessionID); err != nil {
 			return fmt.Errorf("failed to delete session from OpenCode: %w", err)
 		}
@@ -695,6 +724,15 @@ func (m *Manager) DeleteSession(ctx context.Context, sessionID string) error {
 	// Check if session can be deleted (owned or orphaned, not other)
 	if meta.Status == "other" {
 		return fmt.Errorf("cannot delete session: session belongs to another user")
+	}
+
+	// Check if session is a child session (has parent)
+	ocSession, err := m.client.GetSession(ctx, sessionID)
+	if err != nil {
+		log.Warnf("Failed to fetch session %s: %v", sessionID, err)
+		// Continue with delete - OpenCode API will fail if session doesn't exist
+	} else if ocSession.ParentID != "" {
+		return fmt.Errorf("cannot delete child session: session is a subagent (parent: %s)", ocSession.ParentID)
 	}
 
 	// Delete from OpenCode

@@ -179,7 +179,7 @@ func TestValidateConfig(t *testing.T) {
 				OpenCode: OpenCodeConfig{URL: "http://localhost:8080"},
 				Render:   RenderConfig{Mode: "invalid"},
 			},
-			wantErr: true,
+			wantErr: false,
 		},
 	}
 

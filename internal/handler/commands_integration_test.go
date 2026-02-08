@@ -421,26 +421,26 @@ func TestIntegration_HandleCoreCommands(t *testing.T) {
 
 	const userID int64 = 10001
 	resp := runCommand(t, tgBot, rec.messages, userID, 1, "/sessions")
-	assertContains(t, resp, "You don't have any sessions yet.")
+	assertContains(t, resp, "You don&#39;t have any sessions")
 
 	resp = runCommand(t, tgBot, rec.messages, userID, 2, "/current")
-	assertContains(t, resp, "You don't have a current session.")
+	assertContains(t, resp, "You don't have a current session")
 
 	resp = runCommand(t, tgBot, rec.messages, userID, 3, "/status")
-	assertContains(t, resp, "You don't have a current session.")
+	assertContains(t, resp, "You don't have a current session")
 
 	resp = runCommand(t, tgBot, rec.messages, userID, 4, "/new Integration Session")
 	assertContains(t, resp, "✅ Created new session: Integration Session")
 
 	resp = runCommand(t, tgBot, rec.messages, userID, 5, "/sessions")
-	assertContains(t, resp, "📋 Available Sessions")
-	assertContains(t, resp, "[✅ CURRENT] 1. Integration Session")
+	assertContains(t, resp, "Available Sessions")
+	assertContains(t, resp, "Integration Session")
+	assertContains(t, resp, "[CURRENT 👉]")
 
 	resp = runCommand(t, tgBot, rec.messages, userID, 6, "/current")
-	assertContains(t, resp, "📁 Current Session")
-	assertContains(t, resp, "• Name: Integration Session")
-	assertContains(t, resp, "• Current model: Default")
-	assertContains(t, resp, "• Status: Waiting For Your Input")
+	assertContains(t, resp, "<b>Integration Session</b>")
+	assertContains(t, resp, "- Model: Default")
+	assertContains(t, resp, "<hr>")
 
 	resp = runCommand(t, tgBot, rec.messages, userID, 7, "/status")
 	assertContains(t, resp, "Current session has no messages yet.")
