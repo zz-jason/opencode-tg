@@ -1268,17 +1268,9 @@ func (b *Bot) handleSetModel(c telebot.Context) error {
 	}
 	log.Debugf("Model selection found: %s/%s (%s)", selection.ProviderID, selection.ModelID, selection.ModelName)
 
-	// Apply the model selection with timeout - model initialization can take time
-	ctx, cancel := context.WithTimeout(b.ctx, 60*time.Second)
-	defer cancel()
-
 	log.Debugf("Calling SetSessionModel for session %s with model %s/%s", sessionID, selection.ProviderID, selection.ModelID)
-	if err := b.sessionManager.SetSessionModel(ctx, sessionID, selection.ProviderID, selection.ModelID); err != nil {
+	if err := b.sessionManager.SetSessionModel(b.ctx, sessionID, selection.ProviderID, selection.ModelID); err != nil {
 		log.Errorf("Failed to set session model: %v", err)
-		// Check if it's a timeout error
-		if strings.Contains(err.Error(), "context deadline exceeded") || strings.Contains(err.Error(), "timeout") {
-			return c.Send(fmt.Sprintf("Model setting timeout: Model initialization may take longer. Please try again later or use the default model."))
-		}
 		return c.Send(fmt.Sprintf("Failed to set model: %v", err))
 	}
 

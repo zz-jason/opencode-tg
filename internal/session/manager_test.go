@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -510,5 +511,139 @@ func TestCleanupInactiveSessions(t *testing.T) {
 	removed := manager.CleanupInactiveSessions(time.Millisecond)
 	if len(removed) > 0 {
 		t.Logf("Note: Cleanup removed %d sessions (might be expected if test runs slowly)", len(removed))
+	}
+}
+
+func TestSetSessionModelPrototypeModeSkipsInit(t *testing.T) {
+	var initCalls int32
+	sessionCounter := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case r.Method == "POST" && r.URL.Path == "/session":
+			sessionCounter++
+			sessionID := fmt.Sprintf("test-session-%d", sessionCounter)
+			response := opencode.Session{
+				ID:    sessionID,
+				Slug:  "test-slug",
+				Title: "Test Session",
+				Time: opencode.SessionTime{
+					Created: time.Now().UnixMilli(),
+					Updated: time.Now().UnixMilli(),
+				},
+			}
+			_ = json.NewEncoder(w).Encode(response)
+
+		case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/init"):
+			atomic.AddInt32(&initCalls, 1)
+			_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := opencode.NewClient(server.URL, 5)
+	manager := createTestManager(t, client)
+
+	const userID int64 = 12345
+	sessionID, err := manager.CreateNewSession(context.Background(), userID, "Prototype Session")
+	if err != nil {
+		t.Fatalf("CreateNewSession failed: %v", err)
+	}
+
+	if err := manager.SetSessionModel(context.Background(), sessionID, "deepseek", "deepseek-chat"); err != nil {
+		t.Fatalf("SetSessionModel failed: %v", err)
+	}
+
+	if calls := atomic.LoadInt32(&initCalls); calls != 0 {
+		t.Fatalf("expected no /init calls in prototype mode, got %d", calls)
+	}
+
+	meta, exists := manager.GetSessionMeta(sessionID)
+	if !exists {
+		t.Fatalf("expected session meta to exist")
+	}
+	if meta.ProviderID != "deepseek" || meta.ModelID != "deepseek-chat" {
+		t.Fatalf("unexpected session model metadata: %s/%s", meta.ProviderID, meta.ModelID)
+	}
+
+	providerID, modelID, exists, err := manager.GetUserLastModel(userID)
+	if err != nil {
+		t.Fatalf("GetUserLastModel failed: %v", err)
+	}
+	if !exists {
+		t.Fatalf("expected user last model to be stored")
+	}
+	if providerID != "deepseek" || modelID != "deepseek-chat" {
+		t.Fatalf("unexpected user last model: %s/%s", providerID, modelID)
+	}
+}
+
+func TestCreateNewSessionWithModelPrototypeModeSkipsInit(t *testing.T) {
+	var initCalls int32
+	sessionCounter := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case r.Method == "POST" && r.URL.Path == "/session":
+			sessionCounter++
+			sessionID := fmt.Sprintf("test-session-%d", sessionCounter)
+			response := opencode.Session{
+				ID:    sessionID,
+				Slug:  "test-slug",
+				Title: "Session With Model",
+				Time: opencode.SessionTime{
+					Created: time.Now().UnixMilli(),
+					Updated: time.Now().UnixMilli(),
+				},
+			}
+			_ = json.NewEncoder(w).Encode(response)
+
+		case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/init"):
+			atomic.AddInt32(&initCalls, 1)
+			_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := opencode.NewClient(server.URL, 5)
+	manager := createTestManager(t, client)
+
+	const userID int64 = 67890
+	sessionID, err := manager.CreateNewSessionWithModel(context.Background(), userID, "Named Session", "deepseek", "deepseek-chat")
+	if err != nil {
+		t.Fatalf("CreateNewSessionWithModel failed: %v", err)
+	}
+
+	if calls := atomic.LoadInt32(&initCalls); calls != 0 {
+		t.Fatalf("expected no /init calls in prototype mode, got %d", calls)
+	}
+
+	meta, exists := manager.GetSessionMeta(sessionID)
+	if !exists {
+		t.Fatalf("expected session meta to exist")
+	}
+	if meta.ProviderID != "deepseek" || meta.ModelID != "deepseek-chat" {
+		t.Fatalf("unexpected session model metadata: %s/%s", meta.ProviderID, meta.ModelID)
+	}
+
+	providerID, modelID, exists, err := manager.GetUserLastModel(userID)
+	if err != nil {
+		t.Fatalf("GetUserLastModel failed: %v", err)
+	}
+	if !exists {
+		t.Fatalf("expected user last model to be stored")
+	}
+	if providerID != "deepseek" || modelID != "deepseek-chat" {
+		t.Fatalf("unexpected user last model: %s/%s", providerID, modelID)
 	}
 }

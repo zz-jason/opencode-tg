@@ -558,12 +558,10 @@ func (m *Manager) CreateNewSessionWithModel(ctx context.Context, userID int64, n
 		return "", err
 	}
 
-	// Initialize session with the selected model if specified
+	// Prototype mode: keep model binding in session metadata and apply it per message.
+	// Do not block on /session/{id}/init because provider init can stall for a long time.
 	if providerID != "" && modelID != "" {
-		if err := m.client.InitSessionWithModel(ctx, session.ID, providerID, modelID); err != nil {
-			log.Warnf("Failed to initialize session with model %s/%s: %v", providerID, modelID, err)
-			// Continue anyway, session will use default model
-		}
+		log.Debugf("Prototype mode: skip synchronous session init for new session %s with model %s/%s", session.ID, providerID, modelID)
 	}
 
 	// Update user's last model preference if a model was specified
@@ -584,7 +582,8 @@ func (m *Manager) CreateNewSessionWithModel(ctx context.Context, userID int64, n
 	return session.ID, nil
 }
 
-// SetSessionModel sets or changes the model for an existing session
+// SetSessionModel sets or changes the model metadata for an existing session.
+// In prototype mode we rely on message-level model selection and skip /session/{id}/init.
 func (m *Manager) SetSessionModel(ctx context.Context, sessionID, providerID, modelID string) error {
 	log.Debugf("SetSessionModel: START - acquiring lock for session %s with model %s/%s", sessionID, providerID, modelID)
 	startTime := time.Now()
@@ -617,19 +616,8 @@ func (m *Manager) SetSessionModel(ctx context.Context, sessionID, providerID, mo
 		return err
 	}
 
-	// Initialize session with the selected model
 	if providerID != "" && modelID != "" {
-		log.Debugf("SetSessionModel: calling InitSessionWithModel for session %s with %s/%s", sessionID, providerID, modelID)
-		initStart := time.Now()
-		if err := m.client.InitSessionWithModel(ctx, sessionID, providerID, modelID); err != nil {
-			initTime := time.Since(initStart)
-			log.Warnf("Failed to initialize session with model %s/%s after %v: %v", providerID, modelID, initTime, err)
-			// Continue anyway, session will use default model
-			// Return a wrapped error that handlers can check if needed
-			return fmt.Errorf("model metadata updated but initialization failed: %w", err)
-		}
-		initTime := time.Since(initStart)
-		log.Debugf("SetSessionModel: successfully initialized session %s with model %s/%s after %v", sessionID, providerID, modelID, initTime)
+		log.Debugf("SetSessionModel: prototype mode skip /session/%s/init for %s/%s; model will be applied per message", sessionID, providerID, modelID)
 	}
 
 	// Update user's last model preference
