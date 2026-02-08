@@ -733,6 +733,110 @@ func TestApplyMessagePartUpdatedEventLocked_MissingPartIDIsStable(t *testing.T) 
 	}
 }
 
+func TestApplyMessagePartUpdatedEventLocked_IgnoresReplayRegression(t *testing.T) {
+	b := &Bot{}
+	state := &streamingState{
+		requestStartedAt:  time.Now().UnixMilli(),
+		initialMessageIDs: map[string]bool{},
+		eventMessages:     make(map[string]*eventMessageState),
+		displaySet:        make(map[string]bool),
+		pendingSet:        make(map[string]bool),
+	}
+
+	firstRaw, _ := json.Marshal(opencode.MessagePartUpdatedProperties{
+		Part: opencode.MessagePartResponse{
+			ID:        "part_1",
+			SessionID: "ses_test",
+			MessageID: "msg_assistant_1",
+			Type:      "text",
+			Text:      "hello world",
+		},
+		Delta: "hello world",
+	})
+	changed, _ := b.applyMessagePartUpdatedEventLocked(state, "ses_test", firstRaw)
+	if !changed {
+		t.Fatalf("expected first part update to change state")
+	}
+
+	replayRaw, _ := json.Marshal(opencode.MessagePartUpdatedProperties{
+		Part: opencode.MessagePartResponse{
+			ID:        "part_1",
+			SessionID: "ses_test",
+			MessageID: "msg_assistant_1",
+			Type:      "text",
+			Text:      "hello",
+		},
+		Delta: "hello",
+	})
+	changed, _ = b.applyMessagePartUpdatedEventLocked(state, "ses_test", replayRaw)
+	if changed {
+		t.Fatalf("expected replay regression update to be ignored")
+	}
+
+	msgState := state.eventMessages["msg_assistant_1"]
+	if msgState == nil {
+		t.Fatalf("expected message state to exist")
+	}
+	part := msgState.Parts["part_1"]
+	if part.Text != "hello world" {
+		t.Fatalf("expected text to remain at latest snapshot, got %q", part.Text)
+	}
+}
+
+func TestApplyMessagePartUpdatedEventLocked_DeltaOnlyAppends(t *testing.T) {
+	b := &Bot{}
+	state := &streamingState{
+		requestStartedAt:  time.Now().UnixMilli(),
+		initialMessageIDs: map[string]bool{},
+		eventMessages:     make(map[string]*eventMessageState),
+		displaySet:        make(map[string]bool),
+		pendingSet:        make(map[string]bool),
+	}
+
+	firstRaw, _ := json.Marshal(opencode.MessagePartUpdatedProperties{
+		Part: opencode.MessagePartResponse{
+			ID:        "part_1",
+			SessionID: "ses_test",
+			MessageID: "msg_assistant_1",
+			Type:      "text",
+			Text:      "hello",
+		},
+		Delta: "hello",
+	})
+	changed, _ := b.applyMessagePartUpdatedEventLocked(state, "ses_test", firstRaw)
+	if !changed {
+		t.Fatalf("expected first part update to change state")
+	}
+
+	deltaRaw, _ := json.Marshal(opencode.MessagePartUpdatedProperties{
+		Part: opencode.MessagePartResponse{
+			ID:        "part_1",
+			SessionID: "ses_test",
+			MessageID: "msg_assistant_1",
+			Type:      "text",
+		},
+		Delta: " world",
+	})
+	changed, _ = b.applyMessagePartUpdatedEventLocked(state, "ses_test", deltaRaw)
+	if !changed {
+		t.Fatalf("expected delta-only update to append and change state")
+	}
+
+	msgState := state.eventMessages["msg_assistant_1"]
+	if msgState == nil {
+		t.Fatalf("expected message state to exist")
+	}
+	part := msgState.Parts["part_1"]
+	if part.Text != "hello world" {
+		t.Fatalf("expected appended text, got %q", part.Text)
+	}
+
+	changed, _ = b.applyMessagePartUpdatedEventLocked(state, "ses_test", deltaRaw)
+	if changed {
+		t.Fatalf("expected repeated delta-only replay to be ignored")
+	}
+}
+
 func TestReconcileEventStateWithMessagesLocked_MissingPartIDDoesNotDuplicate(t *testing.T) {
 	b := &Bot{}
 	state := &streamingState{
@@ -777,13 +881,87 @@ func TestReconcileEventStateWithMessagesLocked_MissingPartIDDoesNotDuplicate(t *
 	}
 }
 
-func TestEventPipelineSettledLocked_UsesIdleFallbackWithoutExplicitFinish(t *testing.T) {
+func TestMissingPartIDSyntheticIDConsistentBetweenEventAndSnapshot(t *testing.T) {
 	b := &Bot{}
 	now := time.Now()
 	state := &streamingState{
-		hasEventUpdates: true,
-		lastEventAt:     now.Add(-(eventSettleIdleWindow + time.Second)),
-		activeMessageID: "msg_assistant_1",
+		sessionID:         "ses_test",
+		requestStartedAt:  now.UnixMilli(),
+		initialMessageIDs: map[string]bool{},
+		eventMessages:     make(map[string]*eventMessageState),
+		displaySet:        map[string]bool{"msg_assistant_1": true},
+		displayOrder:      []string{"msg_assistant_1"},
+		pendingSet:        make(map[string]bool),
+		activeMessageID:   "msg_assistant_1",
+	}
+	state.eventMessages["msg_assistant_1"] = &eventMessageState{
+		Info: opencode.MessageInfo{
+			ID:        "msg_assistant_1",
+			SessionID: "ses_test",
+			Role:      "assistant",
+			Time: opencode.MessageTime{
+				Created: now.UnixMilli(),
+			},
+		},
+		PartOrder: []string{},
+		Parts:     map[string]opencode.MessagePartResponse{},
+	}
+
+	partRaw, _ := json.Marshal(opencode.MessagePartUpdatedProperties{
+		Part: opencode.MessagePartResponse{
+			SessionID: "ses_test",
+			MessageID: "msg_assistant_1",
+			Type:      "text",
+			Text:      "hello",
+		},
+		Delta: "hello",
+	})
+
+	changed, _ := b.applyMessagePartUpdatedEventLocked(state, "ses_test", partRaw)
+	if !changed {
+		t.Fatalf("expected first missing-id event part to update state")
+	}
+
+	snapshot := opencode.Message{
+		ID:        "msg_assistant_1",
+		SessionID: "ses_test",
+		Role:      "assistant",
+		CreatedAt: now,
+		Parts: []interface{}{
+			opencode.MessagePartResponse{
+				SessionID: "ses_test",
+				MessageID: "msg_assistant_1",
+				Type:      "text",
+				Text:      "hello",
+			},
+		},
+	}
+	b.reconcileEventStateWithMessagesLocked(state, []opencode.Message{snapshot})
+
+	msgState := state.eventMessages["msg_assistant_1"]
+	if msgState == nil {
+		t.Fatalf("expected message state to exist")
+	}
+	if len(msgState.Parts) != 1 || len(msgState.PartOrder) != 1 {
+		t.Fatalf("expected one synthesized part after reconcile, got parts=%d order=%d", len(msgState.Parts), len(msgState.PartOrder))
+	}
+
+	changed, _ = b.applyMessagePartUpdatedEventLocked(state, "ses_test", partRaw)
+	if changed {
+		t.Fatalf("expected duplicate missing-id event part to be ignored after reconcile")
+	}
+	if len(msgState.Parts) != 1 || len(msgState.PartOrder) != 1 {
+		t.Fatalf("expected one synthesized part after duplicate event, got parts=%d order=%d", len(msgState.Parts), len(msgState.PartOrder))
+	}
+}
+
+func TestReconcileEventStateWithMessagesLocked_EquivalentContentDoesNotBumpRevision(t *testing.T) {
+	b := &Bot{}
+	now := time.Now()
+	state := &streamingState{
+		sessionID:         "ses_test",
+		requestStartedAt:  now.UnixMilli(),
+		initialMessageIDs: map[string]bool{},
 		eventMessages: map[string]*eventMessageState{
 			"msg_assistant_1": {
 				Info: opencode.MessageInfo{
@@ -794,26 +972,50 @@ func TestEventPipelineSettledLocked_UsesIdleFallbackWithoutExplicitFinish(t *tes
 						Created: now.UnixMilli(),
 					},
 				},
+				PartOrder: []string{"text:event-fallback"},
+				Parts: map[string]opencode.MessagePartResponse{
+					"text:event-fallback": {
+						ID:        "text:event-fallback",
+						SessionID: "ses_test",
+						MessageID: "msg_assistant_1",
+						Type:      "text",
+						Text:      "stable text",
+					},
+				},
+			},
+		},
+		activeMessageID: "msg_assistant_1",
+		displaySet:      map[string]bool{"msg_assistant_1": true},
+		displayOrder:    []string{"msg_assistant_1"},
+		pendingSet:      make(map[string]bool),
+		revision:        7,
+	}
+
+	message := opencode.Message{
+		ID:        "msg_assistant_1",
+		SessionID: "ses_test",
+		Role:      "assistant",
+		CreatedAt: now,
+		Parts: []interface{}{
+			opencode.MessagePartResponse{
+				SessionID: "ses_test",
+				MessageID: "msg_assistant_1",
+				Type:      "text",
+				Text:      "stable text",
 			},
 		},
 	}
 
-	if !b.eventPipelineSettledLocked(state, true) {
-		t.Fatalf("expected idle fallback settle when no finish marker arrives")
-	}
-
-	state.lastEventAt = now
-	if b.eventPipelineSettledLocked(state, true) {
-		t.Fatalf("did not expect settle immediately after a recent event")
+	b.reconcileEventStateWithMessagesLocked(state, []opencode.Message{message})
+	if state.revision != 7 {
+		t.Fatalf("expected revision to stay stable for equivalent part content, got %d", state.revision)
 	}
 }
 
-func TestEventPipelineSettledLocked_CompletedMessageRequiresQuietWindow(t *testing.T) {
+func TestEventPipelineSettledLocked_RequiresExplicitCompletionSignal(t *testing.T) {
 	b := &Bot{}
 	now := time.Now()
 	state := &streamingState{
-		hasEventUpdates: true,
-		lastEventAt:     now,
 		activeMessageID: "msg_assistant_1",
 		eventMessages: map[string]*eventMessageState{
 			"msg_assistant_1": {
@@ -831,12 +1033,29 @@ func TestEventPipelineSettledLocked_CompletedMessageRequiresQuietWindow(t *testi
 		},
 	}
 
-	if b.eventPipelineSettledLocked(state, true) {
-		t.Fatalf("did not expect immediate settle right after completion marker")
+	if !b.eventPipelineSettledLocked(state, true) {
+		t.Fatalf("expected settled when active message has completion marker")
 	}
 
-	state.lastEventAt = now.Add(-(eventSettleCompletionQuietWindow + time.Second))
-	if !b.eventPipelineSettledLocked(state, true) {
-		t.Fatalf("expected settle after completion quiet window elapsed")
+	state.eventMessages["msg_assistant_1"].Info.Time.Completed = 0
+	state.eventMessages["msg_assistant_1"].Info.Finish = ""
+	if b.eventPipelineSettledLocked(state, true) {
+		t.Fatalf("expected not settled without explicit completion markers")
+	}
+}
+
+func TestEventPipelineNoOutputCandidateLocked(t *testing.T) {
+	b := &Bot{}
+	state := &streamingState{
+		eventMessages: make(map[string]*eventMessageState),
+	}
+
+	if !b.eventPipelineNoOutputCandidateLocked(state, true) {
+		t.Fatalf("expected no-output candidate when no events or displays were produced")
+	}
+
+	state.hasEventUpdates = true
+	if b.eventPipelineNoOutputCandidateLocked(state, true) {
+		t.Fatalf("did not expect no-output candidate after event updates appear")
 	}
 }

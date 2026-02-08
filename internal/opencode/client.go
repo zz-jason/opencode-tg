@@ -413,6 +413,7 @@ func (c *Client) GetMessages(ctx context.Context, sessionID string) ([]Message, 
 
 	// Convert to Message slice
 	messages := make([]Message, len(msgResponses))
+	messageIDs := make([]string, 0, len(msgResponses))
 	for i, msgResp := range msgResponses {
 		msg := Message{
 			ID:         msgResp.Info.ID,
@@ -444,9 +445,29 @@ func (c *Client) GetMessages(ctx context.Context, sessionID string) ([]Message, 
 		}
 
 		messages[i] = msg
+		if msg.ID != "" {
+			messageIDs = append(messageIDs, msg.ID)
+		}
 	}
 
+	log.Infof("OpenCode API message snapshot: path=/session/%s/message count=%d message_ids=%s", sessionID, len(messages), formatMessageIDsForLog(messageIDs, 30))
+
 	return messages, nil
+}
+
+func formatMessageIDsForLog(ids []string, max int) string {
+	if len(ids) == 0 {
+		return "[]"
+	}
+	if max <= 0 || max > len(ids) {
+		max = len(ids)
+	}
+
+	preview := strings.Join(ids[:max], ",")
+	if len(ids) > max {
+		return fmt.Sprintf("[%s,...(+%d)]", preview, len(ids)-max)
+	}
+	return fmt.Sprintf("[%s]", preview)
 }
 
 // AbortSession aborts the current execution in a session

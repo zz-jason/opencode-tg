@@ -26,12 +26,12 @@ const (
 	maxTelegramMessages = 20
 	// telegramMessageMaxLength is Telegram's hard message size limit.
 	telegramMessageMaxLength = 4096
-	// eventSettleCompletionQuietWindow is the quiet period required after an explicit
-	// completion marker to avoid exiting before late-arriving follow-up message IDs.
-	eventSettleCompletionQuietWindow = 3 * time.Second
-	// eventSettleIdleWindow is the quiet period after send completion used as a
-	// fallback settle signal when upstream does not emit explicit finish markers.
-	eventSettleIdleWindow = 45 * time.Second
+	// eventSettleStableReconciles requires this many unchanged reconcile passes
+	// before considering stream state settled.
+	eventSettleStableReconciles = 2
+	// noOutputStableReconciles avoids long blocking when provider returns no
+	// assistant output at all.
+	noOutputStableReconciles = 3
 )
 
 // Bot represents the Telegram bot with all dependencies
@@ -102,6 +102,7 @@ type streamingState struct {
 	pendingSet        map[string]bool
 	lastEventAt       time.Time
 	hasEventUpdates   bool
+	revision          uint64
 
 	isStreaming bool
 	isComplete  bool
@@ -1340,13 +1341,22 @@ func (b *Bot) handleText(c telebot.Context) error {
 	}
 
 	// Cancel any existing streaming for this session
+	cancelledExistingStream := false
 	b.streamingStateMu.Lock()
 	if existingState, ok := b.streamingStates[sessionID]; ok && existingState.isStreaming {
 		existingState.cancel()
 		existingState.isStreaming = false
 		log.Infof("Cancelled existing streaming for session %s before starting new request", sessionID)
+		cancelledExistingStream = true
 	}
 	b.streamingStateMu.Unlock()
+	if cancelledExistingStream {
+		abortCtx, abortCancel := context.WithTimeout(b.ctx, 5*time.Second)
+		if abortErr := b.opencodeClient.AbortSession(abortCtx, sessionID); abortErr != nil {
+			log.Warnf("Failed to abort previous session execution for %s: %v", sessionID, abortErr)
+		}
+		abortCancel()
+	}
 
 	// Send initial "processing" message
 	processingMsg, err := b.sendRenderedTelegramMessage(c, "🤖 Processing...", true)
@@ -1442,13 +1452,19 @@ func (b *Bot) handleText(c telebot.Context) error {
 		sendReq.Model = messageModel
 	}
 
+	modelLabel := "unknown"
+	if messageModel != nil {
+		modelLabel = messageModel.ProviderID + "/" + messageModel.ModelID
+	}
+	log.Infof("Dispatching OpenCode message: session=%s request_message_id=%s model=%s text_len=%d", sessionID, requestMessageID, modelLabel, len(text))
+
 	sendErrCh := make(chan error, 1)
 	go func() {
 		sendErrCh <- b.opencodeClient.PostMessage(ctx, sessionID, sendReq)
 	}()
 
-	sendErr := <-sendErrCh
-	streamingState.isComplete = true
+	sendCompleted := false
+	var sendErr error
 
 	// Always reconcile against final snapshots to close any missed event gaps.
 	b.reconcileEventStateWithLatestMessages(streamingState)
@@ -1462,28 +1478,64 @@ func (b *Bot) handleText(c telebot.Context) error {
 	}
 	settleDeadline := time.Now().Add(settleTimeout)
 	lastReconcileAt := time.Now()
-	noOutputSince := time.Now()
+	settleStablePasses := 0
+	noOutputPasses := 0
+	var settleCandidateRevision uint64
+	hasSettleCandidateRevision := false
 	for {
+		if !sendCompleted {
+			select {
+			case sendErr = <-sendErrCh:
+				sendCompleted = true
+				streamingState.isComplete = true
+				if sendErr != nil {
+					log.Warnf("OpenCode PostMessage finished with error for session %s request_message_id=%s: %v", sessionID, requestMessageID, sendErr)
+				} else {
+					log.Infof("OpenCode PostMessage acknowledged for session %s request_message_id=%s", sessionID, requestMessageID)
+				}
+			default:
+			}
+		}
+
+		performedReconcile := false
 		if time.Since(lastReconcileAt) >= time.Second {
 			b.reconcileEventStateWithLatestMessages(streamingState)
 			lastReconcileAt = time.Now()
+			performedReconcile = true
 		}
 
 		streamingState.updateMutex.Lock()
 		for b.tryPromoteNextActiveMessage(streamingState) {
 		}
 		b.flushEventDisplaysLocked(streamingState, true)
-		settled := b.eventPipelineSettledLocked(streamingState, true)
-		hasOutput := len(streamingState.displayOrder) > 0
-		hasEvents := streamingState.hasEventUpdates
-		if hasOutput {
-			noOutputSince = time.Now()
-		}
-		if !hasOutput && !hasEvents && time.Since(noOutputSince) >= 3*time.Second {
-			// Some providers return quickly with no assistant output.
-			settled = true
-		}
+		hasEventUpdates := streamingState.hasEventUpdates
+		settleCandidate := b.eventPipelineSettledLocked(streamingState, sendCompleted || hasEventUpdates)
+		noOutputCandidate := b.eventPipelineNoOutputCandidateLocked(streamingState, sendCompleted)
+		revision := streamingState.revision
 		streamingState.updateMutex.Unlock()
+
+		if performedReconcile {
+			if settleCandidate {
+				if hasSettleCandidateRevision && revision == settleCandidateRevision {
+					settleStablePasses++
+				} else {
+					settleStablePasses = 1
+					settleCandidateRevision = revision
+					hasSettleCandidateRevision = true
+				}
+			} else {
+				settleStablePasses = 0
+				hasSettleCandidateRevision = false
+			}
+
+			if noOutputCandidate {
+				noOutputPasses++
+			} else {
+				noOutputPasses = 0
+			}
+		}
+
+		settled := settleStablePasses >= eventSettleStableReconciles || noOutputPasses >= noOutputStableReconciles
 
 		if settled || time.Now().After(settleDeadline) {
 			break
@@ -1506,6 +1558,14 @@ func (b *Bot) handleText(c telebot.Context) error {
 	case <-time.After(2 * time.Second):
 		log.Warnf("Timed out waiting for event stream to stop for session %s", sessionID)
 	}
+	if !sendCompleted {
+		select {
+		case sendErr = <-sendErrCh:
+			sendCompleted = true
+			streamingState.isComplete = true
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
 
 	streamingState.updateMutex.Lock()
 	for b.tryPromoteNextActiveMessage(streamingState) {
@@ -1514,14 +1574,14 @@ func (b *Bot) handleText(c telebot.Context) error {
 	if len(displays) > 0 {
 		b.updateStreamingTelegramMessages(streamingState, displays)
 		streamingState.updateMutex.Unlock()
-		if sendErr != nil {
+		if sendCompleted && sendErr != nil {
 			log.Warnf("SendMessage returned error after event rendering completed: %v", sendErr)
 		}
 		return nil
 	}
 	streamingState.updateMutex.Unlock()
 
-	if sendErr != nil {
+	if sendCompleted && sendErr != nil {
 		errorMsg := fmt.Sprintf("Processing error: %v", sendErr)
 		b.updateTelegramMessage(c, processingMsg, errorMsg, false)
 		return nil
@@ -1909,7 +1969,9 @@ func (b *Bot) consumeSessionEvents(ctx context.Context, state *streamingState, s
 			return
 		}
 
+		receivedEvents := false
 		err := b.opencodeClient.StreamSessionEvents(ctx, func(event opencode.SessionEvent) error {
+			receivedEvents = true
 			state.updateMutex.Lock()
 			changed, forceFlush := b.applySessionEventLocked(state, sessionID, event)
 			if !changed {
@@ -1919,13 +1981,13 @@ func (b *Bot) consumeSessionEvents(ctx context.Context, state *streamingState, s
 
 			state.hasEventUpdates = true
 			state.lastEventAt = time.Now()
+			state.revision++
 			for b.tryPromoteNextActiveMessage(state) {
 			}
 			b.flushEventDisplaysLocked(state, forceFlush)
 			state.updateMutex.Unlock()
 			return nil
 		})
-		backoff = 200 * time.Millisecond
 
 		if ctx.Err() != nil {
 			return
@@ -1936,19 +1998,23 @@ func (b *Bot) consumeSessionEvents(ctx context.Context, state *streamingState, s
 			log.Warnf("Event stream closed unexpectedly for session %s", sessionID)
 		}
 
-		b.reconcileEventStateWithLatestMessages(state)
+		// Only reconcile after a stream that had events. This avoids turning
+		// repeated connection failures into high-frequency snapshot polling.
+		if receivedEvents {
+			b.reconcileEventStateWithLatestMessages(state)
+			backoff = 200 * time.Millisecond
+		} else if backoff < 3*time.Second {
+			backoff *= 2
+			if backoff > 3*time.Second {
+				backoff = 3 * time.Second
+			}
+		}
 
 		wait := backoff
-		if wait > 3*time.Second {
-			wait = 3 * time.Second
-		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(wait):
-		}
-		if backoff < 3*time.Second {
-			backoff *= 2
 		}
 	}
 }
@@ -2015,7 +2081,10 @@ func (b *Bot) applyMessagePartUpdatedEventLocked(state *streamingState, sessionI
 	}
 
 	msgState := b.getOrCreateEventMessageStateLocked(state, part.MessageID)
-	changed := upsertEventPartLocked(msgState, part, fallbackEventPartKey(part))
+	if strings.TrimSpace(part.ID) == "" {
+		part.ID = synthesizePartID(part, 0)
+	}
+	changed := upsertEventPartLocked(msgState, part, payload.Delta)
 	return changed, false
 }
 
@@ -2194,20 +2263,20 @@ func (b *Bot) eventPipelineSettledLocked(state *streamingState, sendCompleted bo
 		return len(state.displayOrder) > 0 || state.hasEventUpdates
 	}
 	active := state.eventMessages[state.activeMessageID]
-	if isEventMessageCompleted(active) {
-		if state.lastEventAt.IsZero() {
-			return true
-		}
-		// Keep listening briefly after completion in case provider emits the
-		// next message ID slightly later.
-		return time.Since(state.lastEventAt) >= eventSettleCompletionQuietWindow
+	return isEventMessageCompleted(active)
+}
+
+func (b *Bot) eventPipelineNoOutputCandidateLocked(state *streamingState, sendCompleted bool) bool {
+	if state == nil || !sendCompleted {
+		return false
 	}
-	// Fallback settle condition: if send request has completed and no new event/snapshot
-	// changes were observed for a while, treat active message as converged.
-	if !state.lastEventAt.IsZero() && time.Since(state.lastEventAt) >= eventSettleIdleWindow {
-		return true
+	if len(state.pendingOrder) > 0 {
+		return false
 	}
-	return false
+	if state.activeMessageID != "" {
+		return false
+	}
+	return len(state.displayOrder) == 0 && !state.hasEventUpdates
 }
 
 func isEventMessageCompleted(msg *eventMessageState) bool {
@@ -2297,33 +2366,7 @@ func sortedEventParts(msg *eventMessageState) []opencode.MessagePartResponse {
 		return nil
 	}
 
-	ordered := make([]opencode.MessagePartResponse, 0, len(msg.Parts))
-	seen := make(map[string]bool, len(msg.Parts))
-	for _, partID := range msg.PartOrder {
-		part, exists := msg.Parts[partID]
-		if !exists {
-			continue
-		}
-		ordered = append(ordered, part)
-		seen[partID] = true
-	}
-
-	if len(ordered) == len(msg.Parts) {
-		return ordered
-	}
-
-	remainingIDs := make([]string, 0, len(msg.Parts)-len(ordered))
-	for partID := range msg.Parts {
-		if seen[partID] {
-			continue
-		}
-		remainingIDs = append(remainingIDs, partID)
-	}
-	sort.Strings(remainingIDs)
-	for _, partID := range remainingIDs {
-		ordered = append(ordered, msg.Parts[partID])
-	}
-	return ordered
+	return orderedParts(msg.PartOrder, msg.Parts)
 }
 
 func formatEventMessageParts(parts []opencode.MessagePartResponse) string {
@@ -2426,14 +2469,12 @@ func (b *Bot) reconcileEventStateWithMessagesLocked(state *streamingState, messa
 			stateChanged = true
 		}
 
-		for index, rawPart := range msg.Parts {
-			part, ok := rawPart.(opencode.MessagePartResponse)
-			if !ok {
-				continue
-			}
-			if upsertEventPartLocked(msgState, part, fallbackSnapshotPartKey(index, part)) {
-				stateChanged = true
-			}
+		nextParts, nextOrder, partsChanged := buildSnapshotMessageParts(msg.Parts, msgState)
+		if partsChanged {
+			msgState.Parts = nextParts
+			msgState.PartOrder = nextOrder
+			msgState.LastEvent = time.Now()
+			stateChanged = true
 		}
 
 		if role := strings.ToLower(strings.TrimSpace(msgState.Info.Role)); role != "user" && role != "" {
@@ -2449,21 +2490,27 @@ func (b *Bot) reconcileEventStateWithMessagesLocked(state *streamingState, messa
 	if stateChanged {
 		state.hasEventUpdates = true
 		state.lastEventAt = time.Now()
+		state.revision++
 	}
 }
 
-func upsertEventPartLocked(msgState *eventMessageState, part opencode.MessagePartResponse, fallbackKey string) bool {
+func upsertEventPartLocked(msgState *eventMessageState, part opencode.MessagePartResponse, delta string) bool {
 	if msgState == nil {
 		return false
 	}
 
 	partID := strings.TrimSpace(part.ID)
 	if partID == "" {
-		partID = fallbackPartID(part, fallbackKey)
+		partID = synthesizePartID(part, 0)
 		part.ID = partID
 	}
 
+	part = normalizeIncomingPart(part, delta)
+
 	existing, exists := msgState.Parts[partID]
+	if exists {
+		part = mergeEventPart(existing, part, delta)
+	}
 	if exists && sameEventPart(existing, part) {
 		return false
 	}
@@ -2476,46 +2523,226 @@ func upsertEventPartLocked(msgState *eventMessageState, part opencode.MessagePar
 	return true
 }
 
-func fallbackPartID(part opencode.MessagePartResponse, fallbackKey string) string {
-	normalizedType := strings.TrimSpace(part.Type)
-	if normalizedType == "" {
-		normalizedType = "part"
-	}
-	if callID := strings.TrimSpace(part.CallID); callID != "" {
-		return "call:" + callID
-	}
-	if fallbackKey == "" {
-		fallbackKey = "single"
-	}
-	if tool := strings.TrimSpace(part.Tool); tool != "" {
-		return fmt.Sprintf("%s:%s:%s", normalizedType, tool, fallbackKey)
-	}
-	return fmt.Sprintf("%s:%s", normalizedType, fallbackKey)
+func normalizeIncomingPart(part opencode.MessagePartResponse, delta string) opencode.MessagePartResponse {
+	_ = delta
+	return part
 }
 
-func fallbackEventPartKey(part opencode.MessagePartResponse) string {
+func mergeEventPart(existing, incoming opencode.MessagePartResponse, delta string) opencode.MessagePartResponse {
+	merged := incoming
+
+	if merged.Type == "" {
+		merged.Type = existing.Type
+	}
+	if merged.SessionID == "" {
+		merged.SessionID = existing.SessionID
+	}
+	if merged.MessageID == "" {
+		merged.MessageID = existing.MessageID
+	}
+	if merged.Tool == "" {
+		merged.Tool = existing.Tool
+	}
+	if merged.Snapshot == "" {
+		merged.Snapshot = existing.Snapshot
+	}
+	if merged.Reason == "" {
+		merged.Reason = existing.Reason
+	}
+	if merged.CallID == "" {
+		merged.CallID = existing.CallID
+	}
+	if merged.State == nil {
+		merged.State = existing.State
+	}
+
+	if isAppendOnlyPartType(merged.Type) {
+		merged.Text = mergeAppendOnlyText(existing.Text, merged.Text, delta)
+	}
+
+	return merged
+}
+
+func isAppendOnlyPartType(partType string) bool {
+	switch strings.ToLower(strings.TrimSpace(partType)) {
+	case "text", "reasoning":
+		return true
+	default:
+		return false
+	}
+}
+
+func mergeAppendOnlyText(existingText, incomingText, delta string) string {
+	if incomingText == "" && delta != "" {
+		if existingText == "" {
+			return delta
+		}
+		if strings.HasSuffix(existingText, delta) {
+			return existingText
+		}
+		return existingText + delta
+	}
+
+	if existingText == "" {
+		return incomingText
+	}
+	if incomingText == "" {
+		return existingText
+	}
+
+	// Replayed historical snapshots should not regress rendered content.
+	if strings.HasPrefix(existingText, incomingText) {
+		return existingText
+	}
+	// Normal forward growth.
+	if strings.HasPrefix(incomingText, existingText) {
+		return incomingText
+	}
+	// Prefer the longer candidate to avoid oscillation on reconnect replay.
+	if len(incomingText) < len(existingText) {
+		return existingText
+	}
+	return incomingText
+}
+
+func buildSnapshotMessageParts(rawParts []interface{}, msgState *eventMessageState) (map[string]opencode.MessagePartResponse, []string, bool) {
+	nextParts := make(map[string]opencode.MessagePartResponse, len(rawParts))
+	nextOrder := make([]string, 0, len(rawParts))
+	seenOrder := make(map[string]bool, len(rawParts))
+	occurrences := make(map[string]int)
+
+	for _, rawPart := range rawParts {
+		part, ok := rawPart.(opencode.MessagePartResponse)
+		if !ok {
+			continue
+		}
+
+		partID := strings.TrimSpace(part.ID)
+		if partID == "" {
+			partID = fallbackSnapshotPartID(part, occurrences)
+			part.ID = partID
+		}
+		if !seenOrder[partID] {
+			nextOrder = append(nextOrder, partID)
+			seenOrder[partID] = true
+		}
+		nextParts[partID] = part
+	}
+
+	if msgState == nil {
+		return nextParts, nextOrder, len(nextOrder) > 0
+	}
+
+	currentOrdered := orderedParts(msgState.PartOrder, msgState.Parts)
+	nextOrdered := orderedParts(nextOrder, nextParts)
+	if sameOrderedPartContent(currentOrdered, nextOrdered) {
+		return nextParts, nextOrder, false
+	}
+	return nextParts, nextOrder, true
+}
+
+func fallbackSnapshotPartID(part opencode.MessagePartResponse, occurrences map[string]int) string {
+	signature := snapshotPartSignature(part)
+	index := occurrences[signature]
+	occurrences[signature] = index + 1
+	return synthesizePartID(part, index)
+}
+
+func synthesizePartID(part opencode.MessagePartResponse, occurrence int) string {
 	if callID := strings.TrimSpace(part.CallID); callID != "" {
-		return "event-call:" + callID
+		if occurrence <= 0 {
+			return "call:" + callID
+		}
+		return fmt.Sprintf("call:%s:%d", callID, occurrence)
 	}
-	if tool := strings.TrimSpace(part.Tool); tool != "" {
-		return "event-tool:" + tool
+
+	signature := snapshotPartSignature(part)
+	if occurrence <= 0 {
+		return "synth:" + signature
 	}
+	return fmt.Sprintf("synth:%s:%d", signature, occurrence)
+}
+
+func snapshotPartSignature(part opencode.MessagePartResponse) string {
 	partType := strings.TrimSpace(part.Type)
 	if partType == "" {
 		partType = "part"
 	}
-	return "event-type:" + partType
+	callID := strings.TrimSpace(part.CallID)
+	tool := strings.TrimSpace(part.Tool)
+	reason := strings.TrimSpace(part.Reason)
+	if reason == "" {
+		reason = "-"
+	}
+	if callID == "" {
+		callID = "-"
+	}
+	if tool == "" {
+		tool = "-"
+	}
+	return fmt.Sprintf("%s|tool=%s|call=%s|reason=%s", partType, tool, callID, reason)
 }
 
-func fallbackSnapshotPartKey(index int, part opencode.MessagePartResponse) string {
-	if callID := strings.TrimSpace(part.CallID); callID != "" {
-		return "snapshot-call:" + callID
+func orderedParts(partOrder []string, parts map[string]opencode.MessagePartResponse) []opencode.MessagePartResponse {
+	if len(parts) == 0 {
+		return nil
 	}
-	partType := strings.TrimSpace(part.Type)
-	if partType == "" {
-		partType = "part"
+
+	ordered := make([]opencode.MessagePartResponse, 0, len(parts))
+	seen := make(map[string]bool, len(parts))
+	for _, partID := range partOrder {
+		part, exists := parts[partID]
+		if !exists {
+			continue
+		}
+		ordered = append(ordered, part)
+		seen[partID] = true
 	}
-	return fmt.Sprintf("snapshot-%s-%d", partType, index)
+
+	if len(ordered) == len(parts) {
+		return ordered
+	}
+
+	remainingIDs := make([]string, 0, len(parts)-len(ordered))
+	for partID := range parts {
+		if seen[partID] {
+			continue
+		}
+		remainingIDs = append(remainingIDs, partID)
+	}
+	sort.Strings(remainingIDs)
+	for _, partID := range remainingIDs {
+		ordered = append(ordered, parts[partID])
+	}
+	return ordered
+}
+
+func sameOrderedPartContent(left, right []opencode.MessagePartResponse) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if !sameEventPartContent(left[i], right[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func sameEventPartContent(left, right opencode.MessagePartResponse) bool {
+	if left.Type != right.Type || left.Text != right.Text {
+		return false
+	}
+	if left.Tool != right.Tool || left.Snapshot != right.Snapshot || left.Reason != right.Reason {
+		return false
+	}
+	if left.CallID != right.CallID {
+		return false
+	}
+	if stringifyToolValue(left.State) != stringifyToolValue(right.State) {
+		return false
+	}
+	return true
 }
 
 func sameEventPart(left, right opencode.MessagePartResponse) bool {
