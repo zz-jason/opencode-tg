@@ -233,22 +233,12 @@ func (b *Bot) Start() {
 	}
 
 	// Register command handlers
-	b.tgBot.Handle("/start", b.withTelegramInterfaceLog("/start", b.handleStart))
 	b.tgBot.Handle("/help", b.withTelegramInterfaceLog("/help", b.handleHelp))
 	b.tgBot.Handle("/sessions", b.withTelegramInterfaceLog("/sessions", b.handleSessions))
 	b.tgBot.Handle("/new", b.withTelegramInterfaceLog("/new", b.handleNew))
 	b.tgBot.Handle("/switch", b.withTelegramInterfaceLog("/switch", b.handleSwitch))
-	b.tgBot.Handle("/current", b.withTelegramInterfaceLog("/current", b.handleCurrent))
 	b.tgBot.Handle("/abort", b.withTelegramInterfaceLog("/abort", b.handleAbort))
-	b.tgBot.Handle("/files", b.withTelegramInterfaceLog("/files", b.handleFiles))
-	b.tgBot.Handle("/search", b.withTelegramInterfaceLog("/search", b.handleSearch))
-	b.tgBot.Handle("/findfile", b.withTelegramInterfaceLog("/findfile", b.handleFindFile))
-	b.tgBot.Handle("/symbol", b.withTelegramInterfaceLog("/symbol", b.handleSymbol))
-	b.tgBot.Handle("/agent", b.withTelegramInterfaceLog("/agent", b.handleAgent))
-	b.tgBot.Handle("/command", b.withTelegramInterfaceLog("/command", b.handleCommand))
-	b.tgBot.Handle("/status", b.withTelegramInterfaceLog("/status", b.handleStatus))
 	b.tgBot.Handle("/models", b.withTelegramInterfaceLog("/models", b.handleModels))
-	b.tgBot.Handle("/providers", b.withTelegramInterfaceLog("/providers", b.handleProviders))
 	b.tgBot.Handle("/setmodel", b.withTelegramInterfaceLog("/setmodel", b.handleSetModel))
 	b.tgBot.Handle("/rename", b.withTelegramInterfaceLog("/rename", b.handleRename))
 	b.tgBot.Handle("/delete", b.withTelegramInterfaceLog("/delete", b.handleDelete))
@@ -257,64 +247,21 @@ func (b *Bot) Start() {
 	b.tgBot.Handle(telebot.OnText, b.withTelegramInterfaceLog("OnText", b.handleText))
 }
 
-// handleStart handles the /start command
-func (b *Bot) handleStart(c telebot.Context) error {
-	user := c.Sender()
-	message := fmt.Sprintf(`👋 Hello %s!
-
-Welcome to OpenCode Telegram Bot.
-
-I am an AI programming assistant that can help you:
-• Write and refactor code
-• Answer programming questions
-• Browse project files
-• Search code and symbols
-
-Basic commands:
-/start - Show this help message
-/help - Show detailed help
-/sessions - List your sessions
-/new [name] - Create a new session
-/switch <sessionID> - Switch session
-/current - Show current session
-/status - Check current task status
-
-Send any non-command text and I'll send it as an instruction to OpenCode.
-
-Use /help to see all available commands.`, user.FirstName)
-
-	return c.Send(message)
-}
-
 // handleHelp handles the /help command
 func (b *Bot) handleHelp(c telebot.Context) error {
 	helpText := `📚 OpenCode Bot Help
 
 Core Commands:
-• /start - Show welcome message
 • /help - Show this help
 • /sessions - List all sessions
 • /new [name] - Create new session
 • /switch <number> - Switch current session
 • /rename <number> <name> - Rename a session
 • /delete <number> - Delete a session
-• /current - Show current session information
 • /abort - Abort current task
-• /status - Check current task status
-
-File Operations:
-• /files [path] - Browse project files (default: current directory)
-• /search <pattern> - Search code text
-• /findfile <pattern> - Search for files
-• /symbol <symbol> - Search symbols (functions, classes, etc.)
-
-System Information:
-• /agent - List available AI agents
-• /command - List available commands
 
 Model Selection:
 • /models - List available AI models (with numbers)
-• /providers - List AI providers
 • /setmodel <number> - Set model for current session
 
 Interactive Mode:
@@ -494,115 +441,6 @@ func (b *Bot) handleSwitch(c telebot.Context) error {
 	return c.Send(fmt.Sprintf("✅ Session switched to:\n\n%d. %s", sessionNumber, foundSession.Name))
 }
 
-// handleCurrent handles the /current command
-func (b *Bot) handleCurrent(c telebot.Context) error {
-	userID := c.Sender().ID
-	sessionID, exists := b.sessionManager.GetUserSession(userID)
-
-	if !exists {
-		_, err := b.sendRenderedTelegramMessage(c, "You don't have a current session. Use /new to create a new session.", false)
-		return err
-	}
-
-	meta, exists := b.sessionManager.GetSessionMeta(sessionID)
-	if !exists {
-		_, err := b.sendRenderedTelegramMessage(c, "Session information lost. Use /new to create a new session.", false)
-		return err
-	}
-
-	// Get recent messages
-	messages, err := b.opencodeClient.GetMessages(b.ctx, sessionID)
-	if err != nil {
-		log.Errorf("Failed to get messages: %v", err)
-		_, sendErr := b.sendRenderedTelegramMessage(c, fmt.Sprintf("Failed to get messages: %v", err), false)
-		return sendErr
-	}
-
-	// Get session details from OpenCode
-	session, err := b.opencodeClient.GetSession(b.ctx, sessionID)
-	if err != nil || session == nil {
-		log.Errorf("Failed to get session details: %v", err)
-		_, sendErr := b.sendRenderedTelegramMessage(c, fmt.Sprintf("Failed to get session details: %v", err), false)
-		return sendErr
-	}
-
-	// Determine current status
-	statusStr := "Porcessing finished."
-	if len(messages) > 0 {
-		lastMsg := messages[len(messages)-1]
-		if !(lastMsg.Role == "assistant" && lastMsg.Finish != "") {
-			statusStr = "Processing..."
-		}
-	}
-
-	// Determine model info
-	modelInfo := "Default"
-	if meta.ProviderID != "" && meta.ModelID != "" {
-		modelInfo = fmt.Sprintf("%s/%s", meta.ProviderID, meta.ModelID)
-	}
-
-	var sb strings.Builder
-
-	// Show session info in bullet points (same format as /status)
-	fmt.Fprintf(&sb, "## Session: %s\n", meta.Name)
-	fmt.Fprintf(&sb, "---\n")
-	fmt.Fprintf(&sb, "- Created: %s\n", time.UnixMilli(session.Time.Created).Format("2006-01-02 15:04"))
-	fmt.Fprintf(&sb, "- Updated: %s\n", time.UnixMilli(session.Time.Updated).Format("2006-01-02 15:04"))
-	fmt.Fprintf(&sb, "- Messages: %d\n", meta.MessageCount)
-	fmt.Fprintf(&sb, "- Model: %s\n", modelInfo)
-	fmt.Fprintf(&sb, "- Status: %s\n", statusStr)
-
-	// Show latest message if available
-	if len(messages) > 0 {
-		msg := messages[len(messages)-1]
-		var role string
-		switch msg.Role {
-		case "user":
-			role = "User"
-		case "assistant":
-			role = "Assistant"
-		case "system":
-			role = "System"
-		}
-		messageMeta := fmt.Sprintf("[%s] [%s]", role, msg.CreatedAt.Format("15:04"))
-
-		fmt.Fprintf(&sb, "\n")
-		fmt.Fprintf(&sb, "## Latest Message %s\n", messageMeta)
-		fmt.Fprintf(&sb, "---\n")
-
-		// Show detailed parts if available
-		if len(msg.Parts) > 0 {
-			// Only include reply content in parts if message content is empty
-			partsStr := formatMessagePartsWithOptions(msg.Parts, msg.Content == "")
-			if partsStr != "No detailed content" {
-				fmt.Fprintf(&sb, "%s\n", partsStr)
-			}
-			log.Infof("[DEBUG] zz-jason, partsStr: %s", partsStr)
-		}
-
-		// Show message content if available
-		if msg.Content != "" {
-			fmt.Fprintf(&sb, "%s\n", msg.Content)
-		}
-
-	} else {
-		sb.WriteString("No messages yet.\n")
-	}
-
-	result := sb.String()
-
-	pages := b.paginateDisplayText(result, false)
-	var sendErr error
-	for i, page := range pages {
-		_, err := b.sendRenderedTelegramMessage(c, page, false)
-		if err != nil {
-			sendErr = err
-			log.Errorf("Failed to send page %d/%d: %v", i+1, len(pages), err)
-		}
-	}
-	return sendErr
-}
-
 // handleAbort handles the /abort command
 func (b *Bot) handleAbort(c telebot.Context) error {
 	userID := c.Sender().ID
@@ -754,8 +592,7 @@ func formatToolCallPart(toolName, snapshot string, state interface{}, text strin
 	return wrapInExpandableBlockquote(block.String())
 }
 
-// formatMessageWithMetadata formats a single OpenCode message with role, timestamp, parts, and content
-// Follows the same logic as /current command for displaying messages
+// formatMessageWithMetadata formats a single OpenCode message with role, timestamp, parts, and content.
 func formatMessageWithMetadata(msg opencode.Message) string {
 	var sb strings.Builder
 
@@ -1063,109 +900,6 @@ func wrapInExpandableBlockquote(markdown string) string {
 	return sb.String()
 }
 
-// handleStatus handles the /status command
-func (b *Bot) handleStatus(c telebot.Context) error {
-	userID := c.Sender().ID
-	sessionID, exists := b.sessionManager.GetUserSession(userID)
-
-	if !exists {
-		return c.Send("You don't have a current session. Use /new to create a new session.")
-	}
-
-	// Get recent messages
-	messages, err := b.opencodeClient.GetMessages(b.ctx, sessionID)
-	if err != nil {
-		log.Errorf("Failed to get messages: %v", err)
-		return c.Send(fmt.Sprintf("Failed to get messages: %v", err))
-	}
-
-	if len(messages) == 0 {
-		return c.Send("Current session has no messages yet.")
-	}
-
-	// Determine current status
-	statusStr := "Waiting For Your Input"
-	if len(messages) > 0 {
-		lastMsg := messages[len(messages)-1]
-		if !(lastMsg.Role == "assistant" && lastMsg.Finish != "") {
-			statusStr = "Assistant is processing..."
-		}
-	}
-
-	var sb strings.Builder
-	sb.WriteString("📊 Session Status\n")
-	sb.WriteString("────────────────\n")
-
-	// Show session info
-	session, err := b.opencodeClient.GetSession(b.ctx, sessionID)
-	if err == nil && session != nil {
-		fmt.Fprintf(&sb, "• Name: %s\n", session.Title)
-		createdAt := time.UnixMilli(session.Time.Created)
-		fmt.Fprintf(&sb, "• Created: %s\n", createdAt.Format("2006-01-02 15:04"))
-	}
-
-	fmt.Fprintf(&sb, "• Messages: %d\n", len(messages))
-	fmt.Fprintf(&sb, "• Status: %s\n\n", statusStr)
-
-	// Show last 3 messages in a cleaner format
-	start := len(messages) - 3
-	if start < 0 {
-		start = 0
-	}
-
-	for i := start; i < len(messages); i++ {
-		msg := messages[i]
-		// Compute relative index (0 = latest, -1 = previous, -2 = older)
-		relIndex := i - (len(messages) - 1)
-		role := "👤 You"
-		if msg.Role == "assistant" {
-			role = "🤖 Assistant"
-		} else if msg.Role == "system" {
-			role = "⚙️ System"
-		}
-		timeStr := msg.CreatedAt.Format("15:04")
-
-		fmt.Fprintf(&sb, "\n[Message %d] %s [%s]\n", relIndex, role, timeStr)
-		sb.WriteString("────────────────\n")
-
-		// Show message content
-		if len(msg.Parts) > 0 {
-			// Always show detailed parts if available, especially for tool calls
-			partsStr := formatMessageParts(msg.Parts)
-			if partsStr != "No detailed content" {
-				fmt.Fprintf(&sb, "%s\n", partsStr)
-			} else if msg.Content != "" {
-				// Fallback to content if parts don't provide details
-				content := msg.Content
-				if len(content) > 400 {
-					content = content[:400] + "..."
-				}
-				fmt.Fprintf(&sb, "%s\n", content)
-			} else {
-				sb.WriteString("(No content)\n")
-			}
-		} else if msg.Content != "" {
-			// No parts, just show content
-			content := msg.Content
-			if len(content) > 400 {
-				content = content[:400] + "..."
-			}
-			fmt.Fprintf(&sb, "%s\n", content)
-		} else {
-			sb.WriteString("(No content)\n")
-		}
-
-	}
-
-	// Truncate if too long
-	result := sb.String()
-	if len(result) > 4000 {
-		result = result[:4000] + "\n... (content too long, truncated)"
-	}
-
-	return c.Send(result)
-}
-
 // handleModels lists available AI models
 func (b *Bot) handleModels(c telebot.Context) error {
 	// Synchronize models from OpenCode to local storage
@@ -1210,8 +944,7 @@ func (b *Bot) handleModels(c telebot.Context) error {
 
 	if len(connectedProviders) == 0 {
 		sb.WriteString("⚠️ No connected AI providers.\n")
-		sb.WriteString("Please configure API keys for at least one AI provider first.\n\n")
-		sb.WriteString("Use /providers to view provider connection status.")
+		sb.WriteString("Please configure API keys for at least one AI provider first.")
 		b.storeModelMapping(c.Sender().ID, modelMapping)
 		return c.Send(sb.String())
 	}
@@ -1253,80 +986,6 @@ func (b *Bot) handleModels(c telebot.Context) error {
 	// Store the model mapping in the bot context (for this user)
 	// We'll store it in a simple way for now - could be enhanced with persistence
 	b.storeModelMapping(c.Sender().ID, modelMapping)
-
-	result := sb.String()
-	if len(result) > 4000 {
-		result = result[:4000] + "\n...(content too long, truncated)"
-	}
-	return c.Send(result)
-}
-
-// handleProviders lists AI providers
-func (b *Bot) handleProviders(c telebot.Context) error {
-	providersResp, err := b.opencodeClient.GetProviders(b.ctx)
-	if err != nil {
-		log.Errorf("Failed to get providers: %v", err)
-		return c.Send(fmt.Sprintf("Failed to get providers: %v", err))
-	}
-
-	// Create a set of connected provider IDs for faster lookup
-	connectedSet := make(map[string]bool)
-	for _, providerID := range providersResp.Connected {
-		connectedSet[providerID] = true
-	}
-
-	var sb strings.Builder
-	sb.WriteString("🏢 AI Providers\n\n")
-
-	// Show connected providers first
-	hasConnected := false
-	for _, provider := range providersResp.All {
-		if connectedSet[provider.ID] {
-			if !hasConnected {
-				sb.WriteString("✅ Connected Providers:\n\n")
-				hasConnected = true
-			}
-			fmt.Fprintf(&sb, "✅ %s\n", provider.Name)
-			fmt.Fprintf(&sb, "  ID: %s\n", provider.ID)
-			fmt.Fprintf(&sb, "  Source: %s\n", provider.Source)
-			if len(provider.Env) > 0 {
-				fmt.Fprintf(&sb, "  Environment Variables: %s\n", strings.Join(provider.Env, ", "))
-			}
-			if len(provider.Models) > 0 {
-				fmt.Fprintf(&sb, "  Models: %d\n", len(provider.Models))
-			}
-			sb.WriteString("\n")
-		}
-	}
-
-	// Show unconnected providers
-	hasUnconnected := false
-	for _, provider := range providersResp.All {
-		if !connectedSet[provider.ID] {
-			if !hasUnconnected {
-				sb.WriteString("⚠️ Unconnected Providers (API key required):\n\n")
-				hasUnconnected = true
-			}
-			fmt.Fprintf(&sb, "⚪ %s\n", provider.Name)
-			fmt.Fprintf(&sb, "  ID: %s\n", provider.ID)
-			fmt.Fprintf(&sb, "  Source: %s\n", provider.Source)
-			if len(provider.Env) > 0 {
-				fmt.Fprintf(&sb, "  Required Environment Variables: %s\n", strings.Join(provider.Env, ", "))
-			}
-			if len(provider.Models) > 0 {
-				fmt.Fprintf(&sb, "  Available Models: %d\n", len(provider.Models))
-			}
-			sb.WriteString("\n")
-		}
-	}
-
-	// Summary
-	sb.WriteString("📊 Summary:\n")
-	fmt.Fprintf(&sb, "  • Connected: %d providers\n", len(providersResp.Connected))
-	fmt.Fprintf(&sb, "  • Total: %d providers\n", len(providersResp.All))
-	sb.WriteString("\n")
-
-	sb.WriteString("Use /models to view available models from connected providers.")
 
 	result := sb.String()
 	if len(result) > 4000 {
@@ -1637,286 +1296,6 @@ renderLoop:
 	log.Infof("No renderable assistant output for session %s request_message_id=%s", sessionID, requestMessageID)
 	b.updateTelegramMessage(c, processingMsg, "🤖 Response completed with no content.", false)
 	return nil
-}
-
-// The following handlers are stubs for future implementation
-
-func (b *Bot) handleFiles(c telebot.Context) error {
-	args := c.Args()
-	path := "."
-	if len(args) > 0 {
-		path = strings.Join(args, " ")
-	}
-
-	files, err := b.opencodeClient.ListFiles(b.ctx, path)
-	if err != nil {
-		log.Errorf("Failed to list files: %v", err)
-		return c.Send(fmt.Sprintf("Failed to list files: %v", err))
-	}
-
-	if len(files) == 0 {
-		return c.Send(fmt.Sprintf("Directory '%s' is empty or does not exist.", path))
-	}
-
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "📁 File List: %s\n\n", path)
-
-	// Separate directories and files
-	var dirs []opencode.FileInfo
-	var fileList []opencode.FileInfo
-
-	for _, file := range files {
-		if file.Type == "directory" {
-			dirs = append(dirs, file)
-		} else {
-			fileList = append(fileList, file)
-		}
-	}
-
-	// Show directories first
-	if len(dirs) > 0 {
-		sb.WriteString("📂 Directories:\n")
-		for _, dir := range dirs {
-			ignored := ""
-			if dir.Ignored {
-				ignored = " [Ignored]"
-			}
-			fmt.Fprintf(&sb, "  • %s%s\n", dir.Name, ignored)
-		}
-		sb.WriteString("\n")
-	}
-
-	// Then files
-	if len(fileList) > 0 {
-		sb.WriteString("📄 Files:\n")
-		for _, file := range fileList {
-			ignored := ""
-			if file.Ignored {
-				ignored = " [Ignored]"
-			}
-			fmt.Fprintf(&sb, "  • %s%s\n", file.Name, ignored)
-		}
-		sb.WriteString("\n")
-	}
-
-	fmt.Fprintf(&sb, "Total: %d items (%d directories, %d files)", len(files), len(dirs), len(fileList))
-
-	result := sb.String()
-	if len(result) > 4000 {
-		result = result[:4000] + "\n...(content too long, truncated)"
-	}
-
-	return c.Send(result)
-}
-
-func (b *Bot) handleSearch(c telebot.Context) error {
-	args := c.Args()
-	if len(args) == 0 {
-		return c.Send("Please specify search content.\nUsage: /search <search pattern>")
-	}
-
-	query := strings.Join(args, " ")
-
-	// Try to use OpenCode search API
-	results, err := b.opencodeClient.SearchFiles(b.ctx, query)
-	if err != nil {
-		// API not available, provide helpful message
-		log.Debugf("Search API not available: %v", err)
-		return c.Send(fmt.Sprintf("🔍 Search functionality is currently unavailable.\n\nReason: %v\n\nYou can directly send a message to the assistant to request a search, for example:\n\"Search for code containing '%s'\"", err, query))
-	}
-
-	if len(results) == 0 {
-		return c.Send(fmt.Sprintf("No code containing '%s' was found.", query))
-	}
-
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "🔍 Search Results: '%s'\n\n", query)
-
-	// Limit results to prevent message overflow
-	maxResults := 10
-	if len(results) > maxResults {
-		fmt.Fprintf(&sb, "Found %d results, showing first %d:\n\n", len(results), maxResults)
-		results = results[:maxResults]
-	}
-
-	for i, result := range results {
-		fmt.Fprintf(&sb, "%d. %s:%d\n", i+1, result.Path, result.Line)
-		fmt.Fprintf(&sb, "   %s\n\n", strings.TrimSpace(result.Content))
-	}
-
-	resultStr := sb.String()
-	if len(resultStr) > 4000 {
-		resultStr = resultStr[:4000] + "\n...(content too long, truncated)"
-	}
-
-	return c.Send(resultStr)
-}
-
-func (b *Bot) handleFindFile(c telebot.Context) error {
-	args := c.Args()
-	if len(args) == 0 {
-		return c.Send("Please specify file pattern.\nUsage: /findfile <file pattern>")
-	}
-
-	pattern := strings.Join(args, " ")
-
-	// Try to use OpenCode find file API
-	files, err := b.opencodeClient.FindFile(b.ctx, pattern)
-	if err != nil {
-		// API not available, provide helpful message
-		log.Debugf("Find file API not available: %v", err)
-		return c.Send(fmt.Sprintf("🔍 File search functionality is currently unavailable.\n\nReason: %v\n\nYou can use the /files command to browse directories, or directly send a message to the assistant to request file search.", err))
-	}
-
-	if len(files) == 0 {
-		return c.Send(fmt.Sprintf("No files matching '%s' were found.", pattern))
-	}
-
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "🔍 File Search Results: '%s'\n\n", pattern)
-
-	// Separate directories and files
-	var dirs []opencode.FileInfo
-	var fileList []opencode.FileInfo
-
-	for _, file := range files {
-		if file.Type == "directory" {
-			dirs = append(dirs, file)
-		} else {
-			fileList = append(fileList, file)
-		}
-	}
-
-	// Limit results
-	maxResults := 15
-	totalResults := len(files)
-	if totalResults > maxResults {
-		fmt.Fprintf(&sb, "Found %d results, showing first %d:\n\n", totalResults, maxResults)
-		if len(dirs) > maxResults/2 {
-			dirs = dirs[:maxResults/2]
-		}
-		if len(fileList) > maxResults/2 {
-			fileList = fileList[:maxResults/2]
-		}
-	}
-
-	if len(dirs) > 0 {
-		sb.WriteString("📂 Directories:\n")
-		for _, dir := range dirs {
-			ignored := ""
-			if dir.Ignored {
-				ignored = " [Ignored]"
-			}
-			fmt.Fprintf(&sb, "  • %s%s\n", dir.Path, ignored)
-		}
-		sb.WriteString("\n")
-	}
-
-	if len(fileList) > 0 {
-		sb.WriteString("📄 Files:\n")
-		for _, file := range fileList {
-			ignored := ""
-			if file.Ignored {
-				ignored = " [Ignored]"
-			}
-			fmt.Fprintf(&sb, "  • %s%s\n", file.Path, ignored)
-		}
-		sb.WriteString("\n")
-	}
-
-	fmt.Fprintf(&sb, "Total: %d items", totalResults)
-
-	resultStr := sb.String()
-	if len(resultStr) > 4000 {
-		resultStr = resultStr[:4000] + "\n...(content too long, truncated)"
-	}
-
-	return c.Send(resultStr)
-}
-
-func (b *Bot) handleSymbol(c telebot.Context) error {
-	args := c.Args()
-	if len(args) == 0 {
-		return c.Send("Please specify symbol name.\nUsage: /symbol <symbol name>")
-	}
-
-	symbol := strings.Join(args, " ")
-
-	// Try to use OpenCode symbol search API
-	results, err := b.opencodeClient.SearchSymbol(b.ctx, symbol)
-	if err != nil {
-		// API not available, provide helpful message
-		log.Debugf("Symbol search API not available: %v", err)
-		return c.Send(fmt.Sprintf("🔍 Symbol search functionality is currently unavailable.\n\nReason: %v\n\nYou can directly send a message to the assistant to request symbol search, for example:\n\"Find function %s\"", err, symbol))
-	}
-
-	if len(results) == 0 {
-		return c.Send(fmt.Sprintf("Symbol '%s' not found.", symbol))
-	}
-
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "🔍 Symbol Search Results: '%s'\n\n", symbol)
-
-	// Limit results
-	maxResults := 10
-	if len(results) > maxResults {
-		fmt.Fprintf(&sb, "Found %d results, showing first %d:\n\n", len(results), maxResults)
-		results = results[:maxResults]
-	}
-
-	for i, result := range results {
-		fmt.Fprintf(&sb, "%d. %s (%s)\n", i+1, result.Name, result.Kind)
-		fmt.Fprintf(&sb, "   Location: %s:%d\n", result.Path, result.Line)
-		if result.Signature != "" {
-			fmt.Fprintf(&sb, "   Signature: %s\n", result.Signature)
-		}
-		sb.WriteString("\n")
-	}
-
-	resultStr := sb.String()
-	if len(resultStr) > 4000 {
-		resultStr = resultStr[:4000] + "\n...(content too long, truncated)"
-	}
-
-	return c.Send(resultStr)
-}
-
-func (b *Bot) handleAgent(c telebot.Context) error {
-	// Try to get agents list
-	agents, err := b.opencodeClient.ListAgents(b.ctx)
-	if err != nil {
-		// API not available, provide helpful message
-		log.Debugf("Agents API not available: %v", err)
-		return c.Send(fmt.Sprintf("🤖 Agent list functionality is currently unavailable.\n\nReason: %v\n\nYou can use /models and /providers commands to view available AI models and providers.", err))
-	}
-
-	if len(agents) == 0 {
-		return c.Send("No AI agents are currently available.")
-	}
-
-	var sb strings.Builder
-	sb.WriteString("🤖 Available AI Agents:\n\n")
-
-	for i, agent := range agents {
-		fmt.Fprintf(&sb, "%d. %s\n", i+1, agent.Name)
-		if agent.Description != "" {
-			fmt.Fprintf(&sb, "   Description: %s\n", agent.Description)
-		}
-		fmt.Fprintf(&sb, "   ID: %s\n\n", agent.ID)
-	}
-
-	fmt.Fprintf(&sb, "Total: %d agents", len(agents))
-
-	resultStr := sb.String()
-	if len(resultStr) > 4000 {
-		resultStr = resultStr[:4000] + "\n...(content too long, truncated)"
-	}
-
-	return c.Send(resultStr)
-}
-
-func (b *Bot) handleCommand(c telebot.Context) error {
-	return c.Send("Command list functionality is not yet implemented.")
 }
 
 // buildGlobalModelMapping builds the global model mapping from preloaded models
@@ -3737,54 +3116,6 @@ func normalizeFenceLineForSplit(trimmedLine string) (fenceLine string, quotePref
 		}
 	}
 	return trimmedLine, ""
-}
-
-// formatLatestMessage formats the latest message from a session for display
-func (b *Bot) formatLatestMessage(sessionID string, userID int64) (string, error) {
-	// Get recent messages
-	messages, err := b.opencodeClient.GetMessages(b.ctx, sessionID)
-	if err != nil {
-		log.Errorf("Failed to get messages for latest update: %v", err)
-		return "", err
-	}
-
-	if len(messages) == 0 {
-		return "No messages in session.", nil
-	}
-
-	// Get the latest message
-	latestMsg := messages[len(messages)-1]
-
-	// Check if this is an assistant message with detailed parts
-	hasDetailedParts := len(latestMsg.Parts) > 0 && formatMessageParts(latestMsg.Parts) != "No detailed content"
-
-	// If it's not an assistant message or doesn't have detailed parts, no need for separate update
-	if latestMsg.Role != "assistant" || !hasDetailedParts {
-		return "", nil
-	}
-
-	// Format the message similar to /status command
-	role := "🤖 Assistant"
-	timeStr := latestMsg.CreatedAt.Format("15:04")
-
-	var sb strings.Builder
-	sb.WriteString("📋 Latest Message Details\n")
-	sb.WriteString("────────────────\n")
-	fmt.Fprintf(&sb, "[Message 0] %s [%s]\n", role, timeStr)
-	sb.WriteString("────────────────\n")
-
-	// Show detailed parts
-	partsStr := formatMessageParts(latestMsg.Parts)
-	fmt.Fprintf(&sb, "%s\n", partsStr)
-
-	// Truncate if too long for Telegram
-	result := sb.String()
-	const maxTelegramLength = 3500
-	if len(result) > maxTelegramLength {
-		result = result[:maxTelegramLength] + "\n... (content too long, use /status or /current for full details)"
-	}
-
-	return result, nil
 }
 
 // Close closes the bot and releases resources

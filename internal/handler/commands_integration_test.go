@@ -423,27 +423,13 @@ func TestIntegration_HandleCoreCommands(t *testing.T) {
 	resp := runCommand(t, tgBot, rec.messages, userID, 1, "/sessions")
 	assertContains(t, resp, "You don&#39;t have any sessions")
 
-	resp = runCommand(t, tgBot, rec.messages, userID, 2, "/current")
-	assertContains(t, resp, "You don't have a current session")
-
-	resp = runCommand(t, tgBot, rec.messages, userID, 3, "/status")
-	assertContains(t, resp, "You don't have a current session")
-
-	resp = runCommand(t, tgBot, rec.messages, userID, 4, "/new Integration Session")
+	resp = runCommand(t, tgBot, rec.messages, userID, 2, "/new Integration Session")
 	assertContains(t, resp, "✅ Created new session: Integration Session")
 
-	resp = runCommand(t, tgBot, rec.messages, userID, 5, "/sessions")
+	resp = runCommand(t, tgBot, rec.messages, userID, 3, "/sessions")
 	assertContains(t, resp, "Available Sessions")
 	assertContains(t, resp, "Integration Session")
 	assertContains(t, resp, "[CURRENT 👉]")
-
-	resp = runCommand(t, tgBot, rec.messages, userID, 6, "/current")
-	assertContains(t, resp, "<b>Integration Session</b>")
-	assertContains(t, resp, "- Model: Default")
-	assertContains(t, resp, "<hr>")
-
-	resp = runCommand(t, tgBot, rec.messages, userID, 7, "/status")
-	assertContains(t, resp, "Current session has no messages yet.")
 }
 
 func TestIntegration_HandleCoreCommandsTextFallback(t *testing.T) {

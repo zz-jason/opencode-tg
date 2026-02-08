@@ -12,7 +12,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -74,15 +73,6 @@ type Session struct {
 type SessionTime struct {
 	Created int64 `json:"created"`
 	Updated int64 `json:"updated"`
-}
-
-// FileInfo represents a file or directory
-type FileInfo struct {
-	Name     string `json:"name"`
-	Path     string `json:"path"`
-	Absolute string `json:"absolute"`
-	Type     string `json:"type"` // "file" or "directory"
-	Ignored  bool   `json:"ignored"`
 }
 
 // Message represents a message in a session
@@ -962,91 +952,6 @@ func isRetryableError(err error) bool {
 	}
 
 	return false
-}
-
-// SearchResult represents a search result
-type SearchResult struct {
-	Path    string  `json:"path"`
-	Line    int     `json:"line"`
-	Content string  `json:"content"`
-	Score   float64 `json:"score,omitempty"`
-}
-
-// SymbolResult represents a symbol search result
-type SymbolResult struct {
-	Name      string `json:"name"`
-	Kind      string `json:"kind"` // function, class, variable, etc.
-	Path      string `json:"path"`
-	Line      int    `json:"line"`
-	Signature string `json:"signature,omitempty"`
-}
-
-// AgentInfo represents an AI agent
-type AgentInfo struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
-}
-
-// CommandInfo represents a command
-type CommandInfo struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Usage       string `json:"usage,omitempty"`
-}
-
-// SearchFiles searches for text in files
-func (c *Client) SearchFiles(ctx context.Context, query string) ([]SearchResult, error) {
-	return nil, errors.New("search not implemented: API endpoint not available")
-}
-
-// FindFile finds files by name pattern
-func (c *Client) FindFile(ctx context.Context, pattern string) ([]FileInfo, error) {
-	return nil, errors.New("find file not implemented: API endpoint not available")
-}
-
-// SearchSymbol searches for symbols in code
-func (c *Client) SearchSymbol(ctx context.Context, symbol string) ([]SymbolResult, error) {
-	return nil, errors.New("symbol search not implemented: API endpoint not available")
-}
-
-// ListAgents lists available AI agents
-func (c *Client) ListAgents(ctx context.Context) ([]AgentInfo, error) {
-	return nil, errors.New("list agents not implemented: API endpoint not available")
-}
-
-// ListCommands lists available commands
-func (c *Client) ListCommands(ctx context.Context) ([]CommandInfo, error) {
-	return nil, errors.New("list commands not implemented: API endpoint not available")
-}
-
-// ListFiles lists files in a directory
-func (c *Client) ListFiles(ctx context.Context, path string) ([]FileInfo, error) {
-	urlStr := c.baseURL + "/file"
-	if path != "" {
-		urlStr += "?path=" + url.QueryEscape(path)
-	}
-	req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("failed to list files: status %d", resp.StatusCode)
-	}
-
-	var files []FileInfo
-	if err := json.NewDecoder(resp.Body).Decode(&files); err != nil {
-		return nil, err
-	}
-	return files, nil
 }
 
 // RenameSession renames a session by updating its title and metadata
