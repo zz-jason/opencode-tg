@@ -24,6 +24,8 @@ const (
 	// maxTelegramMessages is the maximum number of messages we'll send for a single response
 	// to avoid flooding the chat and hitting rate limits
 	maxTelegramMessages = 20
+	// telegramMessageMaxLength is Telegram's hard message size limit.
+	telegramMessageMaxLength = 4096
 )
 
 // Bot represents the Telegram bot with all dependencies
@@ -83,8 +85,26 @@ type streamingState struct {
 	// Session ID for this streaming state
 	sessionID string
 
+	// Event-driven stream state for /event updates.
+	requestStartedAt  int64
+	initialMessageIDs map[string]bool
+	eventMessages     map[string]*eventMessageState
+	activeMessageID   string
+	displayOrder      []string
+	displaySet        map[string]bool
+	pendingOrder      []string
+	pendingSet        map[string]bool
+	lastEventAt       time.Time
+	hasEventUpdates   bool
+
 	isStreaming bool
 	isComplete  bool
+}
+
+type eventMessageState struct {
+	Info      opencode.MessageInfo
+	PartOrder []string
+	Parts     map[string]opencode.MessagePartResponse
 }
 
 // modelSelection represents a model selection with provider and model IDs
@@ -1346,7 +1366,25 @@ func (b *Bot) handleText(c telebot.Context) error {
 		allDisplayChunks:    nil,
 		sessionInfoAdded:    false,
 		sessionID:           sessionID,
+		requestStartedAt:    time.Now().UnixMilli(),
+		initialMessageIDs:   make(map[string]bool),
+		eventMessages:       make(map[string]*eventMessageState),
+		displaySet:          make(map[string]bool),
+		pendingSet:          make(map[string]bool),
 		isStreaming:         true,
+	}
+
+	// Capture existing message IDs before sending the new request.
+	// Event-driven rendering will ignore these historical IDs.
+	if existingMessages, getErr := b.opencodeClient.GetMessages(ctx, sessionID); getErr == nil {
+		for _, msg := range existingMessages {
+			if msg.ID == "" {
+				continue
+			}
+			streamingState.initialMessageIDs[msg.ID] = true
+		}
+	} else {
+		log.Warnf("Failed to preload existing messages for event stream filtering: %v", getErr)
 	}
 
 	// Store streaming state for potential abort
@@ -1375,6 +1413,14 @@ func (b *Bot) handleText(c telebot.Context) error {
 		b.periodicMessageUpdates(periodicCtx, streamingState, sessionID, stopUpdates)
 	}()
 
+	// Start event stream updates. This is the preferred real-time source;
+	// periodic polling remains as a fallback if event stream is unavailable.
+	eventDone := make(chan struct{})
+	go func() {
+		defer close(eventDone)
+		b.consumeSessionEvents(periodicCtx, streamingState, sessionID)
+	}()
+
 	// Check if OpenCode server is reachable before starting stream
 	healthCtx, healthCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer healthCancel()
@@ -1396,8 +1442,27 @@ func (b *Bot) handleText(c telebot.Context) error {
 	case <-time.After(2 * time.Second):
 		log.Warnf("Timed out waiting for periodic updater to stop for session %s", sessionID)
 	}
+	select {
+	case <-eventDone:
+	case <-time.After(2 * time.Second):
+		log.Warnf("Timed out waiting for event updater to stop for session %s", sessionID)
+	}
 	if err != nil {
 		log.Errorf("Failed to stream message: %v", err)
+
+		if streamingState.hasEventUpdates {
+			b.reconcileEventStateWithLatestMessages(streamingState)
+			streamingState.updateMutex.Lock()
+			for b.tryPromoteNextActiveMessage(streamingState) {
+			}
+			displays := b.buildEventDrivenDisplaysLocked(streamingState)
+			if len(displays) > 0 {
+				b.updateStreamingTelegramMessages(streamingState, displays)
+				streamingState.updateMutex.Unlock()
+				return nil
+			}
+			streamingState.updateMutex.Unlock()
+		}
 
 		// Update with error message
 		errorMsg := fmt.Sprintf("Processing error: %v", err)
@@ -1418,6 +1483,20 @@ func (b *Bot) handleText(c telebot.Context) error {
 	// Streaming completed successfully
 	// Mark streaming as complete
 	streamingState.isComplete = true
+
+	if streamingState.hasEventUpdates {
+		b.reconcileEventStateWithLatestMessages(streamingState)
+		streamingState.updateMutex.Lock()
+		for b.tryPromoteNextActiveMessage(streamingState) {
+		}
+		displays := b.buildEventDrivenDisplaysLocked(streamingState)
+		if len(displays) > 0 {
+			b.updateStreamingTelegramMessages(streamingState, displays)
+			streamingState.updateMutex.Unlock()
+			return nil
+		}
+		streamingState.updateMutex.Unlock()
+	}
 
 	// Get final content. Prefer the most complete assistant content available:
 	// streamed chunks and periodically-polled message content may differ by timing.
@@ -1883,6 +1962,13 @@ func (b *Bot) periodicMessageUpdates(ctx context.Context, state *streamingState,
 			log.Debugf("Periodic updates stopped for session %s: stop signal", sessionID)
 			return
 		case <-ticker.C:
+			state.updateMutex.Lock()
+			hasRecentEvents := state.hasEventUpdates && time.Since(state.lastEventAt) < 5*time.Second
+			state.updateMutex.Unlock()
+			if hasRecentEvents {
+				continue
+			}
+
 			updateCount++
 			log.Debugf("Periodic update #%d for session %s", updateCount, sessionID)
 
@@ -1896,6 +1982,18 @@ func (b *Bot) periodicMessageUpdates(ctx context.Context, state *streamingState,
 			}
 
 			state.updateMutex.Lock()
+			if state.hasEventUpdates {
+				b.reconcileEventStateWithMessagesLocked(state, messages)
+				for b.tryPromoteNextActiveMessage(state) {
+				}
+				displays := b.buildEventDrivenDisplaysLocked(state)
+				if len(displays) == 0 {
+					displays = []string{"🤖 Processing...\n\nModel is thinking, please wait..."}
+				}
+				b.updateStreamingTelegramMessages(state, displays)
+				state.updateMutex.Unlock()
+				continue
+			}
 
 			// Get session metadata for formatting
 			var sessionMeta *session.SessionMeta
@@ -1917,6 +2015,507 @@ func (b *Bot) periodicMessageUpdates(ctx context.Context, state *streamingState,
 			state.updateMutex.Unlock()
 		}
 	}
+}
+
+func (b *Bot) consumeSessionEvents(ctx context.Context, state *streamingState, sessionID string) {
+	if state == nil || b.opencodeClient == nil {
+		return
+	}
+
+	err := b.opencodeClient.StreamSessionEvents(ctx, func(event opencode.SessionEvent) error {
+		state.updateMutex.Lock()
+		changed, forceFlush := b.applySessionEventLocked(state, sessionID, event)
+		if !changed {
+			state.updateMutex.Unlock()
+			return nil
+		}
+
+		state.hasEventUpdates = true
+		state.lastEventAt = time.Now()
+		for b.tryPromoteNextActiveMessage(state) {
+		}
+
+		now := time.Now()
+		shouldFlush := forceFlush || now.Sub(state.lastUpdate) >= 350*time.Millisecond
+		if shouldFlush {
+			displays := b.buildEventDrivenDisplaysLocked(state)
+			if len(displays) > 0 {
+				state.lastUpdate = now
+				b.updateStreamingTelegramMessages(state, displays)
+			}
+		}
+		state.updateMutex.Unlock()
+		return nil
+	})
+	if err != nil && ctx.Err() == nil {
+		log.Warnf("Event stream exited for session %s: %v", sessionID, err)
+	}
+}
+
+func (b *Bot) applySessionEventLocked(state *streamingState, sessionID string, event opencode.SessionEvent) (changed bool, forceFlush bool) {
+	switch event.Type {
+	case "message.updated":
+		return b.applyMessageUpdatedEventLocked(state, sessionID, event.Properties)
+	case "message.part.updated":
+		return b.applyMessagePartUpdatedEventLocked(state, sessionID, event.Properties)
+	default:
+		return false, false
+	}
+}
+
+func (b *Bot) applyMessageUpdatedEventLocked(state *streamingState, sessionID string, raw json.RawMessage) (bool, bool) {
+	var payload opencode.MessageUpdatedProperties
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return false, false
+	}
+	info := payload.Info
+	if info.ID == "" || info.SessionID == "" || info.SessionID != sessionID {
+		return false, false
+	}
+	if !b.shouldTrackEventMessageLocked(state, info.ID, info.Time.Created) {
+		return false, false
+	}
+
+	msgState := b.getOrCreateEventMessageStateLocked(state, info.ID)
+	prevInfo := msgState.Info
+	msgState.Info = mergeMessageInfo(prevInfo, info)
+
+	displayChanged := false
+	if role := strings.ToLower(strings.TrimSpace(msgState.Info.Role)); role != "" && role != "user" {
+		displayChanged = b.enqueueEventMessageLocked(state, msgState.Info.ID)
+	}
+
+	completedNow := isEventMessageCompleted(msgState)
+	infoChanged := !sameMessageInfoForRender(prevInfo, msgState.Info)
+	return infoChanged || displayChanged, completedNow || displayChanged
+}
+
+func (b *Bot) applyMessagePartUpdatedEventLocked(state *streamingState, sessionID string, raw json.RawMessage) (bool, bool) {
+	var payload opencode.MessagePartUpdatedProperties
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return false, false
+	}
+
+	part := payload.Part
+	if part.MessageID == "" || part.SessionID == "" || part.SessionID != sessionID {
+		return false, false
+	}
+	if !b.shouldTrackEventMessageLocked(state, part.MessageID, 0) {
+		return false, false
+	}
+
+	msgState := b.getOrCreateEventMessageStateLocked(state, part.MessageID)
+	changed := upsertEventPartLocked(msgState, part)
+	return changed, false
+}
+
+func (b *Bot) shouldTrackEventMessageLocked(state *streamingState, messageID string, created int64) bool {
+	if messageID == "" {
+		return false
+	}
+	if _, tracked := state.eventMessages[messageID]; tracked {
+		return true
+	}
+	if state.initialMessageIDs != nil && state.initialMessageIDs[messageID] {
+		return false
+	}
+	if created > 0 && state.requestStartedAt > 0 && created+500 < state.requestStartedAt {
+		return false
+	}
+	return true
+}
+
+func (b *Bot) getOrCreateEventMessageStateLocked(state *streamingState, messageID string) *eventMessageState {
+	if msgState, exists := state.eventMessages[messageID]; exists {
+		return msgState
+	}
+	msgState := &eventMessageState{
+		Info: opencode.MessageInfo{
+			ID: messageID,
+		},
+		PartOrder: make([]string, 0, 8),
+		Parts:     make(map[string]opencode.MessagePartResponse),
+	}
+	state.eventMessages[messageID] = msgState
+	return msgState
+}
+
+func mergeMessageInfo(existing, incoming opencode.MessageInfo) opencode.MessageInfo {
+	merged := existing
+	if incoming.ID != "" {
+		merged.ID = incoming.ID
+	}
+	if incoming.SessionID != "" {
+		merged.SessionID = incoming.SessionID
+	}
+	if incoming.Role != "" {
+		merged.Role = incoming.Role
+	}
+	if incoming.Time.Created > 0 {
+		merged.Time.Created = incoming.Time.Created
+	}
+	if incoming.Time.Completed > 0 {
+		merged.Time.Completed = incoming.Time.Completed
+	}
+	if incoming.Error != nil {
+		merged.Error = incoming.Error
+	}
+	if incoming.ParentID != "" {
+		merged.ParentID = incoming.ParentID
+	}
+	if incoming.ModelID != "" {
+		merged.ModelID = incoming.ModelID
+	}
+	if incoming.ProviderID != "" {
+		merged.ProviderID = incoming.ProviderID
+	}
+	if incoming.Mode != "" {
+		merged.Mode = incoming.Mode
+	}
+	if incoming.Agent != "" {
+		merged.Agent = incoming.Agent
+	}
+	if incoming.Path != nil {
+		merged.Path = incoming.Path
+	}
+	if incoming.Cost != 0 {
+		merged.Cost = incoming.Cost
+	}
+	if incoming.Tokens != nil {
+		merged.Tokens = incoming.Tokens
+	}
+	if incoming.Finish != "" {
+		merged.Finish = incoming.Finish
+	}
+	if incoming.Summary != nil {
+		merged.Summary = incoming.Summary
+	}
+	return merged
+}
+
+func sameMessageInfoForRender(left, right opencode.MessageInfo) bool {
+	if left.ID != right.ID || left.Role != right.Role || left.SessionID != right.SessionID {
+		return false
+	}
+	if left.Time.Created != right.Time.Created || left.Time.Completed != right.Time.Completed {
+		return false
+	}
+	if left.Finish != right.Finish {
+		return false
+	}
+	if (left.Error == nil) != (right.Error == nil) {
+		return false
+	}
+	return true
+}
+
+func (b *Bot) enqueueEventMessageLocked(state *streamingState, messageID string) bool {
+	if messageID == "" {
+		return false
+	}
+
+	if state.activeMessageID == "" {
+		state.activeMessageID = messageID
+		if !state.displaySet[messageID] {
+			state.displaySet[messageID] = true
+			state.displayOrder = append(state.displayOrder, messageID)
+		}
+		return true
+	}
+
+	if state.activeMessageID == messageID || state.displaySet[messageID] || state.pendingSet[messageID] {
+		return false
+	}
+
+	state.pendingSet[messageID] = true
+	state.pendingOrder = append(state.pendingOrder, messageID)
+	return false
+}
+
+func (b *Bot) tryPromoteNextActiveMessage(state *streamingState) bool {
+	if state.activeMessageID == "" {
+		return false
+	}
+	active := state.eventMessages[state.activeMessageID]
+	if !isEventMessageCompleted(active) {
+		return false
+	}
+	if len(state.pendingOrder) == 0 {
+		return false
+	}
+
+	next := state.pendingOrder[0]
+	state.pendingOrder = state.pendingOrder[1:]
+	delete(state.pendingSet, next)
+	state.activeMessageID = next
+	if !state.displaySet[next] {
+		state.displaySet[next] = true
+		state.displayOrder = append(state.displayOrder, next)
+	}
+	return true
+}
+
+func isEventMessageCompleted(msg *eventMessageState) bool {
+	if msg == nil {
+		return false
+	}
+	if msg.Info.Time.Completed > 0 {
+		return true
+	}
+	if msg.Info.Finish != "" {
+		return true
+	}
+	if msg.Info.Error != nil {
+		return true
+	}
+	return false
+}
+
+func (b *Bot) buildEventDrivenDisplaysLocked(state *streamingState) []string {
+	if state == nil {
+		return nil
+	}
+
+	renderedMessages := make([]string, 0, len(state.displayOrder))
+	for _, messageID := range state.displayOrder {
+		msgState := state.eventMessages[messageID]
+		if msgState == nil {
+			continue
+		}
+		block := formatEventMessageForDisplay(msgState)
+		if strings.TrimSpace(block) == "" {
+			continue
+		}
+		renderedMessages = append(renderedMessages, block)
+	}
+	if len(renderedMessages) == 0 {
+		return []string{"🤖 Processing..."}
+	}
+
+	content := strings.Join(renderedMessages, "\n\n")
+	chunks := b.splitLongContentPreserveCodeBlocks(content)
+	if len(chunks) == 0 {
+		return []string{content}
+	}
+	return chunks
+}
+
+func formatEventMessageForDisplay(msg *eventMessageState) string {
+	if msg == nil {
+		return ""
+	}
+
+	roleLabel := "🤖 Assistant"
+	switch strings.ToLower(strings.TrimSpace(msg.Info.Role)) {
+	case "assistant":
+		roleLabel = "🤖 Assistant"
+	case "system":
+		roleLabel = "⚙️ System"
+	case "user":
+		roleLabel = "👤 User"
+	}
+
+	var sb strings.Builder
+	if msg.Info.Time.Created > 0 {
+		ts := time.UnixMilli(msg.Info.Time.Created).Format("15:04")
+		fmt.Fprintf(&sb, "[%s] [%s]\n", roleLabel, ts)
+		sb.WriteString("---\n")
+	} else {
+		fmt.Fprintf(&sb, "[%s]\n---\n", roleLabel)
+	}
+
+	partStr := formatEventMessageParts(sortedEventParts(msg))
+	if partStr != "" {
+		sb.WriteString(partStr)
+	}
+	if msg.Info.Error != nil {
+		if sb.Len() > 0 {
+			sb.WriteString("\n\n")
+		}
+		sb.WriteString("⚠️ Execution ended with an error.")
+	}
+	return strings.TrimSpace(sb.String())
+}
+
+func sortedEventParts(msg *eventMessageState) []opencode.MessagePartResponse {
+	if msg == nil || len(msg.Parts) == 0 {
+		return nil
+	}
+
+	ordered := make([]opencode.MessagePartResponse, 0, len(msg.Parts))
+	seen := make(map[string]bool, len(msg.Parts))
+	for _, partID := range msg.PartOrder {
+		part, exists := msg.Parts[partID]
+		if !exists {
+			continue
+		}
+		ordered = append(ordered, part)
+		seen[partID] = true
+	}
+
+	if len(ordered) == len(msg.Parts) {
+		return ordered
+	}
+
+	remainingIDs := make([]string, 0, len(msg.Parts)-len(ordered))
+	for partID := range msg.Parts {
+		if seen[partID] {
+			continue
+		}
+		remainingIDs = append(remainingIDs, partID)
+	}
+	sort.Strings(remainingIDs)
+	for _, partID := range remainingIDs {
+		ordered = append(ordered, msg.Parts[partID])
+	}
+	return ordered
+}
+
+func formatEventMessageParts(parts []opencode.MessagePartResponse) string {
+	if len(parts) == 0 {
+		return ""
+	}
+
+	var reasoningAndTools strings.Builder
+	var textContent strings.Builder
+	for _, part := range parts {
+		switch part.Type {
+		case "text":
+			textContent.WriteString(part.Text)
+		case "reasoning":
+			if strings.TrimSpace(part.Text) == "" {
+				continue
+			}
+			reasoningText := strings.ReplaceAll(strings.TrimSpace(part.Text), "\n", "\n> ")
+			fmt.Fprintf(&reasoningAndTools, "> Thinking: %s\n", reasoningText)
+		case "tool":
+			reasoningAndTools.WriteString(formatToolCallPart(part.Tool, part.Snapshot, part.State, part.Text))
+		case "step-start", "step-finish":
+			// Step boundaries are structural markers; skip to keep stream concise.
+		default:
+			if strings.TrimSpace(part.Text) != "" {
+				reasoningAndTools.WriteString(strings.TrimSpace(part.Text))
+				reasoningAndTools.WriteString("\n")
+			}
+		}
+	}
+
+	sections := make([]string, 0, 2)
+	if meta := strings.TrimSpace(reasoningAndTools.String()); meta != "" {
+		sections = append(sections, meta)
+	}
+	if text := strings.TrimSpace(textContent.String()); text != "" {
+		sections = append(sections, text)
+	}
+	return strings.TrimSpace(strings.Join(sections, "\n\n"))
+}
+
+func (b *Bot) reconcileEventStateWithLatestMessages(state *streamingState) {
+	if state == nil || state.sessionID == "" || b.opencodeClient == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(state.ctx, 4*time.Second)
+	defer cancel()
+
+	messages, err := b.opencodeClient.GetMessages(ctx, state.sessionID)
+	if err != nil {
+		log.Warnf("Failed to reconcile event state from message snapshots: %v", err)
+		return
+	}
+	sort.Slice(messages, func(i, j int) bool {
+		return messages[i].CreatedAt.Before(messages[j].CreatedAt)
+	})
+
+	state.updateMutex.Lock()
+	defer state.updateMutex.Unlock()
+	b.reconcileEventStateWithMessagesLocked(state, messages)
+}
+
+func (b *Bot) reconcileEventStateWithMessagesLocked(state *streamingState, messages []opencode.Message) {
+	if state == nil {
+		return
+	}
+
+	for _, msg := range messages {
+		if msg.ID == "" {
+			continue
+		}
+		created := int64(0)
+		if !msg.CreatedAt.IsZero() {
+			created = msg.CreatedAt.UnixMilli()
+		}
+		if !b.shouldTrackEventMessageLocked(state, msg.ID, created) {
+			continue
+		}
+
+		msgState := b.getOrCreateEventMessageStateLocked(state, msg.ID)
+		msgState.Info = mergeMessageInfo(msgState.Info, opencode.MessageInfo{
+			ID:        msg.ID,
+			SessionID: state.sessionID,
+			Role:      msg.Role,
+			Time: opencode.MessageTime{
+				Created: created,
+			},
+			Finish:     msg.Finish,
+			ModelID:    msg.ModelID,
+			ProviderID: msg.ProviderID,
+		})
+		if msg.Finish != "" && msgState.Info.Time.Completed == 0 {
+			msgState.Info.Time.Completed = created
+		}
+
+		for _, rawPart := range msg.Parts {
+			part, ok := rawPart.(opencode.MessagePartResponse)
+			if !ok {
+				continue
+			}
+			upsertEventPartLocked(msgState, part)
+		}
+
+		if role := strings.ToLower(strings.TrimSpace(msgState.Info.Role)); role != "user" && role != "" {
+			b.enqueueEventMessageLocked(state, msg.ID)
+		}
+	}
+
+	for b.tryPromoteNextActiveMessage(state) {
+	}
+}
+
+func upsertEventPartLocked(msgState *eventMessageState, part opencode.MessagePartResponse) bool {
+	if msgState == nil {
+		return false
+	}
+
+	partID := strings.TrimSpace(part.ID)
+	if partID == "" {
+		partID = fmt.Sprintf("%s:%d", part.Type, len(msgState.PartOrder)+1)
+		part.ID = partID
+	}
+
+	existing, exists := msgState.Parts[partID]
+	if exists && sameEventPart(existing, part) {
+		return false
+	}
+
+	if !exists {
+		msgState.PartOrder = append(msgState.PartOrder, partID)
+	}
+	msgState.Parts[partID] = part
+	return true
+}
+
+func sameEventPart(left, right opencode.MessagePartResponse) bool {
+	if left.ID != right.ID || left.Type != right.Type || left.Text != right.Text {
+		return false
+	}
+	if left.Tool != right.Tool || left.Snapshot != right.Snapshot || left.Reason != right.Reason {
+		return false
+	}
+	if stringifyToolValue(left.State) != stringifyToolValue(right.State) {
+		return false
+	}
+	return true
 }
 
 // formatMessageForDisplay formats a message for Telegram display
@@ -1977,8 +2576,18 @@ func (b *Bot) updateTelegramMessage(c telebot.Context, msg *telebot.Message, con
 		return
 	}
 
+	safeChunks := b.ensureTelegramRenderSafeDisplays([]string{content}, streaming)
+	if len(safeChunks) == 0 {
+		return
+	}
+	content = safeChunks[0]
+
 	rendered := b.buildTelegramRenderResult(content, streaming)
-	primary := b.truncateTelegramText(rendered.primaryText)
+	primary := rendered.primaryText
+	if len(primary) > telegramMessageMaxLength {
+		log.Warnf("Skipping Telegram edit because rendered content exceeds limit (%d)", len(primary))
+		return
+	}
 
 	if msg.Text == primary {
 		log.Debug("Skipping Telegram edit because message content is unchanged")
@@ -2004,7 +2613,7 @@ func (b *Bot) updateTelegramMessage(c telebot.Context, msg *telebot.Message, con
 			log.Warnf("Failed to update Telegram message: %v", err)
 			// If editing fails, try to send a new message with fallback handling
 			var newMsg *telebot.Message
-			newMsg, err = b.sendRenderedTelegramMessage(c, primary, streaming)
+			newMsg, err = b.sendRenderedTelegramMessage(c, content, streaming)
 			if err != nil {
 				log.Errorf("Failed to send new message: %v", err)
 				return
@@ -2060,14 +2669,6 @@ func (b *Bot) buildTelegramRenderResult(content string, streaming bool) telegram
 	}
 }
 
-func (b *Bot) truncateTelegramText(content string) string {
-	if len(content) > 4000 {
-		log.Debugf("Message content too long (%d chars), truncating to 4000", len(content))
-		return content[:4000] + "\n...(content too long, truncated)"
-	}
-	return content
-}
-
 func (b *Bot) sendTelegramWithMode(c telebot.Context, text string, mode telebot.ParseMode) (*telebot.Message, error) {
 	if mode == telebot.ModeDefault {
 		return c.Bot().Send(c.Chat(), text)
@@ -2083,8 +2684,20 @@ func (b *Bot) editTelegramWithMode(c telebot.Context, msg *telebot.Message, text
 }
 
 func (b *Bot) sendRenderedTelegramMessage(c telebot.Context, content string, streaming bool) (*telebot.Message, error) {
+	safeChunks := b.ensureTelegramRenderSafeDisplays([]string{content}, streaming)
+	if len(safeChunks) == 0 {
+		return nil, fmt.Errorf("empty content after render-safe pagination")
+	}
+	if len(safeChunks) > 1 {
+		log.Warnf("sendRenderedTelegramMessage received multi-page content, sending first page only")
+	}
+	content = safeChunks[0]
+
 	rendered := b.buildTelegramRenderResult(content, streaming)
-	primary := b.truncateTelegramText(rendered.primaryText)
+	primary := rendered.primaryText
+	if len(primary) > telegramMessageMaxLength {
+		return nil, fmt.Errorf("rendered content exceeds telegram limit: %d", len(primary))
+	}
 
 	// Try sending with the preferred mode (usually HTML)
 	msg, err := b.sendTelegramWithMode(c, primary, rendered.primaryMode)
@@ -2213,6 +2826,11 @@ func (b *Bot) handleDelete(c telebot.Context) error {
 func (b *Bot) handleStreamChunk(state *streamingState, textChunk string) error {
 	state.updateMutex.Lock()
 	defer state.updateMutex.Unlock()
+
+	// Prefer event-driven updates when available. Keep chunk handling only as fallback.
+	if state.hasEventUpdates {
+		return nil
+	}
 
 	// Some stream providers emit cumulative snapshots instead of pure deltas.
 	// Normalize to incremental append to avoid duplicated content growth.
@@ -2356,7 +2974,7 @@ func (b *Bot) formatStreamingDisplays(content string) []string {
 		// Only output content, no progress indicators or pagination headers
 		displays = append(displays, chunk)
 	}
-	return displays
+	return b.ensureTelegramRenderSafeDisplays(displays, true)
 }
 
 func (b *Bot) paginateDisplayText(content string, streaming bool) []string {
@@ -2367,7 +2985,7 @@ func (b *Bot) paginateDisplayText(content string, streaming bool) []string {
 
 	chunks := b.splitLongContentPreserveCodeBlocks(content)
 	if len(chunks) <= 1 {
-		return []string{content}
+		return b.ensureTelegramRenderSafeDisplays([]string{content}, streaming)
 	}
 
 	displays := make([]string, 0, len(chunks))
@@ -2375,11 +2993,130 @@ func (b *Bot) paginateDisplayText(content string, streaming bool) []string {
 		// Only add content, no pagination headers
 		displays = append(displays, chunk)
 	}
-	return displays
+	return b.ensureTelegramRenderSafeDisplays(displays, streaming)
+}
+
+func (b *Bot) ensureTelegramRenderSafeDisplays(displays []string, streaming bool) []string {
+	if len(displays) == 0 {
+		return nil
+	}
+
+	normalized := make([]string, 0, len(displays))
+	for _, display := range displays {
+		if display == "" {
+			normalized = append(normalized, display)
+			continue
+		}
+
+		safeParts := b.splitDisplayToTelegramSafe(display, streaming)
+		normalized = append(normalized, safeParts...)
+		if len(normalized) >= maxTelegramMessages {
+			normalized = normalized[:maxTelegramMessages]
+			last := len(normalized) - 1
+			normalized[last] += "\n\n... (response too long, truncated)"
+			return normalized
+		}
+	}
+	return normalized
+}
+
+func (b *Bot) splitDisplayToTelegramSafe(content string, streaming bool) []string {
+	if content == "" {
+		return []string{""}
+	}
+
+	if b.renderedLengthWithinTelegramLimit(content, streaming) {
+		return []string{content}
+	}
+
+	left, right := splitContentNearMiddle(content)
+	if left == "" || right == "" || left == content || right == content {
+		runes := []rune(content)
+		if len(runes) <= 1 {
+			return []string{content}
+		}
+		mid := len(runes) / 2
+		left = string(runes[:mid])
+		right = string(runes[mid:])
+		if left == "" || right == "" {
+			return []string{content}
+		}
+	}
+
+	parts := b.splitDisplayToTelegramSafe(left, streaming)
+	parts = append(parts, b.splitDisplayToTelegramSafe(right, streaming)...)
+	return parts
+}
+
+func (b *Bot) renderedLengthWithinTelegramLimit(content string, streaming bool) bool {
+	rendered := b.buildTelegramRenderResult(content, streaming)
+	return len(rendered.primaryText) <= telegramMessageMaxLength
+}
+
+func splitContentNearMiddle(content string) (string, string) {
+	runes := []rune(content)
+	total := len(runes)
+	if total <= 1 {
+		return content, ""
+	}
+
+	mid := total / 2
+	bestSplit := -1
+	bestDistance := total + 1
+	searchWindow := 300
+	if searchWindow > mid {
+		searchWindow = mid
+	}
+	for i := mid; i >= mid-searchWindow; i-- {
+		if i <= 0 || i >= total {
+			continue
+		}
+		if runes[i-1] == '\n' {
+			dist := mid - i
+			if dist < 0 {
+				dist = -dist
+			}
+			if dist < bestDistance {
+				bestDistance = dist
+				bestSplit = i
+			}
+			break
+		}
+	}
+	upper := mid + searchWindow
+	if upper >= total {
+		upper = total - 1
+	}
+	for i := mid; i <= upper; i++ {
+		if i <= 0 || i >= total {
+			continue
+		}
+		if runes[i-1] == '\n' {
+			dist := i - mid
+			if dist < 0 {
+				dist = -dist
+			}
+			if dist < bestDistance {
+				bestDistance = dist
+				bestSplit = i
+			}
+			break
+		}
+	}
+
+	if bestSplit <= 0 || bestSplit >= total {
+		bestSplit = mid
+	}
+	return string(runes[:bestSplit]), string(runes[bestSplit:])
 }
 
 func (b *Bot) updateStreamingTelegramMessages(state *streamingState, displays []string) {
 	if len(displays) == 0 || state.telegramCtx == nil {
+		return
+	}
+
+	displays = b.ensureTelegramRenderSafeDisplays(displays, true)
+	if len(displays) == 0 {
 		return
 	}
 
@@ -2444,18 +3181,14 @@ func (b *Bot) handleFinalResponse(c telebot.Context, state *streamingState, cont
 			cachedMessageChunks: make(map[string][]string),
 			allDisplayChunks:    nil,
 			sessionInfoAdded:    false,
+			initialMessageIDs:   make(map[string]bool),
+			eventMessages:       make(map[string]*eventMessageState),
+			displaySet:          make(map[string]bool),
+			pendingSet:          make(map[string]bool),
 		}
 	}
 
-	// Check if content fits in one message.
-	if len(content) <= 3500 {
-		// Only output content, no completion markers
-		b.updateTelegramMessage(c, state.telegramMessages[0], content, false)
-		return
-	}
-
-	// Content is too long: split and render all parts in-place.
-	chunks := b.splitLongContent(content)
+	chunks := b.ensureTelegramRenderSafeDisplays([]string{content}, false)
 	if len(chunks) == 0 {
 		b.updateTelegramMessage(c, state.telegramMessages[0], "✅ Response completed.", false)
 		return

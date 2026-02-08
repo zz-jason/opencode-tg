@@ -111,6 +111,7 @@ type MessageInfo struct {
 	SessionID  string      `json:"sessionID"`
 	Role       string      `json:"role"`
 	Time       MessageTime `json:"time"`
+	Error      interface{} `json:"error,omitempty"`
 	ParentID   string      `json:"parentID,omitempty"`
 	ModelID    string      `json:"modelID,omitempty"`
 	ProviderID string      `json:"providerID,omitempty"`
@@ -144,6 +145,29 @@ type MessagePartResponse struct {
 	CallID    string      `json:"callID,omitempty"`
 	Tool      string      `json:"tool,omitempty"`
 	State     interface{} `json:"state,omitempty"`
+}
+
+// SessionEvent represents a streamed event from /event.
+type SessionEvent struct {
+	Type       string          `json:"type"`
+	Properties json.RawMessage `json:"properties,omitempty"`
+}
+
+// GlobalSessionEventEnvelope represents /global/event payload shape.
+type GlobalSessionEventEnvelope struct {
+	Directory string       `json:"directory,omitempty"`
+	Payload   SessionEvent `json:"payload"`
+}
+
+// MessageUpdatedProperties represents properties for message.updated events.
+type MessageUpdatedProperties struct {
+	Info MessageInfo `json:"info"`
+}
+
+// MessagePartUpdatedProperties represents properties for message.part.updated events.
+type MessagePartUpdatedProperties struct {
+	Part  MessagePartResponse `json:"part"`
+	Delta string              `json:"delta,omitempty"`
 }
 
 // CreateSessionRequest represents a request to create a session
@@ -469,6 +493,11 @@ func generateMessageID() string {
 	return fmt.Sprintf("msg%s", hex.EncodeToString(bytes))
 }
 
+// GenerateMessageID generates a unique message ID starting with "msg".
+func GenerateMessageID() string {
+	return generateMessageID()
+}
+
 // InitSessionWithModel initializes a session with a specific model
 func (c *Client) InitSessionWithModel(ctx context.Context, sessionID string, providerID, modelID string) error {
 	log.Debugf("InitSessionWithModel called for session %s with provider %s model %s", sessionID, providerID, modelID)
@@ -709,6 +738,125 @@ func (c *Client) StreamMessage(ctx context.Context, sessionID string, content st
 	}
 
 	return nil
+}
+
+// StreamSessionEvents subscribes to OpenCode /event SSE stream and emits structured events.
+func (c *Client) StreamSessionEvents(ctx context.Context, callback func(SessionEvent) error) error {
+	if callback == nil {
+		return errors.New("stream events callback is nil")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/event", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Cache-Control", "no-cache")
+
+	transport := &http.Transport{
+		Proxy:               nil,
+		TLSHandshakeTimeout: 30 * time.Second,
+		IdleConnTimeout:     300 * time.Second,
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+	}
+	if baseTransport, ok := c.client.Transport.(*http.Transport); ok && baseTransport != nil {
+		transport = baseTransport.Clone()
+		transport.Proxy = nil
+		transport.ResponseHeaderTimeout = 30 * time.Second
+	}
+
+	streamClient := &http.Client{
+		Transport: transport,
+		Timeout:   0, // Keep stream open until context cancellation.
+	}
+
+	resp, err := streamClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("event stream request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	if !strings.Contains(contentType, "text/event-stream") {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("event stream unexpected content-type %q: %s", contentType, strings.TrimSpace(string(body)))
+	}
+
+	reader := bufio.NewReader(resp.Body)
+	var dataLines []string
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+
+		line = strings.TrimSuffix(line, "\n")
+		line = strings.TrimSuffix(line, "\r")
+
+		if line == "" {
+			if len(dataLines) == 0 {
+				continue
+			}
+			rawData := strings.Join(dataLines, "\n")
+			dataLines = dataLines[:0]
+
+			event, parseErr := parseSessionEventData(rawData)
+			if parseErr != nil {
+				log.Debugf("Skip unparsable event payload: %v", parseErr)
+				continue
+			}
+			if event.Type == "" {
+				continue
+			}
+			if err := callback(event); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
+		if strings.HasPrefix(line, "data:") {
+			value := strings.TrimPrefix(line, "data:")
+			value = strings.TrimPrefix(value, " ")
+			dataLines = append(dataLines, value)
+		}
+	}
+}
+
+func parseSessionEventData(data string) (SessionEvent, error) {
+	data = strings.TrimSpace(data)
+	if data == "" {
+		return SessionEvent{}, errors.New("empty event payload")
+	}
+
+	var direct SessionEvent
+	if err := json.Unmarshal([]byte(data), &direct); err == nil && direct.Type != "" {
+		return direct, nil
+	}
+
+	var wrapped GlobalSessionEventEnvelope
+	if err := json.Unmarshal([]byte(data), &wrapped); err == nil && wrapped.Payload.Type != "" {
+		return wrapped.Payload, nil
+	}
+
+	return SessionEvent{}, fmt.Errorf("unsupported event payload: %s", data)
 }
 
 func extractTextChunksFromStreamEvent(data string) []string {

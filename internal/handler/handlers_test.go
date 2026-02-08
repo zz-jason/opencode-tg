@@ -1,10 +1,12 @@
 package handler
 
 import (
+	"encoding/json"
 	"strings"
 	"sync"
 	"testing"
 	"tg-bot/internal/opencode"
+	"tg-bot/internal/render"
 	"time"
 )
 
@@ -493,5 +495,202 @@ func TestFormatStreamingDisplays_LongSingleLineCreatesMultipleParts(t *testing.T
 	}
 	if totalLength != len(content) {
 		t.Errorf("total length mismatch: got %d, expected %d", totalLength, len(content))
+	}
+}
+
+func TestEventDrivenMessagePromotion_OrderByCompletion(t *testing.T) {
+	b := &Bot{}
+	state := &streamingState{
+		requestStartedAt:  time.Now().UnixMilli(),
+		initialMessageIDs: map[string]bool{},
+		eventMessages:     make(map[string]*eventMessageState),
+		displaySet:        make(map[string]bool),
+		pendingSet:        make(map[string]bool),
+	}
+
+	msg1Created := state.requestStartedAt + 10
+	msg2Created := state.requestStartedAt + 20
+
+	msg1StartRaw, _ := json.Marshal(opencode.MessageUpdatedProperties{
+		Info: opencode.MessageInfo{
+			ID:        "msg_assistant_1",
+			SessionID: "ses_test",
+			Role:      "assistant",
+			Time: opencode.MessageTime{
+				Created: msg1Created,
+			},
+		},
+	})
+	changed, force := b.applyMessageUpdatedEventLocked(state, "ses_test", msg1StartRaw)
+	if !changed || !force {
+		t.Fatalf("expected first assistant message to change state and trigger flush, got changed=%v force=%v", changed, force)
+	}
+	if state.activeMessageID != "msg_assistant_1" {
+		t.Fatalf("expected active message to be msg_assistant_1, got %q", state.activeMessageID)
+	}
+	if len(state.displayOrder) != 1 || state.displayOrder[0] != "msg_assistant_1" {
+		t.Fatalf("unexpected display order after first message: %+v", state.displayOrder)
+	}
+
+	part1Raw, _ := json.Marshal(opencode.MessagePartUpdatedProperties{
+		Part: opencode.MessagePartResponse{
+			ID:        "part_1",
+			SessionID: "ses_test",
+			MessageID: "msg_assistant_1",
+			Type:      "text",
+			Text:      "hello from first",
+		},
+		Delta: "hello from first",
+	})
+	changed, _ = b.applyMessagePartUpdatedEventLocked(state, "ses_test", part1Raw)
+	if !changed {
+		t.Fatalf("expected part update for first message to be applied")
+	}
+
+	msg2StartRaw, _ := json.Marshal(opencode.MessageUpdatedProperties{
+		Info: opencode.MessageInfo{
+			ID:        "msg_assistant_2",
+			SessionID: "ses_test",
+			Role:      "assistant",
+			Time: opencode.MessageTime{
+				Created: msg2Created,
+			},
+		},
+	})
+	changed, _ = b.applyMessageUpdatedEventLocked(state, "ses_test", msg2StartRaw)
+	if !changed {
+		t.Fatalf("expected second assistant message to be tracked")
+	}
+	if state.activeMessageID != "msg_assistant_1" {
+		t.Fatalf("second message must not become active before first completion, got %q", state.activeMessageID)
+	}
+	if len(state.displayOrder) != 1 || state.displayOrder[0] != "msg_assistant_1" {
+		t.Fatalf("second message must not be displayed yet, got order=%+v", state.displayOrder)
+	}
+	if len(state.pendingOrder) != 1 || state.pendingOrder[0] != "msg_assistant_2" {
+		t.Fatalf("expected second message in pending queue, got %+v", state.pendingOrder)
+	}
+
+	msg1FinishRaw, _ := json.Marshal(opencode.MessageUpdatedProperties{
+		Info: opencode.MessageInfo{
+			ID:        "msg_assistant_1",
+			SessionID: "ses_test",
+			Role:      "assistant",
+			Time: opencode.MessageTime{
+				Created:   msg1Created,
+				Completed: msg1Created + 100,
+			},
+			Finish: "stop",
+		},
+	})
+	changed, force = b.applyMessageUpdatedEventLocked(state, "ses_test", msg1FinishRaw)
+	if !changed || !force {
+		t.Fatalf("expected completion update to trigger state change and flush, got changed=%v force=%v", changed, force)
+	}
+
+	if !b.tryPromoteNextActiveMessage(state) {
+		t.Fatalf("expected pending second message to be promoted after first completion")
+	}
+	if state.activeMessageID != "msg_assistant_2" {
+		t.Fatalf("expected active message to switch to msg_assistant_2, got %q", state.activeMessageID)
+	}
+	if len(state.displayOrder) != 2 || state.displayOrder[1] != "msg_assistant_2" {
+		t.Fatalf("expected second message appended to display order, got %+v", state.displayOrder)
+	}
+}
+
+func TestBuildEventDrivenDisplaysLocked_IncludesOnlyPromotedMessages(t *testing.T) {
+	b := &Bot{}
+	state := &streamingState{
+		eventMessages: make(map[string]*eventMessageState),
+		displaySet:    make(map[string]bool),
+		pendingSet:    make(map[string]bool),
+	}
+
+	first := &eventMessageState{
+		Info: opencode.MessageInfo{
+			ID:        "msg_first",
+			SessionID: "ses_test",
+			Role:      "assistant",
+			Time: opencode.MessageTime{
+				Created: 1,
+			},
+		},
+		PartOrder: []string{"p1"},
+		Parts: map[string]opencode.MessagePartResponse{
+			"p1": {
+				ID:        "p1",
+				SessionID: "ses_test",
+				MessageID: "msg_first",
+				Type:      "text",
+				Text:      "first-response",
+			},
+		},
+	}
+	second := &eventMessageState{
+		Info: opencode.MessageInfo{
+			ID:        "msg_second",
+			SessionID: "ses_test",
+			Role:      "assistant",
+			Time: opencode.MessageTime{
+				Created: 2,
+			},
+		},
+		PartOrder: []string{"p2"},
+		Parts: map[string]opencode.MessagePartResponse{
+			"p2": {
+				ID:        "p2",
+				SessionID: "ses_test",
+				MessageID: "msg_second",
+				Type:      "text",
+				Text:      "second-response",
+			},
+		},
+	}
+
+	state.eventMessages["msg_first"] = first
+	state.eventMessages["msg_second"] = second
+	state.displayOrder = []string{"msg_first"}
+
+	displays := b.buildEventDrivenDisplaysLocked(state)
+	if len(displays) == 0 {
+		t.Fatalf("expected rendered displays for first promoted message")
+	}
+	if !strings.Contains(strings.Join(displays, "\n"), "first-response") {
+		t.Fatalf("expected first message content in displays, got: %q", strings.Join(displays, "\n"))
+	}
+	if strings.Contains(strings.Join(displays, "\n"), "second-response") {
+		t.Fatalf("second message should not be rendered before promotion")
+	}
+
+	state.displayOrder = append(state.displayOrder, "msg_second")
+	displays = b.buildEventDrivenDisplaysLocked(state)
+	joined := strings.Join(displays, "\n")
+	if !strings.Contains(joined, "first-response") || !strings.Contains(joined, "second-response") {
+		t.Fatalf("expected both messages after promotion, got: %q", joined)
+	}
+}
+
+func TestEnsureTelegramRenderSafeDisplays_SplitsRenderedOversizeWithoutTruncation(t *testing.T) {
+	b := &Bot{}
+	b.renderer = render.New("markdown_stream")
+
+	// '<' expands to "&lt;" in HTML mode, which can exceed Telegram limit after rendering.
+	original := strings.Repeat("<", 5000)
+	displays := b.ensureTelegramRenderSafeDisplays([]string{original}, false)
+	if len(displays) <= 1 {
+		t.Fatalf("expected oversized rendered content to be split into multiple displays, got %d", len(displays))
+	}
+
+	joined := strings.Join(displays, "")
+	if joined != original {
+		t.Fatalf("expected split displays to preserve raw content length; got=%d want=%d", len(joined), len(original))
+	}
+
+	for i, display := range displays {
+		if !b.renderedLengthWithinTelegramLimit(display, false) {
+			renderedLen := len(b.buildTelegramRenderResult(display, false).primaryText)
+			t.Fatalf("display %d exceeds telegram render limit: %d", i, renderedLen)
+		}
 	}
 }

@@ -3,6 +3,7 @@ package opencode
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -319,5 +320,73 @@ func TestExtractTextChunksFromStreamEvent(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestParseSessionEventData(t *testing.T) {
+	t.Run("direct_event_payload", func(t *testing.T) {
+		event, err := parseSessionEventData(`{"type":"message.updated","properties":{"info":{"id":"msg_1"}}}`)
+		if err != nil {
+			t.Fatalf("parseSessionEventData returned error: %v", err)
+		}
+		if event.Type != "message.updated" {
+			t.Fatalf("unexpected event type: %q", event.Type)
+		}
+	})
+
+	t.Run("global_event_envelope_payload", func(t *testing.T) {
+		event, err := parseSessionEventData(`{"directory":"/tmp/project","payload":{"type":"message.part.updated","properties":{"part":{"id":"part_1"}}}}`)
+		if err != nil {
+			t.Fatalf("parseSessionEventData returned error: %v", err)
+		}
+		if event.Type != "message.part.updated" {
+			t.Fatalf("unexpected event type: %q", event.Type)
+		}
+	})
+}
+
+func TestStreamSessionEvents(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/event" {
+			http.NotFound(w, r)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+
+		_, _ = fmt.Fprint(w, "data: {\"type\":\"message.updated\",\"properties\":{\"info\":{\"id\":\"msg_first\",\"sessionID\":\"ses_test\",\"role\":\"assistant\",\"time\":{\"created\":1}}}}\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+		_, _ = fmt.Fprint(w, "data: {\"directory\":\"/tmp/project\",\"payload\":{\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"part_1\",\"sessionID\":\"ses_test\",\"messageID\":\"msg_first\",\"type\":\"text\",\"text\":\"hello\"},\"delta\":\"hello\"}}}\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, 5)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var events []SessionEvent
+	err := client.StreamSessionEvents(ctx, func(event SessionEvent) error {
+		events = append(events, event)
+		return nil
+	})
+	if err != nil && err != context.DeadlineExceeded {
+		t.Fatalf("StreamSessionEvents returned unexpected error: %v", err)
+	}
+
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+	if events[0].Type != "message.updated" {
+		t.Fatalf("unexpected first event type: %q", events[0].Type)
+	}
+	if events[1].Type != "message.part.updated" {
+		t.Fatalf("unexpected second event type: %q", events[1].Type)
 	}
 }
