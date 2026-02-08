@@ -26,9 +26,12 @@ const (
 	maxTelegramMessages = 20
 	// telegramMessageMaxLength is Telegram's hard message size limit.
 	telegramMessageMaxLength = 4096
+	// eventSettleCompletionQuietWindow is the quiet period required after an explicit
+	// completion marker to avoid exiting before late-arriving follow-up message IDs.
+	eventSettleCompletionQuietWindow = 3 * time.Second
 	// eventSettleIdleWindow is the quiet period after send completion used as a
 	// fallback settle signal when upstream does not emit explicit finish markers.
-	eventSettleIdleWindow = 20 * time.Second
+	eventSettleIdleWindow = 45 * time.Second
 )
 
 // Bot represents the Telegram bot with all dependencies
@@ -1488,6 +1491,15 @@ func (b *Bot) handleText(c telebot.Context) error {
 		time.Sleep(120 * time.Millisecond)
 	}
 
+	// Run one final reconciliation pass before stopping event consumption so
+	// snapshot-persisted tail content can still be reflected in Telegram.
+	b.reconcileEventStateWithLatestMessages(streamingState)
+	streamingState.updateMutex.Lock()
+	for b.tryPromoteNextActiveMessage(streamingState) {
+	}
+	b.flushEventDisplaysLocked(streamingState, true)
+	streamingState.updateMutex.Unlock()
+
 	cancel()
 	select {
 	case <-eventDone:
@@ -2183,7 +2195,12 @@ func (b *Bot) eventPipelineSettledLocked(state *streamingState, sendCompleted bo
 	}
 	active := state.eventMessages[state.activeMessageID]
 	if isEventMessageCompleted(active) {
-		return true
+		if state.lastEventAt.IsZero() {
+			return true
+		}
+		// Keep listening briefly after completion in case provider emits the
+		// next message ID slightly later.
+		return time.Since(state.lastEventAt) >= eventSettleCompletionQuietWindow
 	}
 	// Fallback settle condition: if send request has completed and no new event/snapshot
 	// changes were observed for a while, treat active message as converged.

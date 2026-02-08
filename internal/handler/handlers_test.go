@@ -807,3 +807,36 @@ func TestEventPipelineSettledLocked_UsesIdleFallbackWithoutExplicitFinish(t *tes
 		t.Fatalf("did not expect settle immediately after a recent event")
 	}
 }
+
+func TestEventPipelineSettledLocked_CompletedMessageRequiresQuietWindow(t *testing.T) {
+	b := &Bot{}
+	now := time.Now()
+	state := &streamingState{
+		hasEventUpdates: true,
+		lastEventAt:     now,
+		activeMessageID: "msg_assistant_1",
+		eventMessages: map[string]*eventMessageState{
+			"msg_assistant_1": {
+				Info: opencode.MessageInfo{
+					ID:        "msg_assistant_1",
+					SessionID: "ses_test",
+					Role:      "assistant",
+					Time: opencode.MessageTime{
+						Created:   now.UnixMilli(),
+						Completed: now.UnixMilli(),
+					},
+					Finish: "stop",
+				},
+			},
+		},
+	}
+
+	if b.eventPipelineSettledLocked(state, true) {
+		t.Fatalf("did not expect immediate settle right after completion marker")
+	}
+
+	state.lastEventAt = now.Add(-(eventSettleCompletionQuietWindow + time.Second))
+	if !b.eventPipelineSettledLocked(state, true) {
+		t.Fatalf("expected settle after completion quiet window elapsed")
+	}
+}
