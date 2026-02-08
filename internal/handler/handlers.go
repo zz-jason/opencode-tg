@@ -57,9 +57,8 @@ type Bot struct {
 
 // streamingState tracks the state of an active streaming response
 type streamingState struct {
-	ctx         context.Context
-	cancel      context.CancelFunc
-	stopUpdates chan struct{}
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	telegramMsg      *telebot.Message
 	telegramMessages []*telebot.Message
@@ -1501,61 +1500,6 @@ func (b *Bot) handleText(c telebot.Context) error {
 	return nil
 }
 
-func (b *Bot) waitForLatestAssistantContent(sessionID string, timeout time.Duration) (string, error) {
-	deadline := time.Now().Add(timeout)
-	var lastErr error
-
-	for time.Now().Before(deadline) {
-		content, err := b.getLatestAssistantContent(sessionID)
-		if err != nil {
-			lastErr = err
-		} else if content != "" {
-			return content, nil
-		}
-
-		time.Sleep(500 * time.Millisecond)
-	}
-
-	// Final immediate check at timeout boundary.
-	content, err := b.getLatestAssistantContent(sessionID)
-	if err != nil {
-		if lastErr != nil {
-			return "", lastErr
-		}
-		return "", err
-	}
-	return content, nil
-}
-
-func (b *Bot) getLatestAssistantContent(sessionID string) (string, error) {
-	messages, err := b.opencodeClient.GetMessages(b.ctx, sessionID)
-	if err != nil {
-		return "", err
-	}
-
-	for i := len(messages) - 1; i >= 0; i-- {
-		msg := messages[i]
-		if msg.Role != "assistant" {
-			continue
-		}
-
-		content := strings.TrimSpace(msg.Content)
-		if content != "" {
-			return content, nil
-		}
-
-		if len(msg.Parts) == 0 {
-			continue
-		}
-		parts := strings.TrimSpace(formatMessageParts(msg.Parts))
-		if parts != "" && parts != "No detailed content" {
-			return parts, nil
-		}
-	}
-
-	return "", nil
-}
-
 // The following handlers are stubs for future implementation
 
 func (b *Bot) handleFiles(c telebot.Context) error {
@@ -1923,84 +1867,6 @@ func (b *Bot) clearModelMapping(userID int64) {
 	delete(b.modelMapping, userID)
 }
 
-// periodicMessageUpdates periodically polls OpenCode and updates streaming messages.
-// It serves as a fallback path when SSE text chunks are sparse or absent.
-func (b *Bot) periodicMessageUpdates(ctx context.Context, state *streamingState, sessionID string, stopCh <-chan struct{}) {
-	if state == nil {
-		return
-	}
-
-	// Ticker for periodic updates (every 2 seconds)
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
-	// Count updates for logging
-	updateCount := 0
-
-	for {
-		select {
-		case <-ctx.Done():
-			log.Debugf("Periodic updates stopped for session %s: context done", sessionID)
-			return
-		case <-stopCh:
-			log.Debugf("Periodic updates stopped for session %s: stop signal", sessionID)
-			return
-		case <-ticker.C:
-			state.updateMutex.Lock()
-			hasRecentEvents := state.hasEventUpdates && time.Since(state.lastEventAt) < 5*time.Second
-			state.updateMutex.Unlock()
-			if hasRecentEvents {
-				continue
-			}
-
-			updateCount++
-			log.Debugf("Periodic update #%d for session %s", updateCount, sessionID)
-
-			messages, err := b.opencodeClient.GetMessages(ctx, sessionID)
-			if err != nil {
-				log.Errorf("Failed to get messages for periodic update: %v", err)
-				continue
-			}
-			if len(messages) == 0 {
-				continue
-			}
-
-			state.updateMutex.Lock()
-			if state.hasEventUpdates {
-				b.reconcileEventStateWithMessagesLocked(state, messages)
-				for b.tryPromoteNextActiveMessage(state) {
-				}
-				displays := b.buildEventDrivenDisplaysLocked(state)
-				if len(displays) == 0 {
-					displays = []string{"🤖 Processing...\n\nModel is thinking, please wait..."}
-				}
-				b.updateStreamingTelegramMessages(state, displays)
-				state.updateMutex.Unlock()
-				continue
-			}
-
-			// Get session metadata for formatting
-			var sessionMeta *session.SessionMeta
-			if b.sessionManager != nil {
-				if meta, exists := b.sessionManager.GetSessionMeta(sessionID); exists {
-					sessionMeta = meta
-				}
-			}
-
-			// Format all messages for streaming display (with cache)
-			displays := b.buildDisplayChunksFromMessagesWithCache(messages, sessionMeta, state)
-
-			// If no displays (should not happen), show a placeholder
-			if len(displays) == 0 {
-				displays = []string{"🤖 Processing...\n\nModel is thinking, please wait..."}
-			}
-
-			b.updateStreamingTelegramMessages(state, displays)
-			state.updateMutex.Unlock()
-		}
-	}
-}
-
 func (b *Bot) consumeSessionEvents(ctx context.Context, state *streamingState, sessionID string) {
 	if state == nil || b.opencodeClient == nil {
 		return
@@ -2028,6 +1894,7 @@ func (b *Bot) consumeSessionEvents(ctx context.Context, state *streamingState, s
 			state.updateMutex.Unlock()
 			return nil
 		})
+		backoff = 200 * time.Millisecond
 
 		if ctx.Err() != nil {
 			return
@@ -3200,54 +3067,6 @@ func (b *Bot) updateStreamingTelegramMessages(state *streamingState, displays []
 
 	if len(state.telegramMessages) > 0 {
 		state.telegramMsg = state.telegramMessages[0]
-	}
-}
-
-// handleFinalResponse handles the final response after streaming is complete.
-func (b *Bot) handleFinalResponse(c telebot.Context, state *streamingState, content string) {
-	content = strings.TrimSpace(content)
-	if content == "" {
-		content = "🤖 Response completed."
-	}
-
-	if state == nil || len(state.telegramMessages) == 0 {
-		msg, err := b.sendRenderedTelegramMessage(c, "🤖 Processing...", false)
-		if err != nil {
-			log.Errorf("Failed to create fallback message for final response: %v", err)
-			return
-		}
-		state = &streamingState{
-			telegramMessages:    []*telebot.Message{msg},
-			renderedMessageIDs:  make(map[string]bool),
-			cachedMessageChunks: make(map[string][]string),
-			allDisplayChunks:    nil,
-			sessionInfoAdded:    false,
-			initialMessageIDs:   make(map[string]bool),
-			eventMessages:       make(map[string]*eventMessageState),
-			displaySet:          make(map[string]bool),
-			pendingSet:          make(map[string]bool),
-		}
-	}
-
-	chunks := b.ensureTelegramRenderSafeDisplays([]string{content}, false)
-	if len(chunks) == 0 {
-		b.updateTelegramMessage(c, state.telegramMessages[0], "✅ Response completed.", false)
-		return
-	}
-
-	// Ensure enough Telegram messages exist for all parts.
-	for len(state.telegramMessages) < len(chunks) {
-		newMsg, err := b.sendRenderedTelegramMessage(c, "🤖 Processing...", false)
-		if err != nil {
-			log.Errorf("Failed to create final response part message %d: %v", len(state.telegramMessages)+1, err)
-			return
-		}
-		state.telegramMessages = append(state.telegramMessages, newMsg)
-	}
-
-	for i, chunk := range chunks {
-		// Only output content, no pagination headers or completion markers
-		b.updateTelegramMessage(c, state.telegramMessages[i], chunk, false)
 	}
 }
 
