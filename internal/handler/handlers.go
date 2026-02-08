@@ -83,7 +83,8 @@ type streamingState struct {
 	sessionInfoAdded bool
 
 	// Session ID for this streaming state
-	sessionID string
+	sessionID        string
+	requestMessageID string
 
 	// Event-driven stream state for /event updates.
 	requestStartedAt  int64
@@ -581,7 +582,6 @@ func (b *Bot) handleAbort(c telebot.Context) error {
 	b.streamingStateMu.Lock()
 	if state, ok := b.streamingStates[sessionID]; ok && state.isStreaming {
 		state.cancel()
-		close(state.stopUpdates)
 		state.isStreaming = false
 		log.Infof("Cancelled local streaming state for session %s", sessionID)
 	}
@@ -1334,26 +1334,16 @@ func (b *Bot) handleText(c telebot.Context) error {
 		return err
 	}
 
-	// Prepare context for the streaming request
+	// Prepare context for event-driven streaming request lifecycle.
 	ctx, cancel := context.WithCancel(b.ctx)
 	defer cancel()
 
-	// Channel to signal when to stop updates
-	stopUpdates := make(chan struct{})
-	stopUpdatesClosed := false
-	defer func() {
-		if !stopUpdatesClosed {
-			close(stopUpdates)
-		}
-	}()
-	periodicCtx, cancelPeriodic := context.WithCancel(ctx)
-	defer cancelPeriodic()
+	requestMessageID := opencode.GenerateMessageID()
 
 	// Track streaming state
 	streamingState := &streamingState{
 		ctx:                 ctx,
 		cancel:              cancel,
-		stopUpdates:         stopUpdates,
 		telegramMsg:         processingMsg,
 		telegramMessages:    []*telebot.Message{processingMsg},
 		lastRendered:        []string{"🤖 Processing..."},
@@ -1366,6 +1356,7 @@ func (b *Bot) handleText(c telebot.Context) error {
 		allDisplayChunks:    nil,
 		sessionInfoAdded:    false,
 		sessionID:           sessionID,
+		requestMessageID:    requestMessageID,
 		requestStartedAt:    time.Now().UnixMilli(),
 		initialMessageIDs:   make(map[string]bool),
 		eventMessages:       make(map[string]*eventMessageState),
@@ -1400,120 +1391,113 @@ func (b *Bot) handleText(c telebot.Context) error {
 		streamingState.isStreaming = false
 	}()
 
-	// Stream callback function to handle real-time updates
-	streamCallback := func(textChunk string) error {
-		return b.handleStreamChunk(streamingState, textChunk)
-	}
-
-	// Start periodic polling updates as a fallback channel for OpenCode outputs
-	// that may not be emitted as text chunks in SSE events.
-	periodicDone := make(chan struct{})
-	go func() {
-		defer close(periodicDone)
-		b.periodicMessageUpdates(periodicCtx, streamingState, sessionID, stopUpdates)
-	}()
-
-	// Start event stream updates. This is the preferred real-time source;
-	// periodic polling remains as a fallback if event stream is unavailable.
+	// Start event stream updates as the single real-time source.
 	eventDone := make(chan struct{})
 	go func() {
 		defer close(eventDone)
-		b.consumeSessionEvents(periodicCtx, streamingState, sessionID)
+		b.consumeSessionEvents(ctx, streamingState, sessionID)
 	}()
 
-	// Check if OpenCode server is reachable before starting stream
+	// Check if OpenCode server is reachable before sending the request.
 	healthCtx, healthCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer healthCancel()
 
 	if healthErr := b.opencodeClient.HealthCheck(healthCtx); healthErr != nil {
-		log.Warnf("OpenCode health check failed before streaming: %v", healthErr)
-		// Continue anyway, but log the warning
+		log.Warnf("OpenCode health check failed before sending message: %v", healthErr)
 	} else {
-		log.Debugf("OpenCode health check passed before streaming")
+		log.Debugf("OpenCode health check passed before sending message")
 	}
 
-	// Start streaming the message
-	err = b.opencodeClient.StreamMessage(ctx, sessionID, text, messageModel, streamCallback)
-	cancelPeriodic()
-	close(stopUpdates)
-	stopUpdatesClosed = true
-	select {
-	case <-periodicDone:
-	case <-time.After(2 * time.Second):
-		log.Warnf("Timed out waiting for periodic updater to stop for session %s", sessionID)
+	sendReq := &opencode.SendMessageRequest{
+		MessageID: requestMessageID,
+		Parts: []opencode.MessagePart{
+			{
+				Type: "text",
+				Text: text,
+			},
+		},
 	}
+	if messageModel != nil {
+		sendReq.Model = messageModel
+	}
+
+	sendErrCh := make(chan error, 1)
+	go func() {
+		sendErrCh <- b.opencodeClient.PostMessage(ctx, sessionID, sendReq)
+	}()
+
+	sendErr := <-sendErrCh
+	streamingState.isComplete = true
+
+	// Always reconcile against final snapshots to close any missed event gaps.
+	b.reconcileEventStateWithLatestMessages(streamingState)
+
+	settleTimeout := 2 * time.Duration(b.config.OpenCode.Timeout) * time.Second
+	if settleTimeout < 2*time.Minute {
+		settleTimeout = 2 * time.Minute
+	}
+	if settleTimeout > 30*time.Minute {
+		settleTimeout = 30 * time.Minute
+	}
+	settleDeadline := time.Now().Add(settleTimeout)
+	lastReconcileAt := time.Now()
+	noOutputSince := time.Now()
+	for {
+		if time.Since(lastReconcileAt) >= time.Second {
+			b.reconcileEventStateWithLatestMessages(streamingState)
+			lastReconcileAt = time.Now()
+		}
+
+		streamingState.updateMutex.Lock()
+		for b.tryPromoteNextActiveMessage(streamingState) {
+		}
+		b.flushEventDisplaysLocked(streamingState, true)
+		settled := b.eventPipelineSettledLocked(streamingState, true)
+		hasOutput := len(streamingState.displayOrder) > 0
+		hasEvents := streamingState.hasEventUpdates
+		if hasOutput {
+			noOutputSince = time.Now()
+		}
+		if !hasOutput && !hasEvents && time.Since(noOutputSince) >= 3*time.Second {
+			// Some providers return quickly with no assistant output.
+			settled = true
+		}
+		streamingState.updateMutex.Unlock()
+
+		if settled || time.Now().After(settleDeadline) {
+			break
+		}
+		time.Sleep(120 * time.Millisecond)
+	}
+
+	cancel()
 	select {
 	case <-eventDone:
 	case <-time.After(2 * time.Second):
-		log.Warnf("Timed out waiting for event updater to stop for session %s", sessionID)
+		log.Warnf("Timed out waiting for event stream to stop for session %s", sessionID)
 	}
-	if err != nil {
-		log.Errorf("Failed to stream message: %v", err)
 
-		if streamingState.hasEventUpdates {
-			b.reconcileEventStateWithLatestMessages(streamingState)
-			streamingState.updateMutex.Lock()
-			for b.tryPromoteNextActiveMessage(streamingState) {
-			}
-			displays := b.buildEventDrivenDisplaysLocked(streamingState)
-			if len(displays) > 0 {
-				b.updateStreamingTelegramMessages(streamingState, displays)
-				streamingState.updateMutex.Unlock()
-				return nil
-			}
-			streamingState.updateMutex.Unlock()
+	streamingState.updateMutex.Lock()
+	for b.tryPromoteNextActiveMessage(streamingState) {
+	}
+	displays := b.buildEventDrivenDisplaysLocked(streamingState)
+	if len(displays) > 0 {
+		b.updateStreamingTelegramMessages(streamingState, displays)
+		streamingState.updateMutex.Unlock()
+		if sendErr != nil {
+			log.Warnf("SendMessage returned error after event rendering completed: %v", sendErr)
 		}
+		return nil
+	}
+	streamingState.updateMutex.Unlock()
 
-		// Update with error message
-		errorMsg := fmt.Sprintf("Processing error: %v", err)
-		if len(errorMsg) > 4000 {
-			errorMsg = errorMsg[:4000]
-		}
-
-		// Add any partial content we received
-		finalContent := streamingState.content.String()
-		if finalContent != "" {
-			errorMsg = finalContent + "\n\n---\n\n" + errorMsg
-		}
-
+	if sendErr != nil {
+		errorMsg := fmt.Sprintf("Processing error: %v", sendErr)
 		b.updateTelegramMessage(c, processingMsg, errorMsg, false)
 		return nil
 	}
 
-	// Streaming completed successfully
-	// Mark streaming as complete
-	streamingState.isComplete = true
-
-	if streamingState.hasEventUpdates {
-		b.reconcileEventStateWithLatestMessages(streamingState)
-		streamingState.updateMutex.Lock()
-		for b.tryPromoteNextActiveMessage(streamingState) {
-		}
-		displays := b.buildEventDrivenDisplaysLocked(streamingState)
-		if len(displays) > 0 {
-			b.updateStreamingTelegramMessages(streamingState, displays)
-			streamingState.updateMutex.Unlock()
-			return nil
-		}
-		streamingState.updateMutex.Unlock()
-	}
-
-	// Get final content. Prefer the most complete assistant content available:
-	// streamed chunks and periodically-polled message content may differ by timing.
-	finalContent := streamingState.content.String()
-	fallbackContent, fallbackErr := b.waitForLatestAssistantContent(sessionID, 3*time.Second)
-	if fallbackErr != nil {
-		log.Warnf("Failed to fetch latest assistant content for fallback: %v", fallbackErr)
-	} else if len(strings.TrimSpace(fallbackContent)) > len(strings.TrimSpace(finalContent)) {
-		finalContent = fallbackContent
-	}
-	if finalContent == "" {
-		finalContent = "🤖 Response completed with no content."
-	}
-
-	// Handle final content (may need to split into multiple messages)
-	b.handleFinalResponse(c, streamingState, finalContent)
-
+	b.updateTelegramMessage(c, processingMsg, "🤖 Response completed with no content.", false)
 	return nil
 }
 
@@ -2022,33 +2006,52 @@ func (b *Bot) consumeSessionEvents(ctx context.Context, state *streamingState, s
 		return
 	}
 
-	err := b.opencodeClient.StreamSessionEvents(ctx, func(event opencode.SessionEvent) error {
-		state.updateMutex.Lock()
-		changed, forceFlush := b.applySessionEventLocked(state, sessionID, event)
-		if !changed {
+	backoff := 200 * time.Millisecond
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		err := b.opencodeClient.StreamSessionEvents(ctx, func(event opencode.SessionEvent) error {
+			state.updateMutex.Lock()
+			changed, forceFlush := b.applySessionEventLocked(state, sessionID, event)
+			if !changed {
+				state.updateMutex.Unlock()
+				return nil
+			}
+
+			state.hasEventUpdates = true
+			state.lastEventAt = time.Now()
+			for b.tryPromoteNextActiveMessage(state) {
+			}
+			b.flushEventDisplaysLocked(state, forceFlush)
 			state.updateMutex.Unlock()
 			return nil
+		})
+
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			log.Warnf("Event stream disconnected for session %s: %v", sessionID, err)
+		} else {
+			log.Warnf("Event stream closed unexpectedly for session %s", sessionID)
 		}
 
-		state.hasEventUpdates = true
-		state.lastEventAt = time.Now()
-		for b.tryPromoteNextActiveMessage(state) {
-		}
+		b.reconcileEventStateWithLatestMessages(state)
 
-		now := time.Now()
-		shouldFlush := forceFlush || now.Sub(state.lastUpdate) >= 350*time.Millisecond
-		if shouldFlush {
-			displays := b.buildEventDrivenDisplaysLocked(state)
-			if len(displays) > 0 {
-				state.lastUpdate = now
-				b.updateStreamingTelegramMessages(state, displays)
-			}
+		wait := backoff
+		if wait > 3*time.Second {
+			wait = 3 * time.Second
 		}
-		state.updateMutex.Unlock()
-		return nil
-	})
-	if err != nil && ctx.Err() == nil {
-		log.Warnf("Event stream exited for session %s: %v", sessionID, err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+		if backoff < 3*time.Second {
+			backoff *= 2
+		}
 	}
 }
 
@@ -2070,6 +2073,9 @@ func (b *Bot) applyMessageUpdatedEventLocked(state *streamingState, sessionID st
 	}
 	info := payload.Info
 	if info.ID == "" || info.SessionID == "" || info.SessionID != sessionID {
+		return false, false
+	}
+	if info.ID == state.requestMessageID && strings.EqualFold(strings.TrimSpace(info.Role), "user") {
 		return false, false
 	}
 	if !b.shouldTrackEventMessageLocked(state, info.ID, info.Time.Created) {
@@ -2098,6 +2104,9 @@ func (b *Bot) applyMessagePartUpdatedEventLocked(state *streamingState, sessionI
 
 	part := payload.Part
 	if part.MessageID == "" || part.SessionID == "" || part.SessionID != sessionID {
+		return false, false
+	}
+	if part.MessageID == state.requestMessageID {
 		return false, false
 	}
 	if !b.shouldTrackEventMessageLocked(state, part.MessageID, 0) {
@@ -2253,6 +2262,38 @@ func (b *Bot) tryPromoteNextActiveMessage(state *streamingState) bool {
 		state.displayOrder = append(state.displayOrder, next)
 	}
 	return true
+}
+
+func (b *Bot) flushEventDisplaysLocked(state *streamingState, force bool) bool {
+	if state == nil {
+		return false
+	}
+	now := time.Now()
+	if !force && now.Sub(state.lastUpdate) < 300*time.Millisecond {
+		return false
+	}
+
+	displays := b.buildEventDrivenDisplaysLocked(state)
+	if len(displays) == 0 {
+		return false
+	}
+	state.lastUpdate = now
+	b.updateStreamingTelegramMessages(state, displays)
+	return true
+}
+
+func (b *Bot) eventPipelineSettledLocked(state *streamingState, sendCompleted bool) bool {
+	if state == nil || !sendCompleted {
+		return false
+	}
+	if len(state.pendingOrder) > 0 {
+		return false
+	}
+	if state.activeMessageID == "" {
+		return len(state.displayOrder) > 0 || state.hasEventUpdates
+	}
+	active := state.eventMessages[state.activeMessageID]
+	return isEventMessageCompleted(active)
 }
 
 func isEventMessageCompleted(msg *eventMessageState) bool {

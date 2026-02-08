@@ -372,6 +372,25 @@ func (c *Client) SendMessage(ctx context.Context, sessionID string, req *SendMes
 	return message, nil
 }
 
+// PostMessage posts a user message to a session and ignores response body schema.
+// This is useful for event-driven flows where /event is the source of truth.
+func (c *Client) PostMessage(ctx context.Context, sessionID string, req *SendMessageRequest) error {
+	resp, err := c.request(ctx, "POST", fmt.Sprintf("/session/%s/message", sessionID), req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("post message failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	// Response shape may vary by provider/runtime. Drain and ignore.
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
+}
+
 // GetMessages gets all messages in a session
 func (c *Client) GetMessages(ctx context.Context, sessionID string) ([]Message, error) {
 	resp, err := c.request(ctx, "GET", fmt.Sprintf("/session/%s/message", sessionID), nil)

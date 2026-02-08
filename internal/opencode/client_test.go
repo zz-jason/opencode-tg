@@ -140,6 +140,45 @@ func TestSendMessage(t *testing.T) {
 	}
 }
 
+func TestPostMessage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" || !strings.HasPrefix(r.URL.Path, "/session/test-session/message") {
+			t.Errorf("Unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		var req SendMessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("Failed to decode request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if req.MessageID != "msg_custom_1" {
+			t.Errorf("expected messageID msg_custom_1, got %q", req.MessageID)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, 5)
+	err := client.PostMessage(context.Background(), "test-session", &SendMessageRequest{
+		MessageID: "msg_custom_1",
+		Parts: []MessagePart{
+			{
+				Type: "text",
+				Text: "hello",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("PostMessage failed: %v", err)
+	}
+}
+
 func TestGetSession(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" || r.URL.Path != "/session/test-session-123" {
