@@ -694,3 +694,116 @@ func TestEnsureTelegramRenderSafeDisplays_SplitsRenderedOversizeWithoutTruncatio
 		}
 	}
 }
+
+func TestApplyMessagePartUpdatedEventLocked_MissingPartIDIsStable(t *testing.T) {
+	b := &Bot{}
+	state := &streamingState{
+		requestStartedAt:  time.Now().UnixMilli(),
+		initialMessageIDs: map[string]bool{},
+		eventMessages:     make(map[string]*eventMessageState),
+		displaySet:        make(map[string]bool),
+		pendingSet:        make(map[string]bool),
+	}
+
+	partRaw, _ := json.Marshal(opencode.MessagePartUpdatedProperties{
+		Part: opencode.MessagePartResponse{
+			SessionID: "ses_test",
+			MessageID: "msg_assistant_1",
+			Type:      "text",
+			Text:      "hello",
+		},
+		Delta: "hello",
+	})
+
+	changed, _ := b.applyMessagePartUpdatedEventLocked(state, "ses_test", partRaw)
+	if !changed {
+		t.Fatalf("expected first missing-id part update to change state")
+	}
+	changed, _ = b.applyMessagePartUpdatedEventLocked(state, "ses_test", partRaw)
+	if changed {
+		t.Fatalf("expected duplicate missing-id part update to be ignored")
+	}
+
+	msgState := state.eventMessages["msg_assistant_1"]
+	if msgState == nil {
+		t.Fatalf("expected message state to exist")
+	}
+	if len(msgState.Parts) != 1 || len(msgState.PartOrder) != 1 {
+		t.Fatalf("expected one stable synthesized part, got parts=%d order=%d", len(msgState.Parts), len(msgState.PartOrder))
+	}
+}
+
+func TestReconcileEventStateWithMessagesLocked_MissingPartIDDoesNotDuplicate(t *testing.T) {
+	b := &Bot{}
+	state := &streamingState{
+		sessionID:         "ses_test",
+		requestStartedAt:  time.Now().UnixMilli(),
+		initialMessageIDs: map[string]bool{},
+		eventMessages:     make(map[string]*eventMessageState),
+		displaySet:        make(map[string]bool),
+		pendingSet:        make(map[string]bool),
+	}
+
+	message := opencode.Message{
+		ID:        "msg_assistant_1",
+		SessionID: "ses_test",
+		Role:      "assistant",
+		CreatedAt: time.Now(),
+		Parts: []interface{}{
+			opencode.MessagePartResponse{
+				SessionID: "ses_test",
+				MessageID: "msg_assistant_1",
+				Type:      "text",
+				Text:      "snapshot text",
+			},
+		},
+	}
+
+	b.reconcileEventStateWithMessagesLocked(state, []opencode.Message{message})
+	b.reconcileEventStateWithMessagesLocked(state, []opencode.Message{message})
+
+	msgState := state.eventMessages["msg_assistant_1"]
+	if msgState == nil {
+		t.Fatalf("expected reconciled message state")
+	}
+	if len(msgState.Parts) != 1 || len(msgState.PartOrder) != 1 {
+		t.Fatalf("expected one stable part after repeated reconcile, got parts=%d order=%d", len(msgState.Parts), len(msgState.PartOrder))
+	}
+
+	displays := b.buildEventDrivenDisplaysLocked(state)
+	joined := strings.Join(displays, "\n")
+	if strings.Count(joined, "snapshot text") != 1 {
+		t.Fatalf("expected snapshot text once after repeated reconcile, got: %q", joined)
+	}
+}
+
+func TestEventPipelineSettledLocked_UsesIdleFallbackWithoutExplicitFinish(t *testing.T) {
+	b := &Bot{}
+	now := time.Now()
+	state := &streamingState{
+		hasEventUpdates: true,
+		lastEventAt:     now.Add(-(eventSettleIdleWindow + time.Second)),
+		activeMessageID: "msg_assistant_1",
+		eventMessages: map[string]*eventMessageState{
+			"msg_assistant_1": {
+				Info: opencode.MessageInfo{
+					ID:        "msg_assistant_1",
+					SessionID: "ses_test",
+					Role:      "assistant",
+					Time: opencode.MessageTime{
+						Created: now.UnixMilli(),
+					},
+				},
+			},
+		},
+	}
+
+	if !b.eventPipelineSettledLocked(state, true) {
+		t.Fatalf("expected idle fallback settle when no finish marker arrives")
+	}
+
+	state.lastEventAt = now
+	if b.eventPipelineSettledLocked(state, true) {
+		t.Fatalf("did not expect settle immediately after a recent event")
+	}
+}

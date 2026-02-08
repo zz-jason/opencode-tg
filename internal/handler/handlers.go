@@ -26,6 +26,9 @@ const (
 	maxTelegramMessages = 20
 	// telegramMessageMaxLength is Telegram's hard message size limit.
 	telegramMessageMaxLength = 4096
+	// eventSettleIdleWindow is the quiet period after send completion used as a
+	// fallback settle signal when upstream does not emit explicit finish markers.
+	eventSettleIdleWindow = 20 * time.Second
 )
 
 // Bot represents the Telegram bot with all dependencies
@@ -105,6 +108,7 @@ type eventMessageState struct {
 	Info      opencode.MessageInfo
 	PartOrder []string
 	Parts     map[string]opencode.MessagePartResponse
+	LastEvent time.Time
 }
 
 // modelSelection represents a model selection with provider and model IDs
@@ -1975,6 +1979,9 @@ func (b *Bot) applyMessageUpdatedEventLocked(state *streamingState, sessionID st
 
 	completedNow := isEventMessageCompleted(msgState)
 	infoChanged := !sameMessageInfoForRender(prevInfo, msgState.Info)
+	if infoChanged || displayChanged {
+		msgState.LastEvent = time.Now()
+	}
 	return infoChanged || displayChanged, completedNow || displayChanged
 }
 
@@ -1996,7 +2003,7 @@ func (b *Bot) applyMessagePartUpdatedEventLocked(state *streamingState, sessionI
 	}
 
 	msgState := b.getOrCreateEventMessageStateLocked(state, part.MessageID)
-	changed := upsertEventPartLocked(msgState, part)
+	changed := upsertEventPartLocked(msgState, part, fallbackEventPartKey(part))
 	return changed, false
 }
 
@@ -2175,7 +2182,15 @@ func (b *Bot) eventPipelineSettledLocked(state *streamingState, sendCompleted bo
 		return len(state.displayOrder) > 0 || state.hasEventUpdates
 	}
 	active := state.eventMessages[state.activeMessageID]
-	return isEventMessageCompleted(active)
+	if isEventMessageCompleted(active) {
+		return true
+	}
+	// Fallback settle condition: if send request has completed and no new event/snapshot
+	// changes were observed for a while, treat active message as converged.
+	if !state.lastEventAt.IsZero() && time.Since(state.lastEventAt) >= eventSettleIdleWindow {
+		return true
+	}
+	return false
 }
 
 func isEventMessageCompleted(msg *eventMessageState) bool {
@@ -2360,6 +2375,7 @@ func (b *Bot) reconcileEventStateWithMessagesLocked(state *streamingState, messa
 		return
 	}
 
+	stateChanged := false
 	for _, msg := range messages {
 		if msg.ID == "" {
 			continue
@@ -2373,6 +2389,7 @@ func (b *Bot) reconcileEventStateWithMessagesLocked(state *streamingState, messa
 		}
 
 		msgState := b.getOrCreateEventMessageStateLocked(state, msg.ID)
+		prevInfo := msgState.Info
 		msgState.Info = mergeMessageInfo(msgState.Info, opencode.MessageInfo{
 			ID:        msg.ID,
 			SessionID: state.sessionID,
@@ -2387,32 +2404,45 @@ func (b *Bot) reconcileEventStateWithMessagesLocked(state *streamingState, messa
 		if msg.Finish != "" && msgState.Info.Time.Completed == 0 {
 			msgState.Info.Time.Completed = created
 		}
+		if !sameMessageInfoForRender(prevInfo, msgState.Info) {
+			msgState.LastEvent = time.Now()
+			stateChanged = true
+		}
 
-		for _, rawPart := range msg.Parts {
+		for index, rawPart := range msg.Parts {
 			part, ok := rawPart.(opencode.MessagePartResponse)
 			if !ok {
 				continue
 			}
-			upsertEventPartLocked(msgState, part)
+			if upsertEventPartLocked(msgState, part, fallbackSnapshotPartKey(index, part)) {
+				stateChanged = true
+			}
 		}
 
 		if role := strings.ToLower(strings.TrimSpace(msgState.Info.Role)); role != "user" && role != "" {
-			b.enqueueEventMessageLocked(state, msg.ID)
+			if b.enqueueEventMessageLocked(state, msg.ID) {
+				stateChanged = true
+			}
 		}
 	}
 
 	for b.tryPromoteNextActiveMessage(state) {
+		stateChanged = true
+	}
+	if stateChanged {
+		state.hasEventUpdates = true
+		state.lastEventAt = time.Now()
 	}
 }
 
-func upsertEventPartLocked(msgState *eventMessageState, part opencode.MessagePartResponse) bool {
+func upsertEventPartLocked(msgState *eventMessageState, part opencode.MessagePartResponse, fallbackKey string) bool {
 	if msgState == nil {
 		return false
 	}
 
 	partID := strings.TrimSpace(part.ID)
 	if partID == "" {
-		partID = fmt.Sprintf("%s:%d", part.Type, len(msgState.PartOrder)+1)
+		partID = fallbackPartID(part, fallbackKey)
 		part.ID = partID
 	}
 
@@ -2425,7 +2455,50 @@ func upsertEventPartLocked(msgState *eventMessageState, part opencode.MessagePar
 		msgState.PartOrder = append(msgState.PartOrder, partID)
 	}
 	msgState.Parts[partID] = part
+	msgState.LastEvent = time.Now()
 	return true
+}
+
+func fallbackPartID(part opencode.MessagePartResponse, fallbackKey string) string {
+	normalizedType := strings.TrimSpace(part.Type)
+	if normalizedType == "" {
+		normalizedType = "part"
+	}
+	if callID := strings.TrimSpace(part.CallID); callID != "" {
+		return "call:" + callID
+	}
+	if fallbackKey == "" {
+		fallbackKey = "single"
+	}
+	if tool := strings.TrimSpace(part.Tool); tool != "" {
+		return fmt.Sprintf("%s:%s:%s", normalizedType, tool, fallbackKey)
+	}
+	return fmt.Sprintf("%s:%s", normalizedType, fallbackKey)
+}
+
+func fallbackEventPartKey(part opencode.MessagePartResponse) string {
+	if callID := strings.TrimSpace(part.CallID); callID != "" {
+		return "event-call:" + callID
+	}
+	if tool := strings.TrimSpace(part.Tool); tool != "" {
+		return "event-tool:" + tool
+	}
+	partType := strings.TrimSpace(part.Type)
+	if partType == "" {
+		partType = "part"
+	}
+	return "event-type:" + partType
+}
+
+func fallbackSnapshotPartKey(index int, part opencode.MessagePartResponse) string {
+	if callID := strings.TrimSpace(part.CallID); callID != "" {
+		return "snapshot-call:" + callID
+	}
+	partType := strings.TrimSpace(part.Type)
+	if partType == "" {
+		partType = "part"
+	}
+	return fmt.Sprintf("snapshot-%s-%d", partType, index)
 }
 
 func sameEventPart(left, right opencode.MessagePartResponse) bool {
