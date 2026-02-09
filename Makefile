@@ -1,6 +1,6 @@
 # Makefile for Telegram Bot for OpenCode
 
-.PHONY: build test test-integration clean run check-opencode deps run-with-config release help
+.PHONY: build test lint fmt-check vet staticcheck govulncheck test-integration clean run check-opencode deps run-with-config release help
 
 # Build the bot
 build:
@@ -9,6 +9,42 @@ build:
 # Run tests
 test:
 	go test ./...
+
+# Run lint and static analysis checks
+lint: fmt-check vet staticcheck govulncheck
+
+# Check gofmt formatting
+fmt-check:
+	@unformatted="$$(find . -name '*.go' -not -path './vendor/*' -exec gofmt -l {} +)"; \
+	if [ -n "$$unformatted" ]; then \
+		echo "The following Go files are not formatted:"; \
+		echo "$$unformatted"; \
+		exit 1; \
+	fi
+
+# Run go vet
+vet:
+	go vet ./...
+
+# Run staticcheck
+staticcheck:
+	@staticcheck_bin="$$(command -v staticcheck || true)"; \
+	if [ -z "$$staticcheck_bin" ]; then \
+		echo "staticcheck not found; installing..."; \
+		go install honnef.co/go/tools/cmd/staticcheck@latest; \
+		staticcheck_bin="$$(go env GOPATH)/bin/staticcheck"; \
+	fi; \
+	"$$staticcheck_bin" ./...
+
+# Run vulnerability scan
+govulncheck:
+	@govulncheck_bin="$$(command -v govulncheck || true)"; \
+	if [ -z "$$govulncheck_bin" ]; then \
+		echo "govulncheck not found; installing..."; \
+		go install golang.org/x/vuln/cmd/govulncheck@latest; \
+		govulncheck_bin="$$(go env GOPATH)/bin/govulncheck"; \
+	fi; \
+	"$$govulncheck_bin" ./...
 
 # Run integration tests (requires network access for OpenCode install if OPENCODE_BIN is not set)
 test-integration:
@@ -100,6 +136,7 @@ help:
 	@echo "Available targets:"
 	@echo "  build          - Build the bot"
 	@echo "  test           - Run all tests"
+	@echo "  lint           - Run formatting, vet, staticcheck, and vulnerability checks"
 	@echo "  test-integration - Run integration test suite"
 	@echo "  clean          - Remove build artifacts"
 	@echo "  run            - Build and run the bot"

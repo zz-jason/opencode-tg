@@ -30,7 +30,6 @@ type Renderer struct {
 
 type cachedRender struct {
 	html      string
-	plain     string
 	timestamp time.Time
 }
 
@@ -146,9 +145,6 @@ func (r *Renderer) addToCache(text, html string) {
 }
 
 var (
-	// Links: match [label](url), uses custom parsing to handle parentheses
-	linkRe = regexp.MustCompile(`\[([^\[\]]*)\]\(([^)]+)\)`)
-
 	// Bold italic: non-greedy match
 	boldItalicRe = regexp.MustCompile(`\*\*\*([^*]+?)\*\*\*`)
 

@@ -110,10 +110,7 @@ func (c *SSEConnection) readEvents() {
 				return
 			}
 
-			line = strings.TrimSuffix(line, "\n")
-			if strings.HasSuffix(line, "\r") {
-				line = strings.TrimSuffix(line, "\r")
-			}
+			line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
 
 			// Empty line indicates end of event
 			if line == "" {
@@ -209,10 +206,7 @@ func StreamMessage(ctx context.Context, client *http.Client, baseURL, sessionID,
 				return err
 			}
 
-			line = strings.TrimSuffix(line, "\n")
-			if strings.HasSuffix(line, "\r") {
-				line = strings.TrimSuffix(line, "\r")
-			}
+			line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
 
 			// Empty line indicates end of event
 			if line == "" {

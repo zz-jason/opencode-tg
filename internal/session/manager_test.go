@@ -159,7 +159,7 @@ func TestGetUserSession(t *testing.T) {
 	manager := createTestManager(t, client)
 
 	// Initially no session
-	sessionID, exists := manager.GetUserSession(12345)
+	_, exists := manager.GetUserSession(12345)
 	if exists {
 		t.Error("Should not have session for new user")
 	}
@@ -171,7 +171,7 @@ func TestGetUserSession(t *testing.T) {
 	}
 
 	// Now should have session
-	sessionID, exists = manager.GetUserSession(12345)
+	sessionID, exists := manager.GetUserSession(12345)
 	if !exists {
 		t.Error("Should have session after creation")
 	}
@@ -443,7 +443,7 @@ func TestGetSessionMeta(t *testing.T) {
 	}
 
 	// Non-existent session
-	meta, exists = manager.GetSessionMeta("non-existent-session")
+	_, exists = manager.GetSessionMeta("non-existent-session")
 	if exists {
 		t.Error("Should not have metadata for non-existent session")
 	}

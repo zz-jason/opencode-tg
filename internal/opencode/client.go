@@ -794,10 +794,7 @@ func (c *Client) StreamMessage(ctx context.Context, sessionID string, content st
 					return err
 				}
 
-				line = strings.TrimSuffix(line, "\n")
-				if strings.HasSuffix(line, "\r") {
-					line = strings.TrimSuffix(line, "\r")
-				}
+				line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
 
 				// Empty line indicates end of event
 				if line == "" {
@@ -1064,7 +1061,7 @@ func isRetryableError(err error) bool {
 	// Check for temporary network errors
 	var netErr net.Error
 	if errors.As(err, &netErr) {
-		return netErr.Temporary() || netErr.Timeout()
+		return netErr.Timeout()
 	}
 
 	return false

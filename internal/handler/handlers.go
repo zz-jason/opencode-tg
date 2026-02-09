@@ -26,12 +26,6 @@ const (
 	maxTelegramMessages = 20
 	// telegramMessageMaxLength is Telegram's hard message size limit.
 	telegramMessageMaxLength = 4096
-	// eventSettleStableReconciles requires this many unchanged reconcile passes
-	// before considering stream state settled.
-	eventSettleStableReconciles = 2
-	// noOutputStableReconciles avoids long blocking when provider returns no
-	// assistant output at all.
-	noOutputStableReconciles = 3
 )
 
 // Bot represents the Telegram bot with all dependencies
@@ -76,9 +70,6 @@ type streamingState struct {
 	content     *strings.Builder
 	lastUpdate  time.Time
 	updateMutex *sync.Mutex
-
-	// Track which OpenCode message IDs have been rendered
-	renderedMessageIDs map[string]bool
 
 	// Cache of formatted message chunks by message ID
 	cachedMessageChunks map[string][]string
@@ -654,42 +645,6 @@ func formatMessageWithMetadata(msg opencode.Message) string {
 	return strings.TrimSpace(sb.String())
 }
 
-// formatAllMessagesForStreaming formats all messages for streaming display
-// Returns an array of display strings, each suitable for a Telegram message
-func (b *Bot) formatAllMessagesForStreaming(messages []opencode.Message, sessionMeta *session.SessionMeta) []string {
-	if len(messages) == 0 {
-		return []string{"No messages yet."}
-	}
-
-	var displays []string
-
-	// If we have session metadata, add session info at the beginning
-	if sessionMeta != nil {
-		var sb strings.Builder
-		fmt.Fprintf(&sb, "## Session: %s\n", sessionMeta.Name)
-		sb.WriteString("---\n")
-		fmt.Fprintf(&sb, "- Messages: %d\n", sessionMeta.MessageCount)
-		if sessionMeta.ProviderID != "" && sessionMeta.ModelID != "" {
-			fmt.Fprintf(&sb, "- Model: %s/%s\n", sessionMeta.ProviderID, sessionMeta.ModelID)
-		}
-		sb.WriteString("\n")
-		sessionInfo := sb.String()
-		// Split session info if needed (unlikely to be long)
-		displays = append(displays, sessionInfo)
-	}
-
-	// Format each message
-	for _, msg := range messages {
-		formatted := formatMessageWithMetadata(msg)
-
-		// Split long messages while preserving code blocks
-		chunks := b.splitLongContentPreserveCodeBlocks(formatted)
-		displays = append(displays, chunks...)
-	}
-
-	return displays
-}
-
 // buildDisplayChunksFromMessagesWithCache builds display chunks using cache to avoid re-rendering
 func (b *Bot) buildDisplayChunksFromMessagesWithCache(messages []opencode.Message, sessionMeta *session.SessionMeta, state *streamingState) []string {
 	if len(messages) == 0 {
@@ -1104,69 +1059,6 @@ func (b *Bot) handleText(c telebot.Context) error {
 	return nil
 }
 
-func normalizeParentReplies(messages []opencode.Message, requestMessageID string) []opencode.Message {
-	filtered := make([]opencode.Message, 0, len(messages))
-	for _, msg := range messages {
-		if strings.EqualFold(strings.TrimSpace(msg.Role), "user") {
-			continue
-		}
-		if msg.ParentID != "" && requestMessageID != "" && msg.ParentID != requestMessageID {
-			continue
-		}
-		filtered = append(filtered, msg)
-	}
-	sort.SliceStable(filtered, func(i, j int) bool {
-		if filtered[i].CreatedAt.Equal(filtered[j].CreatedAt) {
-			return filtered[i].ID < filtered[j].ID
-		}
-		if filtered[i].CreatedAt.IsZero() {
-			return false
-		}
-		if filtered[j].CreatedAt.IsZero() {
-			return true
-		}
-		return filtered[i].CreatedAt.Before(filtered[j].CreatedAt)
-	})
-	return filtered
-}
-
-func allParentRepliesCompleted(messages []opencode.Message) bool {
-	if len(messages) == 0 {
-		return false
-	}
-	for _, msg := range messages {
-		if msg.Error != nil {
-			continue
-		}
-		if !msg.CompletedAt.IsZero() {
-			continue
-		}
-		if strings.TrimSpace(msg.Finish) != "" {
-			continue
-		}
-		return false
-	}
-	return true
-}
-
-func digestMessagesForPolling(messages []opencode.Message) string {
-	if len(messages) == 0 {
-		return ""
-	}
-	var sb strings.Builder
-	for i, msg := range messages {
-		if i > 0 {
-			sb.WriteString("||")
-		}
-		sb.WriteString(snapshotMessageDigest(msg))
-		if !msg.CompletedAt.IsZero() {
-			sb.WriteString("|completed=")
-			sb.WriteString(strconv.FormatInt(msg.CompletedAt.UnixMilli(), 10))
-		}
-	}
-	return sb.String()
-}
-
 // buildGlobalModelMapping builds the global model mapping from preloaded models
 func (b *Bot) buildGlobalModelMapping(ctx context.Context) {
 	// Get providers to determine connection status
@@ -1245,92 +1137,6 @@ func (b *Bot) getModelSelection(userID int64, modelID int) (modelSelection, bool
 	}
 
 	return modelSelection{}, false
-}
-
-// clearModelMapping clears the model mapping for a user
-func (b *Bot) clearModelMapping(userID int64) {
-	b.modelMappingMu.Lock()
-	defer b.modelMappingMu.Unlock()
-	delete(b.modelMapping, userID)
-}
-
-func notifyStreamUpdate(ch chan<- struct{}) {
-	if ch == nil {
-		return
-	}
-	select {
-	case ch <- struct{}{}:
-	default:
-	}
-}
-
-func notifyStreamError(ch chan<- error, err error) {
-	if ch == nil || err == nil {
-		return
-	}
-	select {
-	case ch <- err:
-	default:
-	}
-}
-
-func (b *Bot) consumeSessionEvents(ctx context.Context, state *streamingState, sessionID string, updateCh chan<- struct{}, eventErrCh chan<- error) {
-	if state == nil || b.opencodeClient == nil {
-		return
-	}
-
-	backoff := 200 * time.Millisecond
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-
-		receivedEvents := false
-		err := b.opencodeClient.StreamSessionEvents(ctx, func(event opencode.SessionEvent) error {
-			receivedEvents = true
-			state.updateMutex.Lock()
-			changed, _ := b.applySessionEventLocked(state, sessionID, event)
-			if !changed {
-				state.updateMutex.Unlock()
-				return nil
-			}
-
-			state.hasEventUpdates = true
-			state.lastEventAt = time.Now()
-			state.revision++
-			for b.tryPromoteNextActiveMessage(state) {
-			}
-			state.updateMutex.Unlock()
-			notifyStreamUpdate(updateCh)
-			return nil
-		})
-
-		if ctx.Err() != nil {
-			return
-		}
-		if err != nil {
-			log.Warnf("Event stream disconnected for session %s: %v", sessionID, err)
-			notifyStreamError(eventErrCh, err)
-		} else {
-			log.Warnf("Event stream closed unexpectedly for session %s", sessionID)
-		}
-
-		if receivedEvents {
-			backoff = 200 * time.Millisecond
-		} else if backoff < 3*time.Second {
-			backoff *= 2
-			if backoff > 3*time.Second {
-				backoff = 3 * time.Second
-			}
-		}
-
-		wait := backoff
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(wait):
-		}
-	}
 }
 
 func (b *Bot) tryReconcileEventStateWithLatestMessages(state *streamingState, minInterval time.Duration, force bool, reason string) (performed bool, requestObserved bool) {
@@ -1564,10 +1370,7 @@ func (b *Bot) shouldTrackEventMessageLocked(state *streamingState, messageID str
 		return false
 	}
 	if created > 0 && state.requestStartedAt > 0 {
-		if created+1500 < state.requestStartedAt {
-			return false
-		}
-		return true
+		return created+1500 >= state.requestStartedAt
 	}
 	return state.requestObserved
 }
@@ -1699,24 +1502,6 @@ func (b *Bot) tryPromoteNextActiveMessage(state *streamingState) bool {
 		state.displaySet[next] = true
 		state.displayOrder = append(state.displayOrder, next)
 	}
-	return true
-}
-
-func (b *Bot) flushEventDisplaysLocked(state *streamingState, force bool) bool {
-	if state == nil {
-		return false
-	}
-	now := time.Now()
-	if !force && now.Sub(state.lastUpdate) < 300*time.Millisecond {
-		return false
-	}
-
-	displays := b.buildEventDrivenDisplaysLocked(state)
-	if len(displays) == 0 {
-		return false
-	}
-	state.lastUpdate = now
-	b.updateStreamingTelegramMessages(state, displays)
 	return true
 }
 
@@ -2793,30 +2578,9 @@ func (b *Bot) formatStreamingDisplays(content string) []string {
 	}
 
 	displays := make([]string, 0, len(chunks))
-	for _, chunk := range chunks {
-		// Only output content, no progress indicators or pagination headers
-		displays = append(displays, chunk)
-	}
+	// Only output content, no progress indicators or pagination headers.
+	displays = append(displays, chunks...)
 	return b.ensureTelegramRenderSafeDisplays(displays, true)
-}
-
-func (b *Bot) paginateDisplayText(content string, streaming bool) []string {
-	content = strings.TrimSpace(content)
-	if content == "" {
-		return []string{""}
-	}
-
-	chunks := b.splitLongContentPreserveCodeBlocks(content)
-	if len(chunks) <= 1 {
-		return b.ensureTelegramRenderSafeDisplays([]string{content}, streaming)
-	}
-
-	displays := make([]string, 0, len(chunks))
-	for _, chunk := range chunks {
-		// Only add content, no pagination headers
-		displays = append(displays, chunk)
-	}
-	return b.ensureTelegramRenderSafeDisplays(displays, streaming)
 }
 
 func (b *Bot) ensureTelegramRenderSafeDisplays(displays []string, streaming bool) []string {
@@ -2920,7 +2684,6 @@ func splitContentNearMiddle(content string) (string, string) {
 				dist = -dist
 			}
 			if dist < bestDistance {
-				bestDistance = dist
 				bestSplit = i
 			}
 			break
