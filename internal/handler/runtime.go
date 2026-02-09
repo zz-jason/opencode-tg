@@ -419,7 +419,9 @@ func (a *sessionActor) startTask(req *actorSubmitRequest) (*actorRunningTask, er
 	if req.task.Model != nil {
 		modelLabel = req.task.Model.ProviderID + "/" + req.task.Model.ModelID
 	}
-	log.Infof("Dispatching OpenCode message: session=%s request_trace_id=%s request_message_id=auto model=%s text_len=%d", a.sessionID, requestTraceID, modelLabel, len(req.task.Text))
+	if a.bot != nil && a.bot.config != nil && a.bot.config.Logging.EnableOpenCodeRequestLogs {
+		log.Infof("Dispatching OpenCode message: session=%s request_trace_id=%s request_message_id=auto model=%s text_len=%d", a.sessionID, requestTraceID, modelLabel, len(req.task.Text))
+	}
 
 	sendTimeout := time.Duration(a.bot.config.OpenCode.Timeout) * time.Second
 	if sendTimeout < 8*time.Second {
@@ -432,7 +434,9 @@ func (a *sessionActor) startTask(req *actorSubmitRequest) (*actorRunningTask, er
 		taskCancel()
 		return nil, fmt.Errorf("failed to dispatch prompt_async: %w", sendErr)
 	}
-	log.Infof("OpenCode prompt_async acknowledged for session %s request_trace_id=%s", a.sessionID, requestTraceID)
+	if a.bot != nil && a.bot.config != nil && a.bot.config.Logging.EnableOpenCodeRequestLogs {
+		log.Infof("OpenCode prompt_async acknowledged for session %s request_trace_id=%s", a.sessionID, requestTraceID)
+	}
 
 	processingMsg, err := a.bot.sendRenderedTelegramMessage(req.task.TelegramCtx, "🤖 Processing...", true)
 	if err != nil {

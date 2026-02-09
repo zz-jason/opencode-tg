@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"tg-bot/internal/opencode"
 	"tg-bot/internal/render"
+	"tg-bot/internal/session"
+	"tg-bot/internal/storage"
 	"time"
 )
 
@@ -311,6 +314,95 @@ func TestFormatMessageParts(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestBuildGlobalModelMappingFromProviders_IncludesSameModelIDAcrossProviders(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, err := storage.NewStore(storage.Options{
+		Type:     "file",
+		FilePath: filepath.Join(tmpDir, "bot-state.json"),
+	})
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	// Simulate persisted numbering hint for one provider/model pair.
+	if err := store.StoreModel(&storage.ModelMeta{
+		ID:         "shared-model",
+		Number:     7,
+		ProviderID: "provider-a",
+		Name:       "Shared Model",
+	}); err != nil {
+		t.Fatalf("failed to store model: %v", err)
+	}
+
+	manager := session.NewManagerWithStore(opencode.NewClient("http://127.0.0.1:8080", 1), store)
+	bot := &Bot{
+		sessionManager:     manager,
+		globalModelMapping: make(map[int]modelSelection),
+	}
+
+	providersResp := &opencode.ProvidersResponse{
+		All: []opencode.Provider{
+			{
+				ID:   "provider-a",
+				Name: "Provider A",
+				Models: map[string]opencode.Model{
+					"shared-model": {
+						ID:         "shared-model",
+						ProviderID: "provider-a",
+						Name:       "Shared Model",
+					},
+				},
+			},
+			{
+				ID:   "provider-b",
+				Name: "Provider B",
+				Models: map[string]opencode.Model{
+					"shared-model": {
+						ID:         "shared-model",
+						ProviderID: "provider-b",
+						Name:       "Shared Model",
+					},
+				},
+			},
+		},
+		Connected: []string{"provider-a", "provider-b"},
+	}
+
+	bot.buildGlobalModelMappingFromProviders(providersResp)
+
+	bot.globalModelMappingMu.RLock()
+	mapping := make(map[int]modelSelection, len(bot.globalModelMapping))
+	for number, selection := range bot.globalModelMapping {
+		mapping[number] = selection
+	}
+	bot.globalModelMappingMu.RUnlock()
+
+	if len(mapping) != 2 {
+		t.Fatalf("expected 2 models in mapping, got %d", len(mapping))
+	}
+
+	numberByKey := make(map[string]int, len(mapping))
+	for number, selection := range mapping {
+		numberByKey[selection.ProviderID+"/"+selection.ModelID] = number
+	}
+
+	numberA, okA := numberByKey["provider-a/shared-model"]
+	if !okA {
+		t.Fatalf("missing provider-a/shared-model in mapping: %#v", numberByKey)
+	}
+	numberB, okB := numberByKey["provider-b/shared-model"]
+	if !okB {
+		t.Fatalf("missing provider-b/shared-model in mapping: %#v", numberByKey)
+	}
+	if numberA == numberB {
+		t.Fatalf("expected unique numbers for provider-a and provider-b shared-model, got both %d", numberA)
+	}
+	if numberA != 7 {
+		t.Fatalf("expected provider-a/shared-model to reuse persisted number 7, got %d", numberA)
 	}
 }
 

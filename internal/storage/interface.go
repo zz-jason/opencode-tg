@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"strings"
 	"time"
 )
 
@@ -20,11 +21,25 @@ type SessionMeta struct {
 // ModelMeta contains metadata about an AI model
 type ModelMeta struct {
 	ID          string `json:"id"`
+	Number      int    `json:"number,omitempty"`
 	ProviderID  string `json:"providerID"`
 	Name        string `json:"name"`
 	Family      string `json:"family"`
 	Status      string `json:"status,omitempty"`
 	ReleaseDate string `json:"release_date,omitempty"`
+}
+
+// ModelKey returns the canonical storage key for a provider/model pair.
+func ModelKey(providerID, modelID string) string {
+	providerID = strings.TrimSpace(providerID)
+	modelID = strings.TrimSpace(modelID)
+	if providerID == "" {
+		return modelID
+	}
+	if modelID == "" {
+		return providerID
+	}
+	return providerID + "/" + modelID
 }
 
 // Store defines the interface for persistent session storage
@@ -45,15 +60,13 @@ type Store interface {
 
 	// ModelMeta operations
 	StoreModel(meta *ModelMeta) error
-	GetModel(modelID string) (*ModelMeta, bool, error)
+	GetModel(providerID, modelID string) (*ModelMeta, bool, error)
 	ListModels() ([]*ModelMeta, error)
-	DeleteModel(modelID string) error
+	DeleteModel(providerID, modelID string) error
 
 	// UserPreference operations
 	StoreUserLastModel(userID int64, providerID, modelID string) error
 	GetUserLastModel(userID int64) (providerID, modelID string, exists bool, err error)
-	StoreUserLastSession(userID int64, sessionID string) error
-	GetUserLastSession(userID int64) (sessionID string, exists bool, err error)
 
 	// Maintenance
 	Close() error

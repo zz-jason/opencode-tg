@@ -35,6 +35,9 @@ mode = "markdown_stream"
 [logging]
 level = "info"
 output = "bot.log"
+enable_opencode_request_logs = true
+enable_telegram_request_logs = true
+enable_telegram_interface_logs = true
 `
 
 	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
@@ -74,6 +77,15 @@ output = "bot.log"
 	}
 	if cfg.Logging.Level != "info" {
 		t.Errorf("Expected log level 'info', got %s", cfg.Logging.Level)
+	}
+	if !cfg.Logging.EnableOpenCodeRequestLogs {
+		t.Error("Expected enable_opencode_request_logs to be true")
+	}
+	if !cfg.Logging.EnableTelegramRequestLogs {
+		t.Error("Expected enable_telegram_request_logs to be true")
+	}
+	if !cfg.Logging.EnableTelegramInterfaceLogs {
+		t.Error("Expected enable_telegram_interface_logs to be true")
 	}
 }
 
@@ -120,6 +132,15 @@ url = "http://192.168.50.100:8080"
 	}
 	if cfg.Logging.Level != "info" {
 		t.Errorf("Expected default log level 'info', got %s", cfg.Logging.Level)
+	}
+	if cfg.Logging.EnableOpenCodeRequestLogs {
+		t.Error("Expected enable_opencode_request_logs default to be false")
+	}
+	if cfg.Logging.EnableTelegramRequestLogs {
+		t.Error("Expected enable_telegram_request_logs default to be false")
+	}
+	if cfg.Logging.EnableTelegramInterfaceLogs {
+		t.Error("Expected enable_telegram_interface_logs default to be false")
 	}
 }
 

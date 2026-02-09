@@ -405,3 +405,120 @@ func TestFileStore_Close(t *testing.T) {
 		t.Errorf("Second Close should be safe, got %v", err)
 	}
 }
+
+func TestFileStore_PersistModelNumberAndCurrentPreferences(t *testing.T) {
+	path := createTempFile(t)
+
+	store1, err := NewFileStore(path)
+	if err != nil {
+		t.Fatalf("NewFileStore failed: %v", err)
+	}
+	if err := store1.StoreModel(&ModelMeta{
+		ID:         "deepseek-chat",
+		Number:     12,
+		ProviderID: "deepseek",
+		Name:       "DeepSeek Chat",
+		Family:     "deepseek",
+	}); err != nil {
+		t.Fatalf("StoreModel failed: %v", err)
+	}
+	if err := store1.StoreUserLastModel(12345, "deepseek", "deepseek-chat"); err != nil {
+		t.Fatalf("StoreUserLastModel failed: %v", err)
+	}
+	if err := store1.StoreUserSession(12345, "ses_abc"); err != nil {
+		t.Fatalf("StoreUserSession failed: %v", err)
+	}
+	if err := store1.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	store2, err := NewFileStore(path)
+	if err != nil {
+		t.Fatalf("NewFileStore failed on reload: %v", err)
+	}
+	defer store2.Close()
+
+	modelMeta, exists, err := store2.GetModel("deepseek", "deepseek-chat")
+	if err != nil {
+		t.Fatalf("GetModel failed: %v", err)
+	}
+	if !exists {
+		t.Fatal("expected persisted model to exist after reload")
+	}
+	if modelMeta.Number != 12 {
+		t.Fatalf("unexpected persisted model number: got %d, want %d", modelMeta.Number, 12)
+	}
+
+	providerID, modelID, exists, err := store2.GetUserLastModel(12345)
+	if err != nil {
+		t.Fatalf("GetUserLastModel failed: %v", err)
+	}
+	if !exists || providerID != "deepseek" || modelID != "deepseek-chat" {
+		t.Fatalf("unexpected last model preference: exists=%v provider=%s model=%s", exists, providerID, modelID)
+	}
+
+	sessionID, exists, err := store2.GetUserSession(12345)
+	if err != nil {
+		t.Fatalf("GetUserSession failed: %v", err)
+	}
+	if !exists || sessionID != "ses_abc" {
+		t.Fatalf("unexpected current session mapping: exists=%v session=%s", exists, sessionID)
+	}
+}
+
+func TestFileStore_StoresSameModelIDAcrossProviders(t *testing.T) {
+	path := createTempFile(t)
+
+	store, err := NewFileStore(path)
+	if err != nil {
+		t.Fatalf("NewFileStore failed: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.StoreModel(&ModelMeta{
+		ID:         "shared-model",
+		Number:     1,
+		ProviderID: "provider-a",
+		Name:       "Shared Model",
+	}); err != nil {
+		t.Fatalf("StoreModel provider-a failed: %v", err)
+	}
+	if err := store.StoreModel(&ModelMeta{
+		ID:         "shared-model",
+		Number:     2,
+		ProviderID: "provider-b",
+		Name:       "Shared Model",
+	}); err != nil {
+		t.Fatalf("StoreModel provider-b failed: %v", err)
+	}
+
+	modelA, exists, err := store.GetModel("provider-a", "shared-model")
+	if err != nil {
+		t.Fatalf("GetModel provider-a failed: %v", err)
+	}
+	if !exists {
+		t.Fatal("expected provider-a/shared-model to exist")
+	}
+	if modelA.Number != 1 {
+		t.Fatalf("unexpected number for provider-a/shared-model: got %d want 1", modelA.Number)
+	}
+
+	modelB, exists, err := store.GetModel("provider-b", "shared-model")
+	if err != nil {
+		t.Fatalf("GetModel provider-b failed: %v", err)
+	}
+	if !exists {
+		t.Fatal("expected provider-b/shared-model to exist")
+	}
+	if modelB.Number != 2 {
+		t.Fatalf("unexpected number for provider-b/shared-model: got %d want 2", modelB.Number)
+	}
+
+	models, err := store.ListModels()
+	if err != nil {
+		t.Fatalf("ListModels failed: %v", err)
+	}
+	if len(models) != 2 {
+		t.Fatalf("expected 2 models in cache, got %d", len(models))
+	}
+}

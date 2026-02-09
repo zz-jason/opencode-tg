@@ -145,6 +145,7 @@ func NewBot(cfg *config.Config) (*Bot, error) {
 
 	// Create OpenCode client
 	client := opencode.NewClient(cfg.OpenCode.URL, cfg.OpenCode.Timeout)
+	client.SetRequestLogging(cfg.Logging.EnableOpenCodeRequestLogs)
 
 	// Test OpenCode connection
 	healthCtx, healthCancel := context.WithTimeout(ctx, 5*time.Second)
@@ -211,8 +212,27 @@ func (b *Bot) SetTelegramBot(tgBot *telebot.Bot) {
 	b.tgBot = tgBot
 }
 
+func (b *Bot) shouldLogTelegramInterface() bool {
+	return b != nil && b.config != nil && b.config.Logging.EnableTelegramInterfaceLogs
+}
+
+func (b *Bot) shouldLogTelegramRequests() bool {
+	return b != nil && b.config != nil && b.config.Logging.EnableTelegramRequestLogs
+}
+
+func parseModeLabel(mode telebot.ParseMode) string {
+	if mode == telebot.ModeDefault {
+		return "default"
+	}
+	return string(mode)
+}
+
 func (b *Bot) withTelegramInterfaceLog(interfaceName string, handler func(telebot.Context) error) func(telebot.Context) error {
 	return func(c telebot.Context) error {
+		if !b.shouldLogTelegramInterface() {
+			return handler(c)
+		}
+
 		var userID int64
 		var chatID int64
 		var messageID int
@@ -248,6 +268,7 @@ func (b *Bot) Start() {
 	b.tgBot.Handle("/sessions", b.withTelegramInterfaceLog("/sessions", b.handleSessions))
 	b.tgBot.Handle("/new", b.withTelegramInterfaceLog("/new", b.handleNew))
 	b.tgBot.Handle("/switch", b.withTelegramInterfaceLog("/switch", b.handleSwitch))
+	b.tgBot.Handle("/profile", b.withTelegramInterfaceLog("/profile", b.handleProfile))
 	b.tgBot.Handle("/abort", b.withTelegramInterfaceLog("/abort", b.handleAbort))
 	b.tgBot.Handle("/models", b.withTelegramInterfaceLog("/models", b.handleModels))
 	b.tgBot.Handle("/setmodel", b.withTelegramInterfaceLog("/setmodel", b.handleSetModel))
@@ -267,6 +288,7 @@ Core Commands:
 • /sessions - List all sessions
 • /new [name] - Create new session
 • /switch <number> - Switch current session
+• /profile - Show current session and current model
 • /rename <number> <name> - Rename a session
 • /delete <number> - Delete a session
 • /abort - Abort current task
@@ -375,14 +397,17 @@ func (b *Bot) handleNew(c telebot.Context) error {
 	}
 
 	// Set as current session
-	b.sessionManager.SetUserSession(userID, sessionID)
+	if err := b.sessionManager.SetUserSession(userID, sessionID); err != nil {
+		log.Errorf("Failed to set current session after creation: %v", err)
+		return c.Send(fmt.Sprintf("Session created but failed to persist current session: %v", err))
+	}
 
 	// Check if session has a model configured
 	meta, exists := b.sessionManager.GetSessionMeta(sessionID)
 	var message string
 	if exists && meta.ProviderID != "" && meta.ModelID != "" {
-		// Session has a model (likely from user's last preference)
-		message = fmt.Sprintf("✅ Created new session: %s\n\nThis session has been set as your current session.\n\n📋 Using your last model preference.", name)
+		// Session has a model (from user's current model preference).
+		message = fmt.Sprintf("✅ Created new session: %s\n\nThis session has been set as your current session.\n\n📋 Using your current model preference.", name)
 	} else {
 		// No model configured for this session
 		message = fmt.Sprintf("✅ Created new session: %s\n\nThis session has been set as your current session.\n\n⚠️ No AI model configured for this session.\n\nPlease use `/models` to view available models, then use `/setmodel <number>` to set a model for this session before sending messages.", name)
@@ -450,6 +475,66 @@ func (b *Bot) handleSwitch(c telebot.Context) error {
 	}
 
 	return c.Send(fmt.Sprintf("✅ Session switched to:\n\n%d. %s", sessionNumber, foundSession.Name))
+}
+
+// handleProfile shows persisted user-level session/model preferences.
+func (b *Bot) handleProfile(c telebot.Context) error {
+	userID := c.Sender().ID
+
+	currentSessionID, hasCurrent := b.sessionManager.GetUserSession(userID)
+
+	providerID, modelID, hasCurrentModel, err := b.sessionManager.GetUserLastModel(userID)
+	if err != nil {
+		log.Errorf("Failed to get user %d current model: %v", userID, err)
+		return c.Send(fmt.Sprintf("Failed to get user profile: %v", err))
+	}
+
+	describeSession := func(sessionID string) string {
+		if strings.TrimSpace(sessionID) == "" {
+			return "none"
+		}
+
+		meta, exists := b.sessionManager.GetSessionMeta(sessionID)
+		if !exists || meta == nil {
+			return "saved session"
+		}
+
+		name := strings.TrimSpace(meta.Name)
+		if name == "" {
+			return "unnamed session"
+		}
+		return name
+	}
+
+	var sb strings.Builder
+	sb.WriteString("👤 User Profile\n\n")
+
+	if hasCurrent {
+		fmt.Fprintf(&sb, "• Current session: %s\n", describeSession(currentSessionID))
+	} else {
+		sb.WriteString("• Current session: none\n")
+	}
+
+	if (!hasCurrentModel || strings.TrimSpace(providerID) == "" || strings.TrimSpace(modelID) == "") && hasCurrent {
+		// Best-effort recover from current session metadata.
+		meta, exists := b.sessionManager.GetSessionMeta(currentSessionID)
+		if exists && meta != nil && strings.TrimSpace(meta.ProviderID) != "" && strings.TrimSpace(meta.ModelID) != "" {
+			providerID = meta.ProviderID
+			modelID = meta.ModelID
+			hasCurrentModel = true
+			if persistErr := b.sessionManager.SetUserLastModel(userID, providerID, modelID); persistErr != nil {
+				log.Warnf("Failed to persist recovered current model for user %d: %v", userID, persistErr)
+			}
+		}
+	}
+
+	if hasCurrentModel && strings.TrimSpace(providerID) != "" && strings.TrimSpace(modelID) != "" {
+		fmt.Fprintf(&sb, "• Current model: %s/%s\n", providerID, modelID)
+	} else {
+		sb.WriteString("• Current model: none\n")
+	}
+
+	return c.Send(sb.String())
 }
 
 // handleAbort handles the /abort command
@@ -888,79 +973,88 @@ func (b *Bot) handleModels(c telebot.Context) error {
 		log.Errorf("Failed to get providers: %v", err)
 		return c.Send(fmt.Sprintf("Failed to get model list: %v", err))
 	}
+	b.buildGlobalModelMappingFromProviders(providersResp)
+
+	b.globalModelMappingMu.RLock()
+	modelMapping := make(map[int]modelSelection, len(b.globalModelMapping))
+	for number, selection := range b.globalModelMapping {
+		modelMapping[number] = selection
+	}
+	b.globalModelMappingMu.RUnlock()
+
+	// Keep /setmodel fast even when /models was called in another goroutine.
+	b.storeModelMapping(c.Sender().ID, modelMapping)
 
 	var sb strings.Builder
 	sb.WriteString("📋 Connected Providers\n\n")
 
-	// Create a set of connected provider IDs for faster lookup
-	connectedSet := make(map[string]bool)
-	for _, providerID := range providersResp.Connected {
-		connectedSet[providerID] = true
+	type numberedModel struct {
+		Number    int
+		Selection modelSelection
 	}
-
-	// Collect connected providers that actually expose models.
-	connectedProviders := make([]opencode.Provider, 0, len(providersResp.All))
+	providerNames := make(map[string]string, len(providersResp.All))
 	for _, provider := range providersResp.All {
-		if connectedSet[provider.ID] && len(provider.Models) > 0 {
-			connectedProviders = append(connectedProviders, provider)
+		name := strings.TrimSpace(provider.Name)
+		if name == "" {
+			name = provider.ID
 		}
+		providerNames[provider.ID] = name
+	}
+	groupedModels := make(map[string][]numberedModel)
+	for number, selection := range modelMapping {
+		groupedModels[selection.ProviderID] = append(groupedModels[selection.ProviderID], numberedModel{
+			Number:    number,
+			Selection: selection,
+		})
 	}
 
-	// Keep display order stable across calls.
-	sort.Slice(connectedProviders, func(i, j int) bool {
-		if strings.EqualFold(connectedProviders[i].Name, connectedProviders[j].Name) {
-			return connectedProviders[i].ID < connectedProviders[j].ID
-		}
-		return strings.ToLower(connectedProviders[i].Name) < strings.ToLower(connectedProviders[j].Name)
-	})
-
-	modelCounter := 1 // sequential integer -> model selection
-	modelMapping := make(map[int]modelSelection)
-
-	if len(connectedProviders) == 0 {
+	if len(groupedModels) == 0 {
 		sb.WriteString("⚠️ No connected AI providers.\n")
 		sb.WriteString("Please configure API keys for at least one AI provider first.")
-		b.storeModelMapping(c.Sender().ID, modelMapping)
 		return c.Send(sb.String())
 	}
 
-	for _, provider := range connectedProviders {
-		fmt.Fprintf(&sb, "%s (%s)\n", provider.Name, provider.ID)
-		sb.WriteString("────────────────\n")
-
-		models := make([]opencode.Model, 0, len(provider.Models))
-		for _, model := range provider.Models {
-			models = append(models, model)
+	providerIDs := make([]string, 0, len(groupedModels))
+	for providerID := range groupedModels {
+		providerIDs = append(providerIDs, providerID)
+	}
+	sort.Slice(providerIDs, func(i, j int) bool {
+		leftName := strings.ToLower(providerNames[providerIDs[i]])
+		rightName := strings.ToLower(providerNames[providerIDs[j]])
+		if leftName == rightName {
+			return providerIDs[i] < providerIDs[j]
 		}
+		return leftName < rightName
+	})
+
+	for _, providerID := range providerIDs {
+		models := groupedModels[providerID]
 		sort.Slice(models, func(i, j int) bool {
-			if strings.EqualFold(models[i].Name, models[j].Name) {
-				return models[i].ID < models[j].ID
+			if models[i].Number == models[j].Number {
+				if strings.EqualFold(models[i].Selection.ModelName, models[j].Selection.ModelName) {
+					return models[i].Selection.ModelID < models[j].Selection.ModelID
+				}
+				return strings.ToLower(models[i].Selection.ModelName) < strings.ToLower(models[j].Selection.ModelName)
 			}
-			return strings.ToLower(models[i].Name) < strings.ToLower(models[j].Name)
+			return models[i].Number < models[j].Number
 		})
 
+		providerName := providerNames[providerID]
+		if providerName == "" {
+			providerName = providerID
+		}
+		fmt.Fprintf(&sb, "%s (%s)\n", providerName, providerID)
+		sb.WriteString("────────────────\n")
+
 		for _, model := range models {
-			// Store mapping
-			modelMapping[modelCounter] = modelSelection{
-				ProviderID: provider.ID,
-				ModelID:    model.ID,
-				ModelName:  model.Name,
-			}
-
-			fmt.Fprintf(&sb, "%d. %s\n", modelCounter, model.Name)
-
-			modelCounter++
+			fmt.Fprintf(&sb, "%d. %s\n", model.Number, model.Selection.ModelName)
 		}
 
 		sb.WriteString("\n")
 	}
 
 	sb.WriteString("Use /setmodel <number> to set model for current session.\n")
-	sb.WriteString("Use /new <name> to create new session (uses your last selected model).")
-
-	// Store the model mapping in the bot context (for this user)
-	// We'll store it in a simple way for now - could be enhanced with persistence
-	b.storeModelMapping(c.Sender().ID, modelMapping)
+	sb.WriteString("Use /new <name> to create new session (uses your current model).")
 
 	result := sb.String()
 	if len(result) > 4000 {
@@ -1006,6 +1100,14 @@ func (b *Bot) handleSetModel(c telebot.Context) error {
 	if err := b.sessionManager.SetSessionModel(b.ctx, sessionID, selection.ProviderID, selection.ModelID); err != nil {
 		log.Errorf("Failed to set session model: %v", err)
 		return c.Send(fmt.Sprintf("Failed to set model: %v", err))
+	}
+
+	// Ensure current session and current model preferences are persisted when model is set.
+	if err := b.sessionManager.SetUserSession(userID, sessionID); err != nil {
+		log.Warnf("Failed to persist user %d current session after /setmodel: %v", userID, err)
+	}
+	if err := b.sessionManager.SetUserLastModel(userID, selection.ProviderID, selection.ModelID); err != nil {
+		log.Warnf("Failed to persist user %d current model after /setmodel: %v", userID, err)
 	}
 
 	log.Infof("Successfully set model for user %d session %s to %s/%s", userID, sessionID, selection.ProviderID, selection.ModelID)
@@ -1059,47 +1161,140 @@ func (b *Bot) handleText(c telebot.Context) error {
 	return nil
 }
 
-// buildGlobalModelMapping builds the global model mapping from preloaded models
+// buildGlobalModelMapping builds the global model mapping from connected providers.
 func (b *Bot) buildGlobalModelMapping(ctx context.Context) {
-	// Get providers to determine connection status
 	providersResp, err := b.opencodeClient.GetProviders(ctx)
 	if err != nil {
 		log.Warnf("Failed to get providers for global model mapping: %v", err)
 		return
 	}
+	b.buildGlobalModelMappingFromProviders(providersResp)
+}
 
-	// Create a set of connected provider IDs for faster lookup
+func modelMappingKey(providerID, modelID string) string {
+	return strings.TrimSpace(providerID) + "/" + strings.TrimSpace(modelID)
+}
+
+type providerModelEntry struct {
+	ProviderID   string
+	ProviderName string
+	ModelID      string
+	ModelName    string
+}
+
+func (b *Bot) buildGlobalModelMappingFromProviders(providersResp *opencode.ProvidersResponse) {
+	if providersResp == nil {
+		return
+	}
+
+	// Create a set of connected provider IDs for fast lookup.
 	connectedSet := make(map[string]bool)
 	for _, providerID := range providersResp.Connected {
 		connectedSet[providerID] = true
 	}
 
-	// Get preloaded models from storage
-	models, err := b.sessionManager.GetAllModels()
-	if err != nil {
-		log.Warnf("Failed to get preloaded models for global mapping: %v", err)
-		return
-	}
-
-	// Build mapping with sequential numbers
-	modelCounter := 1
-	globalMapping := make(map[int]modelSelection)
-
-	for _, model := range models {
-		// Only include models from connected providers
-		if !connectedSet[model.ProviderID] {
+	// Flatten connected provider models from /provider response.
+	entries := make([]providerModelEntry, 0, 64)
+	for _, provider := range providersResp.All {
+		if !connectedSet[provider.ID] {
 			continue
 		}
 
-		globalMapping[modelCounter] = modelSelection{
-			ProviderID: model.ProviderID,
-			ModelID:    model.ID,
-			ModelName:  model.Name,
+		providerName := strings.TrimSpace(provider.Name)
+		if providerName == "" {
+			providerName = provider.ID
 		}
-		modelCounter++
+
+		for modelID, model := range provider.Models {
+			if strings.TrimSpace(model.ID) == "" {
+				model.ID = modelID
+			}
+			if strings.TrimSpace(model.ProviderID) == "" {
+				model.ProviderID = provider.ID
+			}
+			if strings.TrimSpace(model.Name) == "" {
+				model.Name = model.ID
+			}
+
+			entries = append(entries, providerModelEntry{
+				ProviderID:   provider.ID,
+				ProviderName: providerName,
+				ModelID:      model.ID,
+				ModelName:    model.Name,
+			})
+		}
 	}
 
-	// Store global mapping
+	sort.Slice(entries, func(i, j int) bool {
+		leftProviderName := strings.ToLower(entries[i].ProviderName)
+		rightProviderName := strings.ToLower(entries[j].ProviderName)
+		if leftProviderName == rightProviderName {
+			if entries[i].ProviderID == entries[j].ProviderID {
+				leftModelName := strings.ToLower(entries[i].ModelName)
+				rightModelName := strings.ToLower(entries[j].ModelName)
+				if leftModelName == rightModelName {
+					return entries[i].ModelID < entries[j].ModelID
+				}
+				return leftModelName < rightModelName
+			}
+			return entries[i].ProviderID < entries[j].ProviderID
+		}
+		return leftProviderName < rightProviderName
+	})
+
+	// Load persisted numbers as best-effort hints for stable numbering.
+	persistedByExactKey := make(map[string]int)
+	if b.sessionManager != nil {
+		models, err := b.sessionManager.GetAllModels()
+		if err != nil {
+			log.Warnf("Failed to get preloaded models for global mapping: %v", err)
+		} else {
+			for _, model := range models {
+				if model == nil || model.Number <= 0 {
+					continue
+				}
+				exactKey := modelMappingKey(model.ProviderID, model.ID)
+				if _, exists := persistedByExactKey[exactKey]; !exists {
+					persistedByExactKey[exactKey] = model.Number
+				}
+			}
+		}
+	}
+
+	globalMapping := make(map[int]modelSelection, len(entries))
+	usedNumbers := make(map[int]bool, len(entries))
+	nextFallbackNumber := 1
+
+	allocateNumber := func(preferred int) int {
+		if preferred > 0 && !usedNumbers[preferred] {
+			usedNumbers[preferred] = true
+			if preferred >= nextFallbackNumber {
+				nextFallbackNumber = preferred + 1
+			}
+			return preferred
+		}
+
+		for usedNumbers[nextFallbackNumber] {
+			nextFallbackNumber++
+		}
+		number := nextFallbackNumber
+		usedNumbers[number] = true
+		nextFallbackNumber++
+		return number
+	}
+
+	for _, entry := range entries {
+		exactKey := modelMappingKey(entry.ProviderID, entry.ModelID)
+		number := persistedByExactKey[exactKey]
+		number = allocateNumber(number)
+		globalMapping[number] = modelSelection{
+			ProviderID: entry.ProviderID,
+			ModelID:    entry.ModelID,
+			ModelName:  entry.ModelName,
+		}
+	}
+
+	// Store global mapping.
 	b.globalModelMappingMu.Lock()
 	b.globalModelMapping = globalMapping
 	b.globalModelMappingMu.Unlock()
@@ -2278,17 +2473,65 @@ func (b *Bot) buildTelegramRenderResult(content string, streaming bool) telegram
 }
 
 func (b *Bot) sendTelegramWithMode(c telebot.Context, text string, mode telebot.ParseMode) (*telebot.Message, error) {
-	if mode == telebot.ModeDefault {
-		return c.Bot().Send(c.Chat(), text)
+	shouldLog := b.shouldLogTelegramRequests()
+	var chatID int64
+	if c != nil && c.Chat() != nil {
+		chatID = c.Chat().ID
 	}
-	return c.Bot().Send(c.Chat(), text, mode)
+	startTime := time.Now()
+	if shouldLog {
+		log.Infof("TG API request: method=sendMessage chat=%d mode=%s text_len=%d", chatID, parseModeLabel(mode), len(text))
+	}
+
+	var (
+		msg *telebot.Message
+		err error
+	)
+	if mode == telebot.ModeDefault {
+		msg, err = c.Bot().Send(c.Chat(), text)
+	} else {
+		msg, err = c.Bot().Send(c.Chat(), text, mode)
+	}
+	elapsed := time.Since(startTime)
+	if err != nil {
+		log.Warnf("TG API request failed: method=sendMessage chat=%d mode=%s elapsed=%v err=%v", chatID, parseModeLabel(mode), elapsed, err)
+		return nil, err
+	}
+	if shouldLog {
+		log.Infof("TG API response: method=sendMessage chat=%d message_id=%d mode=%s elapsed=%v", chatID, msg.ID, parseModeLabel(mode), elapsed)
+	}
+	return msg, nil
 }
 
 func (b *Bot) editTelegramWithMode(c telebot.Context, msg *telebot.Message, text string, mode telebot.ParseMode) (*telebot.Message, error) {
-	if mode == telebot.ModeDefault {
-		return c.Bot().Edit(msg, text)
+	shouldLog := b.shouldLogTelegramRequests()
+	var messageID int
+	if msg != nil {
+		messageID = msg.ID
 	}
-	return c.Bot().Edit(msg, text, mode)
+	startTime := time.Now()
+	if shouldLog {
+		log.Infof("TG API request: method=editMessageText message_id=%d mode=%s text_len=%d", messageID, parseModeLabel(mode), len(text))
+	}
+
+	var (
+		edited *telebot.Message
+		err    error
+	)
+	if mode == telebot.ModeDefault {
+		edited, err = c.Bot().Edit(msg, text)
+	} else {
+		edited, err = c.Bot().Edit(msg, text, mode)
+	}
+	elapsed := time.Since(startTime)
+	if err != nil {
+		log.Warnf("TG API request failed: method=editMessageText message_id=%d mode=%s elapsed=%v err=%v", messageID, parseModeLabel(mode), elapsed, err)
+		return nil, err
+	}
+	if shouldLog {
+		log.Infof("TG API response: method=editMessageText message_id=%d mode=%s elapsed=%v", messageID, parseModeLabel(mode), elapsed)
+	}
+	return edited, nil
 }
 
 func (b *Bot) sendRenderedTelegramMessage(c telebot.Context, content string, streaming bool) (*telebot.Message, error) {

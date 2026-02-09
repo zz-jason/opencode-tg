@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -69,33 +70,163 @@ func (m *Manager) Initialize(ctx context.Context) error {
 
 // SyncModels synchronizes models from OpenCode to local storage
 func (m *Manager) SyncModels(ctx context.Context) error {
-	models, err := m.client.GetModels(ctx)
+	providersResp, err := m.client.GetProviders(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to get models from OpenCode: %w", err)
+		return fmt.Errorf("failed to get providers from OpenCode: %w", err)
 	}
 
-	// Get existing models from storage for comparison
+	connectedSet := make(map[string]bool)
+	for _, providerID := range providersResp.Connected {
+		connectedSet[providerID] = true
+	}
+
+	models := make([]opencode.Model, 0, 64)
+	for _, provider := range providersResp.All {
+		if !connectedSet[provider.ID] {
+			continue
+		}
+		for modelID, model := range provider.Models {
+			if strings.TrimSpace(model.ID) == "" {
+				model.ID = modelID
+			}
+			if strings.TrimSpace(model.ProviderID) == "" {
+				model.ProviderID = provider.ID
+			}
+			if strings.TrimSpace(model.Name) == "" {
+				model.Name = model.ID
+			}
+			models = append(models, model)
+		}
+	}
+
+	sort.Slice(models, func(i, j int) bool {
+		leftProvider := strings.ToLower(models[i].ProviderID)
+		rightProvider := strings.ToLower(models[j].ProviderID)
+		if leftProvider != rightProvider {
+			return leftProvider < rightProvider
+		}
+		leftName := strings.ToLower(models[i].Name)
+		rightName := strings.ToLower(models[j].Name)
+		if leftName != rightName {
+			return leftName < rightName
+		}
+		return models[i].ID < models[j].ID
+	})
+
+	// Get existing models from storage for comparison.
 	existingModels, err := m.store.ListModels()
 	if err != nil {
 		return fmt.Errorf("failed to list existing models: %w", err)
 	}
 
-	// Create map of existing model IDs for fast lookup
-	existingModelMap := make(map[string]bool)
+	existingByKey := make(map[string]*storage.ModelMeta, len(existingModels))
 	for _, model := range existingModels {
-		existingModelMap[model.ID] = true
+		if model == nil {
+			continue
+		}
+		key := storage.ModelKey(model.ProviderID, model.ID)
+		if key == "" {
+			continue
+		}
+		existingByKey[key] = model
 	}
 
-	// Add or update models from OpenCode
+	availableByKey := make(map[string]opencode.Model, len(models))
+	availableKeys := make([]string, 0, len(models))
 	for _, model := range models {
+		key := storage.ModelKey(model.ProviderID, model.ID)
+		if key == "" {
+			continue
+		}
+		availableByKey[key] = model
+		availableKeys = append(availableKeys, key)
+	}
+
+	usedNumbers := make(map[int]string, len(models))
+	assignedNumbers := make(map[string]int, len(models))
+
+	// First pass: keep existing numbers for currently available model keys.
+	for _, key := range availableKeys {
+		existing := existingByKey[key]
+		if existing == nil || existing.Number <= 0 {
+			continue
+		}
+		if ownerKey, occupied := usedNumbers[existing.Number]; occupied && ownerKey != key {
+			continue
+		}
+		usedNumbers[existing.Number] = key
+		assignedNumbers[key] = existing.Number
+	}
+
+	// Collect recyclable numbers from models no longer available.
+	recyclableNumbers := make([]int, 0, len(existingModels))
+	recyclableSet := make(map[int]bool)
+	for key, existing := range existingByKey {
+		if _, stillAvailable := availableByKey[key]; stillAvailable {
+			continue
+		}
+		if existing.Number <= 0 {
+			continue
+		}
+		if recyclableSet[existing.Number] {
+			continue
+		}
+		recyclableSet[existing.Number] = true
+		recyclableNumbers = append(recyclableNumbers, existing.Number)
+	}
+	sort.Ints(recyclableNumbers)
+
+	nextModelNumber := 1
+	for number := range usedNumbers {
+		if number >= nextModelNumber {
+			nextModelNumber = number + 1
+		}
+	}
+
+	nextRecyclable := 0
+	allocateNumber := func() int {
+		for nextRecyclable < len(recyclableNumbers) {
+			number := recyclableNumbers[nextRecyclable]
+			nextRecyclable++
+			if _, occupied := usedNumbers[number]; number > 0 && !occupied {
+				return number
+			}
+		}
+		for {
+			if _, occupied := usedNumbers[nextModelNumber]; !occupied {
+				break
+			}
+			nextModelNumber++
+		}
+		return nextModelNumber
+	}
+
+	// Second pass: assign numbers to newly available models.
+	for _, key := range availableKeys {
+		if _, exists := assignedNumbers[key]; exists {
+			continue
+		}
+		number := allocateNumber()
+		usedNumbers[number] = key
+		assignedNumbers[key] = number
+		if number >= nextModelNumber {
+			nextModelNumber = number + 1
+		}
+	}
+
+	// Upsert all available models into local cache.
+	for _, key := range availableKeys {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
 
+		model := availableByKey[key]
+
 		meta := &storage.ModelMeta{
 			ID:          model.ID,
+			Number:      assignedNumbers[key],
 			ProviderID:  model.ProviderID,
 			Name:        model.Name,
 			Family:      model.Family,
@@ -103,20 +234,21 @@ func (m *Manager) SyncModels(ctx context.Context) error {
 			ReleaseDate: model.ReleaseDate,
 		}
 		if err := m.store.StoreModel(meta); err != nil {
-			log.Warnf("Failed to store model %s: %v", model.ID, err)
-			// Continue with other models
-		}
-		delete(existingModelMap, model.ID)
-	}
-
-	// Remove models that no longer exist in OpenCode
-	for modelID := range existingModelMap {
-		if err := m.store.DeleteModel(modelID); err != nil {
-			log.Warnf("Failed to delete model %s: %v", modelID, err)
+			log.Warnf("Failed to store model %s/%s: %v", model.ProviderID, model.ID, err)
 		}
 	}
 
-	log.Infof("Synchronized %d models from OpenCode", len(models))
+	// Remove models that are no longer available.
+	for key, existing := range existingByKey {
+		if _, stillAvailable := availableByKey[key]; stillAvailable {
+			continue
+		}
+		if err := m.store.DeleteModel(existing.ProviderID, existing.ID); err != nil {
+			log.Warnf("Failed to delete stale model %s/%s: %v", existing.ProviderID, existing.ID, err)
+		}
+	}
+
+	log.Infof("Synchronized %d available models from OpenCode providers", len(models))
 	return nil
 }
 
@@ -166,24 +298,14 @@ func (m *Manager) SyncSessions(ctx context.Context) error {
 	return nil
 }
 
-// GetUserLastModel retrieves the last model used by a user
+// GetUserLastModel retrieves the current model preference of a user.
 func (m *Manager) GetUserLastModel(userID int64) (providerID, modelID string, exists bool, err error) {
 	return m.store.GetUserLastModel(userID)
 }
 
-// SetUserLastModel sets the last model used by a user
+// SetUserLastModel sets the current model preference of a user.
 func (m *Manager) SetUserLastModel(userID int64, providerID, modelID string) error {
 	return m.store.StoreUserLastModel(userID, providerID, modelID)
-}
-
-// GetUserLastSession retrieves the last session used by a user
-func (m *Manager) GetUserLastSession(userID int64) (sessionID string, exists bool, err error) {
-	return m.store.GetUserLastSession(userID)
-}
-
-// SetUserLastSession sets the last session used by a user
-func (m *Manager) SetUserLastSession(userID int64, sessionID string) error {
-	return m.store.StoreUserLastSession(userID, sessionID)
 }
 
 // GetAllModels returns all preloaded models from storage
@@ -192,43 +314,14 @@ func (m *Manager) GetAllModels() ([]*storage.ModelMeta, error) {
 }
 
 // GetModel retrieves a specific model by ID
-func (m *Manager) GetModel(modelID string) (*storage.ModelMeta, bool, error) {
-	return m.store.GetModel(modelID)
+func (m *Manager) GetModel(providerID, modelID string) (*storage.ModelMeta, bool, error) {
+	return m.store.GetModel(providerID, modelID)
 }
 
 // GetOrCreateSession gets the current session for a user, or creates a new one
 func (m *Manager) GetOrCreateSession(ctx context.Context, userID int64) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	// Try to use user's last session first
-	lastSessionID, lastExists, err := m.store.GetUserLastSession(userID)
-	if err != nil {
-		log.Warnf("Failed to get user last session: %v", err)
-		// Continue with normal flow
-	}
-	if lastExists && lastSessionID != "" {
-		// Verify the last session exists and belongs to the user
-		meta, exists, err := m.store.GetSessionMeta(lastSessionID)
-		if err != nil {
-			log.Warnf("Failed to get session meta for last session %s: %v", lastSessionID, err)
-		} else if exists && meta.UserID == userID && meta.Status == "owned" {
-			// Session exists and belongs to user, update last used time
-			meta.LastUsedAt = time.Now()
-			meta.MessageCount++
-			if err := m.store.StoreSessionMeta(meta); err != nil {
-				log.Warnf("Failed to update last session meta: %v", err)
-			}
-			// Ensure user session mapping is set
-			if err := m.store.StoreUserSession(userID, lastSessionID); err != nil {
-				log.Warnf("Failed to store user session mapping: %v", err)
-			}
-			log.Infof("Using user's last session %s for user %d", lastSessionID, userID)
-			return lastSessionID, nil
-		}
-		// Last session is invalid, continue with normal flow
-		log.Debugf("Last session %s is invalid for user %d, falling back to normal flow", lastSessionID, userID)
-	}
 
 	// Check if user has an existing session
 	sessionID, exists, err := m.store.GetUserSession(userID)
@@ -244,14 +337,12 @@ func (m *Manager) GetOrCreateSession(ctx context.Context, userID int64) (string,
 		if exists {
 			meta.LastUsedAt = time.Now()
 			meta.MessageCount++
+			if m.applyUserDefaultModelIfMissing(meta, userID) {
+				log.Infof("Applied stored default model %s/%s to active session %s for user %d", meta.ProviderID, meta.ModelID, sessionID, userID)
+			}
 			if err := m.store.StoreSessionMeta(meta); err != nil {
 				return "", err
 			}
-		}
-		// Update user's last session preference
-		if err := m.store.StoreUserLastSession(userID, sessionID); err != nil {
-			log.Warnf("Failed to update user last session: %v", err)
-			// Continue, as this is not critical
 		}
 		return sessionID, nil
 	}
@@ -314,6 +405,9 @@ func (m *Manager) GetOrCreateSession(ctx context.Context, userID int64) (string,
 					meta.ModelID = modelID
 				}
 			}
+			if m.applyUserDefaultModelIfMissing(meta, userID) {
+				log.Infof("Applied stored default model %s/%s to discovered session %s for user %d", meta.ProviderID, meta.ModelID, ocSession.ID, userID)
+			}
 
 			if err := m.store.StoreSessionMeta(meta); err != nil {
 				return "", err
@@ -323,6 +417,9 @@ func (m *Manager) GetOrCreateSession(ctx context.Context, userID int64) (string,
 			meta.LastUsedAt = time.Now()
 			meta.UserID = userID  // Ensure user ID is correct
 			meta.Status = "owned" // Ensure status is correct
+			if m.applyUserDefaultModelIfMissing(meta, userID) {
+				log.Infof("Applied stored default model %s/%s to discovered session %s for user %d", meta.ProviderID, meta.ModelID, ocSession.ID, userID)
+			}
 			if err := m.store.StoreSessionMeta(meta); err != nil {
 				return "", err
 			}
@@ -333,11 +430,6 @@ func (m *Manager) GetOrCreateSession(ctx context.Context, userID int64) (string,
 		// Store user mapping
 		if err := m.store.StoreUserSession(userID, ocSession.ID); err != nil {
 			return "", err
-		}
-
-		// Update last session preference
-		if err := m.store.StoreUserLastSession(userID, ocSession.ID); err != nil {
-			log.Warnf("Failed to update user last session: %v", err)
 		}
 
 		log.Infof("Using existing OpenCode session %s for user %d", ocSession.ID, userID)
@@ -376,6 +468,9 @@ func (m *Manager) GetOrCreateSession(ctx context.Context, userID int64) (string,
 			meta.ModelID = modelID
 		}
 	}
+	if m.applyUserDefaultModelIfMissing(meta, userID) {
+		log.Infof("Applied stored default model %s/%s to new session %s for user %d", meta.ProviderID, meta.ModelID, session.ID, userID)
+	}
 
 	// Store metadata
 	if err := m.store.StoreSessionMeta(meta); err != nil {
@@ -385,11 +480,6 @@ func (m *Manager) GetOrCreateSession(ctx context.Context, userID int64) (string,
 	// Store user mapping
 	if err := m.store.StoreUserSession(userID, session.ID); err != nil {
 		return "", err
-	}
-
-	// Update last session preference
-	if err := m.store.StoreUserLastSession(userID, session.ID); err != nil {
-		log.Warnf("Failed to update user last session: %v", err)
 	}
 
 	log.Infof("Created new session %s for user %d", session.ID, userID)
@@ -428,6 +518,9 @@ func (m *Manager) SetUserSession(userID int64, sessionID string) error {
 		meta.LastUsedAt = time.Now()
 		meta.UserID = userID
 		meta.Status = "owned"
+		if m.applyUserDefaultModelIfMissing(meta, userID) {
+			log.Infof("Applied stored default model %s/%s while switching session %s for user %d", meta.ProviderID, meta.ModelID, sessionID, userID)
+		}
 		if err := m.store.StoreSessionMeta(meta); err != nil {
 			return err
 		}
@@ -440,15 +533,19 @@ func (m *Manager) SetUserSession(userID int64, sessionID string) error {
 			LastUsedAt:   time.Now(),
 			MessageCount: 0,
 		}
+		if m.applyUserDefaultModelIfMissing(meta, userID) {
+			log.Infof("Applied stored default model %s/%s while creating local metadata for session %s user %d", meta.ProviderID, meta.ModelID, sessionID, userID)
+		}
 		if err := m.store.StoreSessionMeta(meta); err != nil {
 			return err
 		}
 	}
 
-	// Update user's last session preference
-	if err := m.store.StoreUserLastSession(userID, sessionID); err != nil {
-		log.Warnf("Failed to update user last session: %v", err)
-		// Continue, as this is not critical
+	// Current model follows the switched current session when available.
+	if strings.TrimSpace(meta.ProviderID) != "" && strings.TrimSpace(meta.ModelID) != "" {
+		if err := m.store.StoreUserLastModel(userID, meta.ProviderID, meta.ModelID); err != nil {
+			log.Warnf("Failed to update user current model while switching session: %v", err)
+		}
 	}
 
 	log.Infof("User %d switched to session %s", userID, sessionID)
@@ -505,17 +602,50 @@ func (m *Manager) ListUserSessions(ctx context.Context, userID int64) ([]*Sessio
 
 // CreateNewSession creates a new session for a user
 func (m *Manager) CreateNewSession(ctx context.Context, userID int64, name string) (string, error) {
-	// Try to use user's last model as default
-	providerID, modelID, exists, err := m.GetUserLastModel(userID)
-	if err != nil {
-		log.Warnf("Failed to get user last model: %v", err)
-		// Continue with empty model
-		providerID, modelID = "", ""
-	}
-	if !exists {
-		providerID, modelID = "", ""
-	}
+	// Resolve user's current model for new sessions.
+	// Priority: stored current model -> current session model.
+	providerID, modelID := m.resolveUserPreferredModel(userID)
 	return m.CreateNewSessionWithModel(ctx, userID, name, providerID, modelID)
+}
+
+func (m *Manager) resolveUserPreferredModel(userID int64) (providerID, modelID string) {
+	providerID, modelID, exists, err := m.store.GetUserLastModel(userID)
+	if err != nil {
+		log.Warnf("Failed to get user %d current model: %v", userID, err)
+	} else if exists && strings.TrimSpace(providerID) != "" && strings.TrimSpace(modelID) != "" {
+		return providerID, modelID
+	}
+
+	candidates := make([]string, 0, 1)
+	currentSessionID, currentExists, currentErr := m.store.GetUserSession(userID)
+	if currentErr != nil {
+		log.Warnf("Failed to get user %d current session while resolving preferred model: %v", userID, currentErr)
+	} else if currentExists && strings.TrimSpace(currentSessionID) != "" {
+		candidates = append(candidates, currentSessionID)
+	}
+
+	for _, sessionID := range candidates {
+		meta, metaExists, metaErr := m.store.GetSessionMeta(sessionID)
+		if metaErr != nil {
+			log.Warnf("Failed to get session meta %s while resolving preferred model for user %d: %v", sessionID, userID, metaErr)
+			continue
+		}
+		if !metaExists || meta == nil {
+			continue
+		}
+		if strings.TrimSpace(meta.ProviderID) == "" || strings.TrimSpace(meta.ModelID) == "" {
+			continue
+		}
+
+		if err := m.store.StoreUserLastModel(userID, meta.ProviderID, meta.ModelID); err != nil {
+			log.Warnf("Failed to persist recovered current model %s/%s for user %d: %v", meta.ProviderID, meta.ModelID, userID, err)
+		} else {
+			log.Infof("Recovered user %d current model from session %s: %s/%s", userID, sessionID, meta.ProviderID, meta.ModelID)
+		}
+		return meta.ProviderID, meta.ModelID
+	}
+
+	return "", ""
 }
 
 // CreateNewSessionWithModel creates a new session for a user with specific model
@@ -562,18 +692,17 @@ func (m *Manager) CreateNewSessionWithModel(ctx context.Context, userID int64, n
 		log.Debugf("Prototype mode: skip synchronous session init for new session %s with model %s/%s", session.ID, providerID, modelID)
 	}
 
-	// Update user's last model preference if a model was specified
+	// Persist user current model preference if a model was specified.
 	if providerID != "" && modelID != "" {
 		if err := m.store.StoreUserLastModel(userID, providerID, modelID); err != nil {
-			log.Warnf("Failed to update user last model: %v", err)
+			log.Warnf("Failed to update user current model: %v", err)
 			// Continue, as this is not critical
 		}
 	}
 
-	// Update user's last session preference
-	if err := m.store.StoreUserLastSession(userID, session.ID); err != nil {
-		log.Warnf("Failed to update user last session: %v", err)
-		// Continue, as this is not critical
+	// Persist current session mapping as part of session creation.
+	if err := m.store.StoreUserSession(userID, session.ID); err != nil {
+		return "", err
 	}
 
 	log.Infof("Created new named session %s (%s) with model %s/%s for user %d", session.ID, name, providerID, modelID, userID)
@@ -618,10 +747,13 @@ func (m *Manager) SetSessionModel(ctx context.Context, sessionID, providerID, mo
 		log.Debugf("SetSessionModel: prototype mode skip /session/%s/init for %s/%s; model will be applied per message", sessionID, providerID, modelID)
 	}
 
-	// Update user's last model preference
+	// Update user's current model preference.
 	if meta.UserID != 0 {
+		if err := m.store.StoreUserSession(meta.UserID, sessionID); err != nil {
+			log.Warnf("Failed to update user current session: %v", err)
+		}
 		if err := m.store.StoreUserLastModel(meta.UserID, providerID, modelID); err != nil {
-			log.Warnf("Failed to update user last model: %v", err)
+			log.Warnf("Failed to update user current model: %v", err)
 			// Continue, as this is not critical
 		}
 	}
@@ -946,6 +1078,33 @@ func getMetadataString(metadata map[string]interface{}, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+func (m *Manager) applyUserDefaultModelIfMissing(meta *storage.SessionMeta, userID int64) bool {
+	if meta == nil || userID == 0 {
+		return false
+	}
+	if strings.TrimSpace(meta.ProviderID) != "" && strings.TrimSpace(meta.ModelID) != "" {
+		return false
+	}
+
+	providerID, modelID, exists, err := m.store.GetUserLastModel(userID)
+	if err != nil {
+		log.Warnf("Failed to get user %d current model: %v", userID, err)
+		return false
+	}
+	if !exists {
+		return false
+	}
+	providerID = strings.TrimSpace(providerID)
+	modelID = strings.TrimSpace(modelID)
+	if providerID == "" || modelID == "" {
+		return false
+	}
+
+	meta.ProviderID = providerID
+	meta.ModelID = modelID
+	return true
 }
 
 func (m *Manager) syncSessionRuntimeInfo(ctx context.Context, sessions []*SessionMeta) {

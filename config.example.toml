@@ -24,3 +24,6 @@ mode = "markdown_stream"  # plain | markdown_final | markdown_stream
 [logging]
 level = "info"
 output = "bot.log"
+enable_opencode_request_logs = false
+enable_telegram_request_logs = false
+enable_telegram_interface_logs = false

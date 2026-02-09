@@ -51,8 +51,11 @@ type RenderConfig struct {
 
 // LoggingConfig contains logging settings
 type LoggingConfig struct {
-	Level  string `toml:"level"`
-	Output string `toml:"output"`
+	Level                       string `toml:"level"`
+	Output                      string `toml:"output"`
+	EnableOpenCodeRequestLogs   bool   `toml:"enable_opencode_request_logs"`
+	EnableTelegramRequestLogs   bool   `toml:"enable_telegram_request_logs"`
+	EnableTelegramInterfaceLogs bool   `toml:"enable_telegram_interface_logs"`
 }
 
 // Load reads and parses the configuration file

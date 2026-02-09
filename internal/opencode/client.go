@@ -26,6 +26,8 @@ type Client struct {
 	timeout time.Duration
 	client  *http.Client
 	stream  *stream.SSEClient
+
+	enableRequestLogs bool
 }
 
 // NewClient creates a new OpenCode client
@@ -54,6 +56,18 @@ func NewClient(baseURL string, timeout int) *Client {
 		client:  client,
 		stream:  stream.NewSSEClient(time.Duration(timeout) * time.Second),
 	}
+}
+
+// SetRequestLogging enables or disables OpenCode API request/response info logs.
+func (c *Client) SetRequestLogging(enabled bool) {
+	if c == nil {
+		return
+	}
+	c.enableRequestLogs = enabled
+}
+
+func (c *Client) shouldLogRequests() bool {
+	return c != nil && c.enableRequestLogs
 }
 
 // Session represents an OpenCode session
@@ -263,14 +277,18 @@ func (c *Client) request(ctx context.Context, method, path string, body interfac
 	req.Header.Set("Accept", "application/json")
 
 	startTime := time.Now()
-	log.Infof("OpenCode API request: method=%s path=%s", method, path)
+	if c.shouldLogRequests() {
+		log.Infof("OpenCode API request: method=%s path=%s", method, path)
+	}
 	resp, err := c.client.Do(req)
 	elapsed := time.Since(startTime)
 	if err != nil {
 		log.Warnf("OpenCode API request failed: method=%s path=%s elapsed=%v err=%v", method, path, elapsed, err)
 		return nil, err
 	}
-	log.Infof("OpenCode API response: method=%s path=%s status=%d elapsed=%v", method, path, resp.StatusCode, elapsed)
+	if c.shouldLogRequests() {
+		log.Infof("OpenCode API response: method=%s path=%s status=%d elapsed=%v", method, path, resp.StatusCode, elapsed)
+	}
 	return resp, nil
 }
 
@@ -439,7 +457,9 @@ func (c *Client) GetMessages(ctx context.Context, sessionID string) ([]Message, 
 		}
 	}
 
-	log.Infof("OpenCode API message snapshot: path=/session/%s/message count=%d message_ids=%s", sessionID, len(messages), formatMessageIDsForLog(messageIDs, 30))
+	if c.shouldLogRequests() {
+		log.Infof("OpenCode API message snapshot: path=/session/%s/message count=%d message_ids=%s", sessionID, len(messages), formatMessageIDsForLog(messageIDs, 30))
+	}
 
 	return messages, nil
 }
@@ -464,7 +484,9 @@ func (c *Client) GetMessagesByParentID(ctx context.Context, sessionID, parentID 
 			messageIDs = append(messageIDs, msg.ID)
 		}
 	}
-	log.Infof("OpenCode API message snapshot: path=/session/%s/message?parentID=%s count=%d message_ids=%s", sessionID, parentID, len(messages), formatMessageIDsForLog(messageIDs, 30))
+	if c.shouldLogRequests() {
+		log.Infof("OpenCode API message snapshot: path=/session/%s/message?parentID=%s count=%d message_ids=%s", sessionID, parentID, len(messages), formatMessageIDsForLog(messageIDs, 30))
+	}
 	return messages, nil
 }
 
@@ -681,7 +703,9 @@ func (c *Client) StreamMessage(ctx context.Context, sessionID string, content st
 
 	url := c.baseURL + "/session/" + sessionID + "/message"
 	log.Debugf("Streaming to URL: %s", url)
-	log.Infof("OpenCode API request: method=POST path=/session/%s/message stream=true", sessionID)
+	if c.shouldLogRequests() {
+		log.Infof("OpenCode API request: method=POST path=/session/%s/message stream=true", sessionID)
+	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonData))
 	if err != nil {
@@ -755,7 +779,9 @@ func (c *Client) StreamMessage(ctx context.Context, sessionID string, content st
 			return err
 		}
 
-		log.Infof("OpenCode API response: method=POST path=/session/%s/message status=%d elapsed=%v stream=true", sessionID, resp.StatusCode, elapsed)
+		if c.shouldLogRequests() {
+			log.Infof("OpenCode API response: method=POST path=/session/%s/message status=%d elapsed=%v stream=true", sessionID, resp.StatusCode, elapsed)
+		}
 		log.Debugf("Stream request completed with status %d after %v (attempt %d/%d)", resp.StatusCode, elapsed, attempt, maxRetries)
 		break
 	}
@@ -875,7 +901,9 @@ func (c *Client) StreamSessionEvents(ctx context.Context, callback func(SessionE
 		Timeout:   0, // Keep stream open until context cancellation.
 	}
 
-	log.Infof("OpenCode API request: method=GET path=/event stream=true")
+	if c.shouldLogRequests() {
+		log.Infof("OpenCode API request: method=GET path=/event stream=true")
+	}
 	startTime := time.Now()
 	resp, err := streamClient.Do(req)
 	elapsed := time.Since(startTime)
@@ -884,7 +912,9 @@ func (c *Client) StreamSessionEvents(ctx context.Context, callback func(SessionE
 		return err
 	}
 	defer resp.Body.Close()
-	log.Infof("OpenCode API response: method=GET path=/event status=%d elapsed=%v stream=true", resp.StatusCode, elapsed)
+	if c.shouldLogRequests() {
+		log.Infof("OpenCode API response: method=GET path=/event status=%d elapsed=%v stream=true", resp.StatusCode, elapsed)
+	}
 
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)

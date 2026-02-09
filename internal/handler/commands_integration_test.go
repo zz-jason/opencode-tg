@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -306,6 +307,13 @@ func assertContains(t *testing.T, got, want string) {
 	}
 }
 
+func assertNotContains(t *testing.T, got, unwanted string) {
+	t.Helper()
+	if strings.Contains(got, unwanted) {
+		t.Fatalf("expected response to NOT contain %q, got:\n%s", unwanted, got)
+	}
+}
+
 func testProviderResponse() map[string]interface{} {
 	return map[string]interface{}{
 		"all": []map[string]interface{}{
@@ -430,6 +438,143 @@ func TestIntegration_HandleCoreCommands(t *testing.T) {
 	assertContains(t, resp, "Available Sessions")
 	assertContains(t, resp, "Integration Session")
 	assertContains(t, resp, "[CURRENT 👉]")
+}
+
+func TestIntegration_HandleProfileCommand(t *testing.T) {
+	t.Helper()
+
+	const (
+		userID    int64 = 10002
+		sessionID       = "session-profile-1"
+	)
+	var sessionCreated atomic.Bool
+
+	opencodeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/global/health":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
+			return
+
+		case r.Method == "GET" && r.URL.Path == "/provider":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(testProviderResponse())
+			return
+
+		case r.Method == "GET" && r.URL.Path == "/session":
+			w.Header().Set("Content-Type", "application/json")
+			if !sessionCreated.Load() {
+				_ = json.NewEncoder(w).Encode([]map[string]interface{}{})
+				return
+			}
+			_ = json.NewEncoder(w).Encode([]map[string]interface{}{
+				testSessionResponse(sessionID, "Profile Session", userID),
+			})
+			return
+
+		case r.Method == "POST" && r.URL.Path == "/session":
+			w.Header().Set("Content-Type", "application/json")
+			sessionCreated.Store(true)
+			_ = json.NewEncoder(w).Encode(testSessionResponse(sessionID, "Profile Session", userID))
+			return
+
+		case r.Method == "GET" && r.URL.Path == "/agent":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]map[string]interface{}{})
+			return
+
+		case r.Method == "GET" && r.URL.Path == "/config":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{})
+			return
+
+		case r.Method == "GET" && r.URL.Path == "/session/status":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{})
+			return
+
+		case r.Method == "GET" && r.URL.Path == "/command":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]map[string]interface{}{})
+			return
+
+		case r.Method == "GET" && r.URL.Path == "/event":
+			w.Header().Set("Content-Type", "text/event-stream")
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			<-r.Context().Done()
+			return
+		}
+
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer opencodeServer.Close()
+
+	rec := newTelegramRecorder(t)
+	tgServer := httptest.NewServer(http.HandlerFunc(rec.serveHTTP))
+	defer tgServer.Close()
+
+	tgBot, err := telebot.NewBot(telebot.Settings{
+		Token:       "integration-token",
+		URL:         tgServer.URL,
+		Client:      tgServer.Client(),
+		Offline:     true,
+		Synchronous: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to create telegram bot: %v", err)
+	}
+
+	cfg := &config.Config{
+		Telegram: config.TelegramConfig{
+			Token:          "integration-token",
+			PollingTimeout: 5,
+			PollingLimit:   100,
+		},
+		OpenCode: config.OpenCodeConfig{
+			URL:     opencodeServer.URL,
+			Timeout: 30,
+		},
+		Storage: config.StorageConfig{
+			Type:     "file",
+			FilePath: filepath.Join(t.TempDir(), "bot-state.json"),
+		},
+		Logging: config.LoggingConfig{
+			Level:  "error",
+			Output: "stdout",
+		},
+	}
+
+	bot, err := NewBot(cfg)
+	if err != nil {
+		t.Fatalf("failed to create handler bot: %v", err)
+	}
+	defer func() {
+		if closeErr := bot.Close(); closeErr != nil {
+			t.Fatalf("failed to close handler bot: %v", closeErr)
+		}
+	}()
+
+	if err := bot.sessionManager.SetUserLastModel(userID, "test-provider", "test-model"); err != nil {
+		t.Fatalf("failed to seed user last model: %v", err)
+	}
+
+	bot.SetTelegramBot(tgBot)
+	bot.Start()
+
+	resp := runCommand(t, tgBot, rec.messages, userID, 1, "/new Profile Session")
+	assertContains(t, resp, "Created new session: Profile Session")
+
+	resp = runCommand(t, tgBot, rec.messages, userID, 2, "/profile")
+	assertContains(t, resp, "User Profile")
+	assertContains(t, resp, "Current session:")
+	assertContains(t, resp, "Current model: test-provider/test-model")
+	assertNotContains(t, resp, "Last active session:")
+	assertNotContains(t, resp, "Last model:")
+	assertContains(t, resp, "Profile Session")
+	assertNotContains(t, resp, sessionID)
 }
 
 func TestIntegration_HandleCoreCommandsTextFallback(t *testing.T) {
