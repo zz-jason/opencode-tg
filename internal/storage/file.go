@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -17,11 +18,10 @@ type fileStore struct {
 	filePath string
 
 	// in-memory data
-	userSessions     map[int64]string
-	sessions         map[string]*SessionMeta
-	models           map[string]*ModelMeta
-	userLastModels   map[int64]*modelPreference
-	userLastSessions map[int64]string
+	userSessions   map[int64]string
+	sessions       map[string]*SessionMeta
+	models         map[string]*ModelMeta
+	userLastModels map[int64]*modelPreference
 
 	// dirty flag to track changes
 	dirty bool
@@ -40,13 +40,12 @@ func NewFileStore(filePath string) (Store, error) {
 	}
 
 	store := &fileStore{
-		filePath:         filePath,
-		userSessions:     make(map[int64]string),
-		sessions:         make(map[string]*SessionMeta),
-		models:           make(map[string]*ModelMeta),
-		userLastModels:   make(map[int64]*modelPreference),
-		userLastSessions: make(map[int64]string),
-		dirty:            false,
+		filePath:       filePath,
+		userSessions:   make(map[int64]string),
+		sessions:       make(map[string]*SessionMeta),
+		models:         make(map[string]*ModelMeta),
+		userLastModels: make(map[int64]*modelPreference),
+		dirty:          false,
 	}
 
 	// Try to load existing data
@@ -89,11 +88,10 @@ func (f *fileStore) load() error {
 	}
 
 	var storedData struct {
-		UserSessions     map[int64]string           `json:"user_sessions"`
-		Sessions         map[string]*SessionMeta    `json:"sessions"`
-		Models           map[string]*ModelMeta      `json:"models,omitempty"`
-		UserLastModels   map[int64]*modelPreference `json:"user_last_models,omitempty"`
-		UserLastSessions map[int64]string           `json:"user_last_sessions,omitempty"`
+		UserSessions   map[int64]string           `json:"user_sessions"`
+		Sessions       map[string]*SessionMeta    `json:"sessions"`
+		Models         map[string]*ModelMeta      `json:"models,omitempty"`
+		UserLastModels map[int64]*modelPreference `json:"user_last_models,omitempty"`
 	}
 
 	if err := json.Unmarshal(data, &storedData); err != nil {
@@ -101,22 +99,62 @@ func (f *fileStore) load() error {
 	}
 
 	f.userSessions = storedData.UserSessions
-	f.sessions = storedData.Sessions
-	f.models = storedData.Models
-	if f.models == nil {
-		f.models = make(map[string]*ModelMeta)
+	if f.userSessions == nil {
+		f.userSessions = make(map[int64]string)
 	}
+	f.sessions = storedData.Sessions
+	if f.sessions == nil {
+		f.sessions = make(map[string]*SessionMeta)
+	}
+	f.models = storedData.Models
+	f.models = normalizeModelCache(storedData.Models)
 	f.userLastModels = storedData.UserLastModels
 	if f.userLastModels == nil {
 		f.userLastModels = make(map[int64]*modelPreference)
 	}
-	f.userLastSessions = storedData.UserLastSessions
-	if f.userLastSessions == nil {
-		f.userLastSessions = make(map[int64]string)
-	}
 	f.dirty = false
 
 	return nil
+}
+
+func normalizeModelCache(raw map[string]*ModelMeta) map[string]*ModelMeta {
+	normalized := make(map[string]*ModelMeta)
+	if raw == nil {
+		return normalized
+	}
+
+	for legacyKey, meta := range raw {
+		if meta == nil {
+			continue
+		}
+
+		legacyKey = strings.TrimSpace(legacyKey)
+		if meta.ID == "" {
+			if idx := strings.LastIndex(legacyKey, "/"); idx >= 0 && idx+1 < len(legacyKey) {
+				meta.ID = legacyKey[idx+1:]
+			} else {
+				meta.ID = legacyKey
+			}
+		}
+
+		key := ModelKey(meta.ProviderID, meta.ID)
+		if key == "" {
+			key = legacyKey
+		}
+		if key == "" {
+			continue
+		}
+
+		if existing, exists := normalized[key]; exists {
+			if existing.Number <= 0 && meta.Number > 0 {
+				normalized[key] = meta
+			}
+			continue
+		}
+		normalized[key] = meta
+	}
+
+	return normalized
 }
 
 // save writes data to file
@@ -130,17 +168,15 @@ func (f *fileStore) save() error {
 // Caller must hold at least a read lock
 func (f *fileStore) saveLocked() error {
 	storedData := struct {
-		UserSessions     map[int64]string           `json:"user_sessions"`
-		Sessions         map[string]*SessionMeta    `json:"sessions"`
-		Models           map[string]*ModelMeta      `json:"models,omitempty"`
-		UserLastModels   map[int64]*modelPreference `json:"user_last_models,omitempty"`
-		UserLastSessions map[int64]string           `json:"user_last_sessions,omitempty"`
+		UserSessions   map[int64]string           `json:"user_sessions"`
+		Sessions       map[string]*SessionMeta    `json:"sessions"`
+		Models         map[string]*ModelMeta      `json:"models,omitempty"`
+		UserLastModels map[int64]*modelPreference `json:"user_last_models,omitempty"`
 	}{
-		UserSessions:     f.userSessions,
-		Sessions:         f.sessions,
-		Models:           f.models,
-		UserLastModels:   f.userLastModels,
-		UserLastSessions: f.userLastSessions,
+		UserSessions:   f.userSessions,
+		Sessions:       f.sessions,
+		Models:         f.models,
+		UserLastModels: f.userLastModels,
 	}
 
 	data, err := json.MarshalIndent(storedData, "", "  ")
@@ -286,17 +322,49 @@ func (f *fileStore) StoreModel(meta *ModelMeta) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	f.models[meta.ID] = meta
+	if meta == nil {
+		return fmt.Errorf("model metadata is nil")
+	}
+	key := ModelKey(meta.ProviderID, meta.ID)
+	if key == "" {
+		return fmt.Errorf("model key is empty")
+	}
+
+	f.models[key] = meta
 	f.markDirty()
 	return f.saveLocked()
 }
 
 // GetModel retrieves model metadata
-func (f *fileStore) GetModel(modelID string) (*ModelMeta, bool, error) {
+func (f *fileStore) GetModel(providerID, modelID string) (*ModelMeta, bool, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	meta, exists := f.models[modelID]
-	return meta, exists, nil
+
+	key := ModelKey(providerID, modelID)
+	if key != "" {
+		if meta, exists := f.models[key]; exists {
+			return meta, true, nil
+		}
+	}
+
+	// Backward-compatible lookup: if providerID is unknown, find unique modelID match.
+	if strings.TrimSpace(providerID) == "" && strings.TrimSpace(modelID) != "" {
+		var matched *ModelMeta
+		for _, meta := range f.models {
+			if meta == nil || meta.ID != modelID {
+				continue
+			}
+			if matched != nil {
+				return nil, false, nil
+			}
+			matched = meta
+		}
+		if matched != nil {
+			return matched, true, nil
+		}
+	}
+
+	return nil, false, nil
 }
 
 // ListModels returns all model metadata
@@ -312,16 +380,27 @@ func (f *fileStore) ListModels() ([]*ModelMeta, error) {
 }
 
 // DeleteModel removes model metadata
-func (f *fileStore) DeleteModel(modelID string) error {
+func (f *fileStore) DeleteModel(providerID, modelID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	delete(f.models, modelID)
+	key := ModelKey(providerID, modelID)
+	if key != "" {
+		delete(f.models, key)
+	} else if strings.TrimSpace(modelID) != "" {
+		// Backward-compatible delete by modelID when provider is unknown.
+		for modelKey, meta := range f.models {
+			if meta != nil && meta.ID == modelID {
+				delete(f.models, modelKey)
+			}
+		}
+	}
+
 	f.markDirty()
 	return f.saveLocked()
 }
 
-// StoreUserLastModel stores the last model used by a user
+// StoreUserLastModel stores the current model preference for a user.
 func (f *fileStore) StoreUserLastModel(userID int64, providerID, modelID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -334,7 +413,7 @@ func (f *fileStore) StoreUserLastModel(userID int64, providerID, modelID string)
 	return f.saveLocked()
 }
 
-// GetUserLastModel retrieves the last model used by a user
+// GetUserLastModel retrieves the current model preference for a user.
 func (f *fileStore) GetUserLastModel(userID int64) (providerID, modelID string, exists bool, err error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
@@ -344,25 +423,6 @@ func (f *fileStore) GetUserLastModel(userID int64) (providerID, modelID string, 
 		return "", "", false, nil
 	}
 	return pref.ProviderID, pref.ModelID, true, nil
-}
-
-// StoreUserLastSession stores the last session used by a user
-func (f *fileStore) StoreUserLastSession(userID int64, sessionID string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	f.userLastSessions[userID] = sessionID
-	f.markDirty()
-	return f.saveLocked()
-}
-
-// GetUserLastSession retrieves the last session used by a user
-func (f *fileStore) GetUserLastSession(userID int64) (sessionID string, exists bool, err error) {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-
-	sessionID, exists = f.userLastSessions[userID]
-	return sessionID, exists, nil
 }
 
 // Close implements Store interface

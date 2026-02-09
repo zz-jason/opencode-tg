@@ -1,6 +1,5 @@
 # Binaries
-/tg-bot
-/bot
+/opencode-tg
 /tg-bot-linux-amd64
 /tg-bot-darwin-amd64
 bin/
@@ -9,8 +8,6 @@ bin/
 config.toml
 
 # Logs
-bot.log
-bot.log.old
 *.log
 
 # Local runtime state
@@ -18,9 +15,7 @@ bot-state.json
 sessions.json
 
 # Design documents
-DESIGN.md
 AGENTS.md
-.AGENTS/templates/DESIGN.md
 .AGENTS/
 
 # IDE

@@ -127,7 +127,6 @@ func main() {
     }
     
     // Register command handlers
-    bot.Handle("/start", startHandler)
     bot.Handle("/help", helpHandler)
     // ... other commands
     
@@ -143,7 +142,7 @@ Encapsulates main OpenCode API endpoints:
 - `GET /session` - Get session list
 - `GET /session/{id}/message` - Get message history
 - `POST /session/{id}/abort` - Abort session
-- `GET /file`, `GET /find` and other auxiliary APIs
+- Other auxiliary APIs (optional, not exposed by current bot commands)
 
 #### 4. Session Management Strategy
 - **Default strategy**: Each Telegram user corresponds to one OpenCode session (simplified management).
@@ -154,20 +153,11 @@ Encapsulates main OpenCode API endpoints:
 
 | Command | Parameters | Description |
 |---------|------------|-------------|
-| `/start` | - | Start bot, show help information |
 | `/help` | - | Display command help |
 | `/sessions` | - | List all sessions for current user |
 | `/new` | [name] | Create new session |
 | `/switch` | sessionID | Switch current session |
-| `/current` | - | Show current session information |
 | `/abort` | - | Abort current session task |
-| `/files` | [path] | Browse project files |
-| `/search` | pattern | Search code text |
-| `/findfile` | pattern | Search for files |
-| `/symbol` | symbol | Search for symbols |
-| `/agent` | - | List available AI agents |
-| `/command` | - | List available commands |
-| `/status` | - | Show current task status (latest messages) |
 
 **Non-command message processing**: Regular text sent by users will be sent as instructions to the current session, and the bot will stream back OpenCode's response.
 
@@ -180,10 +170,6 @@ OpenCode's `/session/{id}/message` endpoint supports Server-Sent Events (SSE) st
 #### 7. Interruption Mechanism
 - When user sends `/abort` command, call `POST /session/{id}/abort` to abort current execution.
 - When user sends a new message, automatically abort current session's streaming response (if still in progress).
-
-#### 8. Status Viewing
-- Users can view the latest message of current session (including intermediate outputs) via `/status`.
-- Bot can periodically cache the latest messages of sessions for quick querying.
 
 ### Deployment and Configuration
 
@@ -276,15 +262,8 @@ The current design chooses Telegram Bot + polling + OpenCode API, balancing deve
 
 | OpenCode Feature | Corresponding Bot Command/Capability |
 |------------------|--------------------------------------|
-| Session Management | `/sessions`, `/new`, `/switch`, `/current`, `/abort` |
+| Session Management | `/sessions`, `/new`, `/switch`, `/abort` |
 | Send Message | Regular text messages (non-commands) |
-| Get Message History | `/status` |
-| File Browsing | `/files [path]` |
-| Text Search | `/search <pattern>` |
-| File Search | `/findfile <pattern>` |
-| Symbol Search | `/symbol <symbol>` |
-| Agent List | `/agent` |
-| Command List | `/command` |
 | Terminal Operations | Not supported yet (requires PTY session, complex interaction) |
 | Project Information | Extendable `/project` |
 | Health Check | Extendable `/health` |

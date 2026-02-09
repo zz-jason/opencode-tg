@@ -26,6 +26,8 @@ type Client struct {
 	timeout time.Duration
 	client  *http.Client
 	stream  *stream.SSEClient
+
+	enableRequestLogs bool
 }
 
 // NewClient creates a new OpenCode client
@@ -56,16 +58,30 @@ func NewClient(baseURL string, timeout int) *Client {
 	}
 }
 
+// SetRequestLogging enables or disables OpenCode API request/response info logs.
+func (c *Client) SetRequestLogging(enabled bool) {
+	if c == nil {
+		return
+	}
+	c.enableRequestLogs = enabled
+}
+
+func (c *Client) shouldLogRequests() bool {
+	return c != nil && c.enableRequestLogs
+}
+
 // Session represents an OpenCode session
 type Session struct {
-	ID        string                 `json:"id"`
-	Slug      string                 `json:"slug"`
-	Version   string                 `json:"version"`
-	ProjectID string                 `json:"projectID"`
-	Directory string                 `json:"directory"`
-	Title     string                 `json:"title"`
-	Time      SessionTime            `json:"time"`
-	Metadata  map[string]interface{} `json:"metadata,omitempty"`
+	ID         string                 `json:"id"`
+	Slug       string                 `json:"slug"`
+	Version    string                 `json:"version"`
+	ProjectID  string                 `json:"projectID"`
+	Directory  string                 `json:"directory"`
+	Title      string                 `json:"title"`
+	Time       SessionTime            `json:"time"`
+	Metadata   map[string]interface{} `json:"metadata,omitempty"`
+	ParentID   string                 `json:"parentID,omitempty"`
+	Permission json.RawMessage        `json:"permission,omitempty"`
 }
 
 // SessionTime represents the time fields in a session
@@ -74,27 +90,21 @@ type SessionTime struct {
 	Updated int64 `json:"updated"`
 }
 
-// FileInfo represents a file or directory
-type FileInfo struct {
-	Name     string `json:"name"`
-	Path     string `json:"path"`
-	Absolute string `json:"absolute"`
-	Type     string `json:"type"` // "file" or "directory"
-	Ignored  bool   `json:"ignored"`
-}
-
 // Message represents a message in a session
 type Message struct {
-	ID         string                 `json:"id"`
-	SessionID  string                 `json:"session_id"`
-	Role       string                 `json:"role"` // "user", "assistant", "system"
-	Content    string                 `json:"content"`
-	Parts      []interface{}          `json:"parts,omitempty"`
-	CreatedAt  time.Time              `json:"created_at"`
-	Metadata   map[string]interface{} `json:"metadata,omitempty"`
-	Finish     string                 `json:"finish,omitempty"`
-	ModelID    string                 `json:"model_id,omitempty"`
-	ProviderID string                 `json:"provider_id,omitempty"`
+	ID          string                 `json:"id"`
+	SessionID   string                 `json:"session_id"`
+	Role        string                 `json:"role"` // "user", "assistant", "system"
+	Content     string                 `json:"content"`
+	Parts       []interface{}          `json:"parts,omitempty"`
+	CreatedAt   time.Time              `json:"created_at"`
+	CompletedAt time.Time              `json:"completed_at,omitempty"`
+	Metadata    map[string]interface{} `json:"metadata,omitempty"`
+	ParentID    string                 `json:"parent_id,omitempty"`
+	Error       interface{}            `json:"error,omitempty"`
+	Finish      string                 `json:"finish,omitempty"`
+	ModelID     string                 `json:"model_id,omitempty"`
+	ProviderID  string                 `json:"provider_id,omitempty"`
 }
 
 // MessageResponse represents the actual API response for a message
@@ -109,6 +119,7 @@ type MessageInfo struct {
 	SessionID  string      `json:"sessionID"`
 	Role       string      `json:"role"`
 	Time       MessageTime `json:"time"`
+	Error      interface{} `json:"error,omitempty"`
 	ParentID   string      `json:"parentID,omitempty"`
 	ModelID    string      `json:"modelID,omitempty"`
 	ProviderID string      `json:"providerID,omitempty"`
@@ -142,6 +153,29 @@ type MessagePartResponse struct {
 	CallID    string      `json:"callID,omitempty"`
 	Tool      string      `json:"tool,omitempty"`
 	State     interface{} `json:"state,omitempty"`
+}
+
+// SessionEvent represents a streamed event from /event.
+type SessionEvent struct {
+	Type       string          `json:"type"`
+	Properties json.RawMessage `json:"properties,omitempty"`
+}
+
+// GlobalSessionEventEnvelope represents /global/event payload shape.
+type GlobalSessionEventEnvelope struct {
+	Directory string       `json:"directory,omitempty"`
+	Payload   SessionEvent `json:"payload"`
+}
+
+// MessageUpdatedProperties represents properties for message.updated events.
+type MessageUpdatedProperties struct {
+	Info MessageInfo `json:"info"`
+}
+
+// MessagePartUpdatedProperties represents properties for message.part.updated events.
+type MessagePartUpdatedProperties struct {
+	Part  MessagePartResponse `json:"part"`
+	Delta string              `json:"delta,omitempty"`
 }
 
 // CreateSessionRequest represents a request to create a session
@@ -212,6 +246,14 @@ type ModelSelection struct {
 	ModelID    string `json:"modelID"`
 }
 
+// SessionStatusInfo represents per-session runtime status reported by /session/status.
+type SessionStatusInfo struct {
+	Type    string `json:"type"`
+	Attempt int    `json:"attempt,omitempty"`
+	Message string `json:"message,omitempty"`
+	Next    int64  `json:"next,omitempty"`
+}
+
 // request makes an HTTP request to the OpenCode API
 func (c *Client) request(ctx context.Context, method, path string, body interface{}) (*http.Response, error) {
 	var reqBody io.Reader
@@ -234,8 +276,20 @@ func (c *Client) request(ctx context.Context, method, path string, body interfac
 	}
 	req.Header.Set("Accept", "application/json")
 
-	log.Debugf("Making %s request to %s", method, url)
-	return c.client.Do(req)
+	startTime := time.Now()
+	if c.shouldLogRequests() {
+		log.Infof("OpenCode API request: method=%s path=%s", method, path)
+	}
+	resp, err := c.client.Do(req)
+	elapsed := time.Since(startTime)
+	if err != nil {
+		log.Warnf("OpenCode API request failed: method=%s path=%s elapsed=%v err=%v", method, path, elapsed, err)
+		return nil, err
+	}
+	if c.shouldLogRequests() {
+		log.Infof("OpenCode API response: method=%s path=%s status=%d elapsed=%v", method, path, resp.StatusCode, elapsed)
+	}
+	return resp, nil
 }
 
 // decodeResponse decodes the JSON response
@@ -346,6 +400,44 @@ func (c *Client) SendMessage(ctx context.Context, sessionID string, req *SendMes
 	return message, nil
 }
 
+// PostMessage posts a user message to a session and ignores response body schema.
+// This is useful for event-driven flows where /event is the source of truth.
+func (c *Client) PostMessage(ctx context.Context, sessionID string, req *SendMessageRequest) error {
+	resp, err := c.request(ctx, "POST", fmt.Sprintf("/session/%s/message", sessionID), req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("post message failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	// Response shape may vary by provider/runtime. Drain and ignore.
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
+}
+
+// PromptAsync enqueues a user message for asynchronous processing.
+// The OpenCode runtime replies immediately (typically 204 No Content) and
+// progress/results should be consumed from /event and/or message snapshots.
+func (c *Client) PromptAsync(ctx context.Context, sessionID string, req *SendMessageRequest) error {
+	resp, err := c.request(ctx, "POST", fmt.Sprintf("/session/%s/prompt_async", sessionID), req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("prompt_async failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
+}
+
 // GetMessages gets all messages in a session
 func (c *Client) GetMessages(ctx context.Context, sessionID string) ([]Message, error) {
 	resp, err := c.request(ctx, "GET", fmt.Sprintf("/session/%s/message", sessionID), nil)
@@ -357,8 +449,48 @@ func (c *Client) GetMessages(ctx context.Context, sessionID string) ([]Message, 
 	if err := decodeResponse(resp, &msgResponses); err != nil {
 		return nil, err
 	}
+	messages := convertMessageResponses(msgResponses)
+	messageIDs := make([]string, 0, len(messages))
+	for _, msg := range messages {
+		if msg.ID != "" {
+			messageIDs = append(messageIDs, msg.ID)
+		}
+	}
 
-	// Convert to Message slice
+	if c.shouldLogRequests() {
+		log.Infof("OpenCode API message snapshot: path=/session/%s/message count=%d message_ids=%s", sessionID, len(messages), formatMessageIDsForLog(messageIDs, 30))
+	}
+
+	return messages, nil
+}
+
+// GetMessagesByParentID gets messages in a session filtered by parent message ID.
+func (c *Client) GetMessagesByParentID(ctx context.Context, sessionID, parentID string) ([]Message, error) {
+	path := fmt.Sprintf("/session/%s/message?parentID=%s", sessionID, url.QueryEscape(parentID))
+	resp, err := c.request(ctx, "GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var msgResponses []MessageResponse
+	if err := decodeResponse(resp, &msgResponses); err != nil {
+		return nil, err
+	}
+
+	messages := convertMessageResponses(msgResponses)
+	messageIDs := make([]string, 0, len(messages))
+	for _, msg := range messages {
+		if msg.ID != "" {
+			messageIDs = append(messageIDs, msg.ID)
+		}
+	}
+	if c.shouldLogRequests() {
+		log.Infof("OpenCode API message snapshot: path=/session/%s/message?parentID=%s count=%d message_ids=%s", sessionID, parentID, len(messages), formatMessageIDsForLog(messageIDs, 30))
+	}
+	return messages, nil
+}
+
+func convertMessageResponses(msgResponses []MessageResponse) []Message {
 	messages := make([]Message, len(msgResponses))
 	for i, msgResp := range msgResponses {
 		msg := Message{
@@ -366,18 +498,16 @@ func (c *Client) GetMessages(ctx context.Context, sessionID string) ([]Message, 
 			SessionID:  msgResp.Info.SessionID,
 			Role:       msgResp.Info.Role,
 			Parts:      make([]interface{}, len(msgResp.Parts)),
+			ParentID:   msgResp.Info.ParentID,
+			Error:      msgResp.Info.Error,
 			Finish:     msgResp.Info.Finish,
 			ModelID:    msgResp.Info.ModelID,
 			ProviderID: msgResp.Info.ProviderID,
 		}
 
-		// Extract text content from parts and store all parts
 		var content strings.Builder
 		for j, part := range msgResp.Parts {
-			// Store the part
 			msg.Parts[j] = part
-
-			// Extract text content
 			if part.Type == "text" && part.Text != "" {
 				content.WriteString(part.Text)
 				content.WriteString("\n")
@@ -385,15 +515,31 @@ func (c *Client) GetMessages(ctx context.Context, sessionID string) ([]Message, 
 		}
 		msg.Content = strings.TrimSpace(content.String())
 
-		// Set CreatedAt from time
 		if msgResp.Info.Time.Created > 0 {
 			msg.CreatedAt = time.UnixMilli(msgResp.Info.Time.Created)
+		}
+		if msgResp.Info.Time.Completed > 0 {
+			msg.CompletedAt = time.UnixMilli(msgResp.Info.Time.Completed)
 		}
 
 		messages[i] = msg
 	}
+	return messages
+}
 
-	return messages, nil
+func formatMessageIDsForLog(ids []string, max int) string {
+	if len(ids) == 0 {
+		return "[]"
+	}
+	if max <= 0 || max > len(ids) {
+		max = len(ids)
+	}
+
+	preview := strings.Join(ids[:max], ",")
+	if len(ids) > max {
+		return fmt.Sprintf("[%s,...(+%d)]", preview, len(ids)-max)
+	}
+	return fmt.Sprintf("[%s]", preview)
 }
 
 // AbortSession aborts the current execution in a session
@@ -460,6 +606,62 @@ func (c *Client) GetModels(ctx context.Context) ([]Model, error) {
 	return models, nil
 }
 
+// GetSessionStatus gets status for all sessions.
+func (c *Client) GetSessionStatus(ctx context.Context) (map[string]SessionStatusInfo, error) {
+	resp, err := c.request(ctx, "GET", "/session/status", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	statuses := make(map[string]SessionStatusInfo)
+	if err := decodeResponse(resp, &statuses); err != nil {
+		return nil, err
+	}
+	return statuses, nil
+}
+
+// GetConfig gets app-level configuration from /config.
+func (c *Client) GetConfig(ctx context.Context) (map[string]interface{}, error) {
+	resp, err := c.request(ctx, "GET", "/config", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	config := make(map[string]interface{})
+	if err := decodeResponse(resp, &config); err != nil {
+		return nil, err
+	}
+	return config, nil
+}
+
+// GetAgents gets available agents from /agent.
+func (c *Client) GetAgents(ctx context.Context) ([]map[string]interface{}, error) {
+	resp, err := c.request(ctx, "GET", "/agent", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var agents []map[string]interface{}
+	if err := decodeResponse(resp, &agents); err != nil {
+		return nil, err
+	}
+	return agents, nil
+}
+
+// GetCommands gets available commands from /command.
+func (c *Client) GetCommands(ctx context.Context) ([]map[string]interface{}, error) {
+	resp, err := c.request(ctx, "GET", "/command", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var commands []map[string]interface{}
+	if err := decodeResponse(resp, &commands); err != nil {
+		return nil, err
+	}
+	return commands, nil
+}
+
 // generateMessageID generates a unique message ID starting with "msg"
 func generateMessageID() string {
 	bytes := make([]byte, 8)
@@ -467,53 +669,9 @@ func generateMessageID() string {
 	return fmt.Sprintf("msg%s", hex.EncodeToString(bytes))
 }
 
-// InitSessionWithModel initializes a session with a specific model
-func (c *Client) InitSessionWithModel(ctx context.Context, sessionID string, providerID, modelID string) error {
-	log.Debugf("InitSessionWithModel called for session %s with provider %s model %s", sessionID, providerID, modelID)
-	messageID := generateMessageID()
-	reqBody := map[string]interface{}{
-		"modelID":    modelID,
-		"providerID": providerID,
-		"messageID":  messageID,
-	}
-	log.Debugf("Initializing session %s with model %s/%s (messageID: %s)", sessionID, providerID, modelID, messageID)
-
-	// Log the full URL being called
-	url := c.baseURL + fmt.Sprintf("/session/%s/init", sessionID)
-	log.Debugf("Making POST request to: %s", url)
-	log.Debugf("Request body: %+v", reqBody)
-
-	startTime := time.Now()
-	resp, err := c.request(ctx, "POST", fmt.Sprintf("/session/%s/init", sessionID), reqBody)
-	elapsed := time.Since(startTime)
-
-	if err != nil {
-		log.Errorf("Failed to send init request for session %s after %v: %v", sessionID, elapsed, err)
-		return err
-	}
-	defer resp.Body.Close()
-
-	log.Debugf("Init request for session %s completed with status %d after %v", sessionID, resp.StatusCode, elapsed)
-
-	if resp.StatusCode >= 400 {
-		// Try to read error body for more information
-		body, _ := io.ReadAll(resp.Body)
-		if len(body) > 0 {
-			log.Errorf("Init session failed with status %d after %v: %s", resp.StatusCode, elapsed, string(body))
-			return fmt.Errorf("failed to initialize session with model: status %d: %s", resp.StatusCode, string(body))
-		}
-		log.Errorf("Init session failed with status %d after %v (no body)", resp.StatusCode, elapsed)
-		return fmt.Errorf("failed to initialize session with model: status %d", resp.StatusCode)
-	}
-
-	// Read successful response body for debugging
-	body, _ := io.ReadAll(resp.Body)
-	if len(body) > 0 {
-		log.Debugf("Init session successful response body: %s", string(body))
-	}
-
-	log.Infof("Successfully initialized session %s with model %s/%s after %v", sessionID, providerID, modelID, elapsed)
-	return nil
+// GenerateMessageID generates a unique message ID starting with "msg".
+func GenerateMessageID() string {
+	return generateMessageID()
 }
 
 // StreamMessage sends a message and streams the response
@@ -545,6 +703,9 @@ func (c *Client) StreamMessage(ctx context.Context, sessionID string, content st
 
 	url := c.baseURL + "/session/" + sessionID + "/message"
 	log.Debugf("Streaming to URL: %s", url)
+	if c.shouldLogRequests() {
+		log.Infof("OpenCode API request: method=POST path=/session/%s/message stream=true", sessionID)
+	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonData))
 	if err != nil {
@@ -618,6 +779,9 @@ func (c *Client) StreamMessage(ctx context.Context, sessionID string, content st
 			return err
 		}
 
+		if c.shouldLogRequests() {
+			log.Infof("OpenCode API response: method=POST path=/session/%s/message status=%d elapsed=%v stream=true", sessionID, resp.StatusCode, elapsed)
+		}
 		log.Debugf("Stream request completed with status %d after %v (attempt %d/%d)", resp.StatusCode, elapsed, attempt, maxRetries)
 		break
 	}
@@ -656,10 +820,7 @@ func (c *Client) StreamMessage(ctx context.Context, sessionID string, content st
 					return err
 				}
 
-				line = strings.TrimSuffix(line, "\n")
-				if strings.HasSuffix(line, "\r") {
-					line = strings.TrimSuffix(line, "\r")
-				}
+				line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
 
 				// Empty line indicates end of event
 				if line == "" {
@@ -707,6 +868,134 @@ func (c *Client) StreamMessage(ctx context.Context, sessionID string, content st
 	}
 
 	return nil
+}
+
+// StreamSessionEvents subscribes to OpenCode /event SSE stream and emits structured events.
+func (c *Client) StreamSessionEvents(ctx context.Context, callback func(SessionEvent) error) error {
+	if callback == nil {
+		return errors.New("stream events callback is nil")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/event", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Cache-Control", "no-cache")
+
+	transport := &http.Transport{
+		Proxy:               nil,
+		TLSHandshakeTimeout: 30 * time.Second,
+		IdleConnTimeout:     300 * time.Second,
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+	}
+	if baseTransport, ok := c.client.Transport.(*http.Transport); ok && baseTransport != nil {
+		transport = baseTransport.Clone()
+		transport.Proxy = nil
+		transport.ResponseHeaderTimeout = 30 * time.Second
+	}
+
+	streamClient := &http.Client{
+		Transport: transport,
+		Timeout:   0, // Keep stream open until context cancellation.
+	}
+
+	if c.shouldLogRequests() {
+		log.Infof("OpenCode API request: method=GET path=/event stream=true")
+	}
+	startTime := time.Now()
+	resp, err := streamClient.Do(req)
+	elapsed := time.Since(startTime)
+	if err != nil {
+		log.Warnf("OpenCode API request failed: method=GET path=/event elapsed=%v err=%v", elapsed, err)
+		return err
+	}
+	defer resp.Body.Close()
+	if c.shouldLogRequests() {
+		log.Infof("OpenCode API response: method=GET path=/event status=%d elapsed=%v stream=true", resp.StatusCode, elapsed)
+	}
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("event stream request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	if !strings.Contains(contentType, "text/event-stream") {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("event stream unexpected content-type %q: %s", contentType, strings.TrimSpace(string(body)))
+	}
+
+	reader := bufio.NewReader(resp.Body)
+	var dataLines []string
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+
+		line = strings.TrimSuffix(line, "\n")
+		line = strings.TrimSuffix(line, "\r")
+
+		if line == "" {
+			if len(dataLines) == 0 {
+				continue
+			}
+			rawData := strings.Join(dataLines, "\n")
+			dataLines = dataLines[:0]
+
+			event, parseErr := parseSessionEventData(rawData)
+			if parseErr != nil {
+				log.Debugf("Skip unparsable event payload: %v", parseErr)
+				continue
+			}
+			if event.Type == "" {
+				continue
+			}
+			if err := callback(event); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
+		if strings.HasPrefix(line, "data:") {
+			value := strings.TrimPrefix(line, "data:")
+			value = strings.TrimPrefix(value, " ")
+			dataLines = append(dataLines, value)
+		}
+	}
+}
+
+func parseSessionEventData(data string) (SessionEvent, error) {
+	data = strings.TrimSpace(data)
+	if data == "" {
+		return SessionEvent{}, errors.New("empty event payload")
+	}
+
+	var direct SessionEvent
+	if err := json.Unmarshal([]byte(data), &direct); err == nil && direct.Type != "" {
+		return direct, nil
+	}
+
+	var wrapped GlobalSessionEventEnvelope
+	if err := json.Unmarshal([]byte(data), &wrapped); err == nil && wrapped.Payload.Type != "" {
+		return wrapped.Payload, nil
+	}
+
+	return SessionEvent{}, fmt.Errorf("unsupported event payload: %s", data)
 }
 
 func extractTextChunksFromStreamEvent(data string) []string {
@@ -802,105 +1091,26 @@ func isRetryableError(err error) bool {
 	// Check for temporary network errors
 	var netErr net.Error
 	if errors.As(err, &netErr) {
-		return netErr.Temporary() || netErr.Timeout()
+		return netErr.Timeout()
 	}
 
 	return false
 }
 
-// SearchResult represents a search result
-type SearchResult struct {
-	Path    string  `json:"path"`
-	Line    int     `json:"line"`
-	Content string  `json:"content"`
-	Score   float64 `json:"score,omitempty"`
-}
-
-// SymbolResult represents a symbol search result
-type SymbolResult struct {
-	Name      string `json:"name"`
-	Kind      string `json:"kind"` // function, class, variable, etc.
-	Path      string `json:"path"`
-	Line      int    `json:"line"`
-	Signature string `json:"signature,omitempty"`
-}
-
-// AgentInfo represents an AI agent
-type AgentInfo struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
-}
-
-// CommandInfo represents a command
-type CommandInfo struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Usage       string `json:"usage,omitempty"`
-}
-
-// SearchFiles searches for text in files
-func (c *Client) SearchFiles(ctx context.Context, query string) ([]SearchResult, error) {
-	return nil, errors.New("search not implemented: API endpoint not available")
-}
-
-// FindFile finds files by name pattern
-func (c *Client) FindFile(ctx context.Context, pattern string) ([]FileInfo, error) {
-	return nil, errors.New("find file not implemented: API endpoint not available")
-}
-
-// SearchSymbol searches for symbols in code
-func (c *Client) SearchSymbol(ctx context.Context, symbol string) ([]SymbolResult, error) {
-	return nil, errors.New("symbol search not implemented: API endpoint not available")
-}
-
-// ListAgents lists available AI agents
-func (c *Client) ListAgents(ctx context.Context) ([]AgentInfo, error) {
-	return nil, errors.New("list agents not implemented: API endpoint not available")
-}
-
-// ListCommands lists available commands
-func (c *Client) ListCommands(ctx context.Context) ([]CommandInfo, error) {
-	return nil, errors.New("list commands not implemented: API endpoint not available")
-}
-
-// ListFiles lists files in a directory
-func (c *Client) ListFiles(ctx context.Context, path string) ([]FileInfo, error) {
-	urlStr := c.baseURL + "/file"
-	if path != "" {
-		urlStr += "?path=" + url.QueryEscape(path)
-	}
-	req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("failed to list files: status %d", resp.StatusCode)
-	}
-
-	var files []FileInfo
-	if err := json.NewDecoder(resp.Body).Decode(&files); err != nil {
-		return nil, err
-	}
-	return files, nil
-}
-
 // RenameSession renames a session by updating its title and metadata
-func (c *Client) RenameSession(ctx context.Context, sessionID string, newName string) error {
-	// Prepare update request
+func (c *Client) RenameSession(ctx context.Context, sessionID string, newName string, userID int64) error {
+	// Prepare update request with metadata
+	metadata := map[string]interface{}{
+		"session_name": newName,
+	}
+	// Include telegram_user_id if provided (non-zero)
+	if userID != 0 {
+		metadata["telegram_user_id"] = userID
+	}
+
 	reqBody := map[string]interface{}{
-		"title": newName,
-		"metadata": map[string]interface{}{
-			"session_name": newName,
-		},
+		"title":    newName,
+		"metadata": metadata,
 	}
 
 	resp, err := c.request(ctx, "PATCH", fmt.Sprintf("/session/%s", sessionID), reqBody)

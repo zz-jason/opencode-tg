@@ -51,8 +51,11 @@ type RenderConfig struct {
 
 // LoggingConfig contains logging settings
 type LoggingConfig struct {
-	Level  string `toml:"level"`
-	Output string `toml:"output"`
+	Level                       string `toml:"level"`
+	Output                      string `toml:"output"`
+	EnableOpenCodeRequestLogs   bool   `toml:"enable_opencode_request_logs"`
+	EnableTelegramRequestLogs   bool   `toml:"enable_telegram_request_logs"`
+	EnableTelegramInterfaceLogs bool   `toml:"enable_telegram_interface_logs"`
 }
 
 // Load reads and parses the configuration file
@@ -136,11 +139,9 @@ func (c *Config) Validate() error {
 	if c.OpenCode.URL == "" {
 		return &ConfigError{Field: "opencode.url", Message: "OpenCode URL is required"}
 	}
-	switch strings.ToLower(strings.TrimSpace(c.Render.Mode)) {
-	case "", "plain", "markdown_final", "markdown_stream":
-	default:
-		return &ConfigError{Field: "render.mode", Message: "must be one of: plain, markdown_final, markdown_stream"}
-	}
+	// Render mode is always markdown_stream, other modes are deprecated
+	// Keep for backward compatibility but ignore value
+	_ = strings.ToLower(strings.TrimSpace(c.Render.Mode))
 	return nil
 }
 

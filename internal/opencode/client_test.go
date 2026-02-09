@@ -3,6 +3,7 @@ package opencode
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -136,6 +137,256 @@ func TestSendMessage(t *testing.T) {
 	}
 	if !strings.Contains(message.Content, "Hello, world!") {
 		t.Errorf("Expected response to contain 'Hello, world!', got %s", message.Content)
+	}
+}
+
+func TestPostMessage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" || !strings.HasPrefix(r.URL.Path, "/session/test-session/message") {
+			t.Errorf("Unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		var req SendMessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("Failed to decode request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if req.MessageID != "msg_custom_1" {
+			t.Errorf("expected messageID msg_custom_1, got %q", req.MessageID)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, 5)
+	err := client.PostMessage(context.Background(), "test-session", &SendMessageRequest{
+		MessageID: "msg_custom_1",
+		Parts: []MessagePart{
+			{
+				Type: "text",
+				Text: "hello",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("PostMessage failed: %v", err)
+	}
+}
+
+func TestPromptAsync(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" || !strings.HasPrefix(r.URL.Path, "/session/test-session/prompt_async") {
+			t.Errorf("Unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		var req SendMessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("Failed to decode request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if req.MessageID != "msg_custom_async_1" {
+			t.Errorf("expected messageID msg_custom_async_1, got %q", req.MessageID)
+		}
+
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, 5)
+	err := client.PromptAsync(context.Background(), "test-session", &SendMessageRequest{
+		MessageID: "msg_custom_async_1",
+		Parts: []MessagePart{
+			{
+				Type: "text",
+				Text: "hello async",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("PromptAsync failed: %v", err)
+	}
+}
+
+func TestGetSessionStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" || r.URL.Path != "/session/status" {
+			t.Errorf("Unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		resp := map[string]SessionStatusInfo{
+			"ses_1": {Type: "busy"},
+			"ses_2": {Type: "idle"},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, 5)
+	statuses, err := client.GetSessionStatus(context.Background())
+	if err != nil {
+		t.Fatalf("GetSessionStatus failed: %v", err)
+	}
+	if len(statuses) != 2 {
+		t.Fatalf("expected 2 statuses, got %d", len(statuses))
+	}
+	if statuses["ses_1"].Type != "busy" {
+		t.Fatalf("unexpected status for ses_1: %+v", statuses["ses_1"])
+	}
+}
+
+func TestGetConfig(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" || r.URL.Path != "/config" {
+			t.Errorf("Unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		resp := map[string]interface{}{
+			"theme":  "dark",
+			"format": "markdown",
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, 5)
+	cfg, err := client.GetConfig(context.Background())
+	if err != nil {
+		t.Fatalf("GetConfig failed: %v", err)
+	}
+	if cfg["theme"] != "dark" {
+		t.Fatalf("unexpected config payload: %+v", cfg)
+	}
+}
+
+func TestGetAgentsAndCommands(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/agent":
+			if r.Method != "GET" {
+				t.Errorf("Unexpected method for /agent: %s", r.Method)
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			resp := []map[string]interface{}{
+				{"id": "build", "name": "Build"},
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+		case "/command":
+			if r.Method != "GET" {
+				t.Errorf("Unexpected method for /command: %s", r.Method)
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			resp := []map[string]interface{}{
+				{"name": "fix"},
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, 5)
+
+	agents, err := client.GetAgents(context.Background())
+	if err != nil {
+		t.Fatalf("GetAgents failed: %v", err)
+	}
+	if len(agents) != 1 {
+		t.Fatalf("expected 1 agent, got %d", len(agents))
+	}
+
+	commands, err := client.GetCommands(context.Background())
+	if err != nil {
+		t.Fatalf("GetCommands failed: %v", err)
+	}
+	if len(commands) != 1 {
+		t.Fatalf("expected 1 command, got %d", len(commands))
+	}
+}
+
+func TestGetMessagesByParentID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" || r.URL.Path != "/session/test-session/message" {
+			t.Errorf("Unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if got := r.URL.Query().Get("parentID"); got != "msg_req_1" {
+			t.Errorf("expected query parentID=msg_req_1, got %q", got)
+		}
+
+		resp := []map[string]interface{}{
+			{
+				"info": map[string]interface{}{
+					"id":         "msg_assistant_1",
+					"sessionID":  "test-session",
+					"role":       "assistant",
+					"parentID":   "msg_req_1",
+					"finish":     "",
+					"error":      nil,
+					"modelID":    "m",
+					"providerID": "p",
+					"time": map[string]interface{}{
+						"created":   float64(1000),
+						"completed": float64(2000),
+					},
+				},
+				"parts": []map[string]interface{}{
+					{
+						"id":        "part_1",
+						"sessionID": "test-session",
+						"messageID": "msg_assistant_1",
+						"type":      "text",
+						"text":      "hello",
+					},
+				},
+			},
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, 5)
+	messages, err := client.GetMessagesByParentID(context.Background(), "test-session", "msg_req_1")
+	if err != nil {
+		t.Fatalf("GetMessagesByParentID failed: %v", err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(messages))
+	}
+	msg := messages[0]
+	if msg.ID != "msg_assistant_1" {
+		t.Fatalf("unexpected message id: %s", msg.ID)
+	}
+	if msg.ParentID != "msg_req_1" {
+		t.Fatalf("unexpected parent id: %s", msg.ParentID)
+	}
+	if msg.CompletedAt.IsZero() {
+		t.Fatalf("expected completedAt to be set")
+	}
+	if msg.Content != "hello" {
+		t.Fatalf("unexpected content: %q", msg.Content)
 	}
 }
 
@@ -319,5 +570,73 @@ func TestExtractTextChunksFromStreamEvent(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestParseSessionEventData(t *testing.T) {
+	t.Run("direct_event_payload", func(t *testing.T) {
+		event, err := parseSessionEventData(`{"type":"message.updated","properties":{"info":{"id":"msg_1"}}}`)
+		if err != nil {
+			t.Fatalf("parseSessionEventData returned error: %v", err)
+		}
+		if event.Type != "message.updated" {
+			t.Fatalf("unexpected event type: %q", event.Type)
+		}
+	})
+
+	t.Run("global_event_envelope_payload", func(t *testing.T) {
+		event, err := parseSessionEventData(`{"directory":"/tmp/project","payload":{"type":"message.part.updated","properties":{"part":{"id":"part_1"}}}}`)
+		if err != nil {
+			t.Fatalf("parseSessionEventData returned error: %v", err)
+		}
+		if event.Type != "message.part.updated" {
+			t.Fatalf("unexpected event type: %q", event.Type)
+		}
+	})
+}
+
+func TestStreamSessionEvents(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/event" {
+			http.NotFound(w, r)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+
+		_, _ = fmt.Fprint(w, "data: {\"type\":\"message.updated\",\"properties\":{\"info\":{\"id\":\"msg_first\",\"sessionID\":\"ses_test\",\"role\":\"assistant\",\"time\":{\"created\":1}}}}\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+		_, _ = fmt.Fprint(w, "data: {\"directory\":\"/tmp/project\",\"payload\":{\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"part_1\",\"sessionID\":\"ses_test\",\"messageID\":\"msg_first\",\"type\":\"text\",\"text\":\"hello\"},\"delta\":\"hello\"}}}\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, 5)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var events []SessionEvent
+	err := client.StreamSessionEvents(ctx, func(event SessionEvent) error {
+		events = append(events, event)
+		return nil
+	})
+	if err != nil && err != context.DeadlineExceeded {
+		t.Fatalf("StreamSessionEvents returned unexpected error: %v", err)
+	}
+
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+	if events[0].Type != "message.updated" {
+		t.Fatalf("unexpected first event type: %q", events[0].Type)
+	}
+	if events[1].Type != "message.part.updated" {
+		t.Fatalf("unexpected second event type: %q", events[1].Type)
 	}
 }

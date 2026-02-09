@@ -6,52 +6,41 @@ import (
 )
 
 func TestNormalizeMode(t *testing.T) {
-	tests := []struct {
-		in   string
-		want string
-	}{
-		{in: "", want: ModeMarkdownStream},
-		{in: "plain", want: ModePlain},
-		{in: "markdown_final", want: ModeMarkdownFinal},
-		{in: "markdown_stream", want: ModeMarkdownStream},
-		{in: "unknown", want: ModeMarkdownStream},
+	// NormalizeMode now always returns markdown_stream
+	if got := NormalizeMode(""); got != ModeMarkdownStream {
+		t.Fatalf("NormalizeMode(\"\") = %q, want %q", got, ModeMarkdownStream)
 	}
-
-	for _, tt := range tests {
-		if got := NormalizeMode(tt.in); got != tt.want {
-			t.Fatalf("NormalizeMode(%q) = %q, want %q", tt.in, got, tt.want)
-		}
+	if got := NormalizeMode("plain"); got != ModeMarkdownStream {
+		t.Fatalf("NormalizeMode(\"plain\") = %q, want %q", got, ModeMarkdownStream)
+	}
+	if got := NormalizeMode("markdown_final"); got != ModeMarkdownStream {
+		t.Fatalf("NormalizeMode(\"markdown_final\") = %q, want %q", got, ModeMarkdownStream)
+	}
+	if got := NormalizeMode("markdown_stream"); got != ModeMarkdownStream {
+		t.Fatalf("NormalizeMode(\"markdown_stream\") = %q, want %q", got, ModeMarkdownStream)
+	}
+	if got := NormalizeMode("unknown"); got != ModeMarkdownStream {
+		t.Fatalf("NormalizeMode(\"unknown\") = %q, want %q", got, ModeMarkdownStream)
 	}
 }
 
 func TestRenderer_RenderMode(t *testing.T) {
-	r := New(ModePlain)
-	plain := r.Render("**hello**", true)
-	if plain.UseHTML {
-		t.Fatalf("plain mode should not use HTML")
-	}
-	if plain.Text != "**hello**" {
-		t.Fatalf("plain mode should keep raw text, got %q", plain.Text)
-	}
-
-	r = New(ModeMarkdownFinal)
+	// Renderer now always uses HTML rendering (markdown_stream mode)
+	r := New("markdown_stream")
 	streaming := r.Render("**hello**", true)
-	if streaming.UseHTML {
-		t.Fatalf("markdown_final streaming path should not use HTML")
+	if !streaming.UseHTML {
+		t.Fatalf("renderer should use HTML while streaming")
+	}
+	if !strings.Contains(streaming.Text, "<b>hello</b>") {
+		t.Fatalf("expected bold conversion, got %q", streaming.Text)
 	}
 
 	final := r.Render("**hello**", false)
 	if !final.UseHTML {
-		t.Fatalf("markdown_final final path should use HTML")
+		t.Fatalf("renderer should use HTML for final rendering")
 	}
 	if !strings.Contains(final.Text, "<b>hello</b>") {
 		t.Fatalf("expected bold conversion, got %q", final.Text)
-	}
-
-	r = New(ModeMarkdownStream)
-	stream := r.Render("**hello**", true)
-	if !stream.UseHTML {
-		t.Fatalf("markdown_stream should use HTML while streaming")
 	}
 }
 

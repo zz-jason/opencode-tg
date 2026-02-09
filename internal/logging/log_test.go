@@ -1,8 +1,10 @@
 package logging
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
+	"regexp"
 	"testing"
 
 	"github.com/sirupsen/logrus"
@@ -74,6 +76,10 @@ func TestInitLogger(t *testing.T) {
 				if logger.Formatter == nil {
 					t.Error("Formatter should be set")
 				}
+
+				if !logger.ReportCaller {
+					t.Error("ReportCaller should be enabled")
+				}
 			}
 
 			// Clean up test file
@@ -130,4 +136,30 @@ func TestInitLoggerWithNestedDirectory(t *testing.T) {
 
 	// Clean up
 	os.RemoveAll(filepath.Join(tempDir, "nested"))
+}
+
+func TestBracketFormatterOutputShape(t *testing.T) {
+	logger := logrus.New()
+	logger.SetReportCaller(true)
+	logger.SetFormatter(&BracketFormatter{
+		TimestampFormat: defaultTimestampFormat,
+	})
+
+	var buf bytes.Buffer
+	logger.SetOutput(&buf)
+
+	logger.WithField("request_id", "abc123").Info("hello world")
+	output := buf.String()
+
+	pattern := `^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] \[INFO\] \[[^\]]+:[0-9]+\] hello world(?: [^=]+=[^ ]+)*\n$`
+	matched, err := regexp.MatchString(pattern, output)
+	if err != nil {
+		t.Fatalf("failed to compile regex: %v", err)
+	}
+	if !matched {
+		t.Fatalf("unexpected log format output: %q", output)
+	}
+	if !regexp.MustCompile(`request_id=abc123`).MatchString(output) {
+		t.Fatalf("expected field in output, got: %q", output)
+	}
 }

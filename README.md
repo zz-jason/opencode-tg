@@ -5,9 +5,9 @@ A Telegram bot for interacting with an [OpenCode](https://github.com/anomalyco/o
 ## Overview
 
 - Send programming tasks in chat and receive real-time progress updates.
-- Manage sessions (create, switch, inspect current session).
+- Manage sessions (create and switch).
 - View and switch available models.
-- Abort tasks, check status, and browse files.
+- Abort tasks.
 
 ## Architecture and Deployment
 
@@ -91,17 +91,13 @@ make build
 
 ## Common Commands
 
-- `/start` show onboarding message
 - `/help` show command help
 - `/sessions` list sessions
 - `/new [name]` create a new session
 - `/switch <number>` switch session
-- `/current` show current session
-- `/status` show current task status
 - `/abort` abort current task
 - `/models` list available models grouped by provider
 - `/setmodel <number>` set model for current session
-- `/files [path]` browse files
 
 Any non-command text message is forwarded to OpenCode.
 
