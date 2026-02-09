@@ -613,19 +613,19 @@ func TestTryReconcileEventStateWithLatestMessages_RespectsMinInterval(t *testing
 	}
 }
 
-func TestShouldTrackEventMessageLocked_DoesNotFilterByCreatedTime(t *testing.T) {
+func TestShouldTrackEventMessageLocked_TracksAfterRequestObserved(t *testing.T) {
 	b := &Bot{}
 	state := &streamingState{
 		requestStartedAt:  time.Now().UnixMilli(),
 		initialMessageIDs: map[string]bool{},
 		eventMessages:     make(map[string]*eventMessageState),
+		requestObserved:   true,
 	}
 
-	// Even if created time is far older than request start, event updates for this
-	// session must still be tracked because some providers update existing message IDs.
-	created := state.requestStartedAt - 60_000
+	// Once request is observed, same-task updates are accepted.
+	created := state.requestStartedAt + 1
 	if !b.shouldTrackEventMessageLocked(state, "msg_reused", created) {
-		t.Fatalf("expected reused message ID to be tracked regardless of created time")
+		t.Fatalf("expected reused message ID to be tracked after request observation")
 	}
 }
 
@@ -634,9 +634,19 @@ func TestEventDrivenMessagePromotion_OrderByCompletion(t *testing.T) {
 	state := &streamingState{
 		requestStartedAt:  time.Now().UnixMilli(),
 		initialMessageIDs: map[string]bool{},
-		eventMessages:     make(map[string]*eventMessageState),
-		displaySet:        make(map[string]bool),
-		pendingSet:        make(map[string]bool),
+		eventMessages: map[string]*eventMessageState{
+			"msg_assistant_1": {
+				Info: opencode.MessageInfo{
+					ID:        "msg_assistant_1",
+					SessionID: "ses_test",
+					Role:      "assistant",
+				},
+				PartOrder: []string{},
+				Parts:     map[string]opencode.MessagePartResponse{},
+			},
+		},
+		displaySet: make(map[string]bool),
+		pendingSet: make(map[string]bool),
 	}
 
 	msg1Created := state.requestStartedAt + 10
@@ -861,9 +871,19 @@ func TestApplyMessagePartUpdatedEventLocked_MissingPartIDIsStable(t *testing.T) 
 	state := &streamingState{
 		requestStartedAt:  time.Now().UnixMilli(),
 		initialMessageIDs: map[string]bool{},
-		eventMessages:     make(map[string]*eventMessageState),
-		displaySet:        make(map[string]bool),
-		pendingSet:        make(map[string]bool),
+		eventMessages: map[string]*eventMessageState{
+			"msg_assistant_1": {
+				Info: opencode.MessageInfo{
+					ID:        "msg_assistant_1",
+					SessionID: "ses_test",
+					Role:      "assistant",
+				},
+				PartOrder: []string{},
+				Parts:     map[string]opencode.MessagePartResponse{},
+			},
+		},
+		displaySet: make(map[string]bool),
+		pendingSet: make(map[string]bool),
 	}
 
 	partRaw, _ := json.Marshal(opencode.MessagePartUpdatedProperties{
@@ -899,9 +919,19 @@ func TestApplyMessagePartUpdatedEventLocked_IgnoresReplayRegression(t *testing.T
 	state := &streamingState{
 		requestStartedAt:  time.Now().UnixMilli(),
 		initialMessageIDs: map[string]bool{},
-		eventMessages:     make(map[string]*eventMessageState),
-		displaySet:        make(map[string]bool),
-		pendingSet:        make(map[string]bool),
+		eventMessages: map[string]*eventMessageState{
+			"msg_assistant_1": {
+				Info: opencode.MessageInfo{
+					ID:        "msg_assistant_1",
+					SessionID: "ses_test",
+					Role:      "assistant",
+				},
+				PartOrder: []string{},
+				Parts:     map[string]opencode.MessagePartResponse{},
+			},
+		},
+		displaySet: make(map[string]bool),
+		pendingSet: make(map[string]bool),
 	}
 
 	firstRaw, _ := json.Marshal(opencode.MessagePartUpdatedProperties{
@@ -949,9 +979,19 @@ func TestApplyMessagePartUpdatedEventLocked_DeltaOnlyAppends(t *testing.T) {
 	state := &streamingState{
 		requestStartedAt:  time.Now().UnixMilli(),
 		initialMessageIDs: map[string]bool{},
-		eventMessages:     make(map[string]*eventMessageState),
-		displaySet:        make(map[string]bool),
-		pendingSet:        make(map[string]bool),
+		eventMessages: map[string]*eventMessageState{
+			"msg_assistant_1": {
+				Info: opencode.MessageInfo{
+					ID:        "msg_assistant_1",
+					SessionID: "ses_test",
+					Role:      "assistant",
+				},
+				PartOrder: []string{},
+				Parts:     map[string]opencode.MessagePartResponse{},
+			},
+		},
+		displaySet: make(map[string]bool),
+		pendingSet: make(map[string]bool),
 	}
 
 	firstRaw, _ := json.Marshal(opencode.MessagePartUpdatedProperties{
@@ -1173,7 +1213,7 @@ func TestReconcileEventStateWithMessagesLocked_EquivalentContentDoesNotBumpRevis
 	}
 }
 
-func TestReconcileEventStateWithMessagesLocked_TracksChangedInitialMessage(t *testing.T) {
+func TestReconcileEventStateWithMessagesLocked_ChangedInitialMessageIgnored(t *testing.T) {
 	b := &Bot{}
 	now := time.Now()
 
@@ -1216,11 +1256,11 @@ func TestReconcileEventStateWithMessagesLocked_TracksChangedInitialMessage(t *te
 
 	b.reconcileEventStateWithMessagesLocked(state, []opencode.Message{changedSnapshot})
 	msgState := state.eventMessages["msg_initial_assistant"]
-	if msgState == nil {
-		t.Fatalf("expected changed initial message to be tracked")
+	if msgState != nil {
+		t.Fatalf("expected changed initial message to stay filtered in prototype mode")
 	}
-	if len(state.displayOrder) != 1 || state.displayOrder[0] != "msg_initial_assistant" {
-		t.Fatalf("expected changed initial message to be displayed, got order=%v", state.displayOrder)
+	if len(state.displayOrder) != 0 {
+		t.Fatalf("expected no initial message promoted to display order, got order=%v", state.displayOrder)
 	}
 }
 
@@ -1305,5 +1345,48 @@ func TestEventPipelineNoOutputCandidateLocked(t *testing.T) {
 	state.hasEventUpdates = true
 	if b.eventPipelineNoOutputCandidateLocked(state, true) {
 		t.Fatalf("did not expect no-output candidate after event updates appear")
+	}
+}
+
+func TestEventPipelineSettledLocked_EmptyActiveMessageNotSettled(t *testing.T) {
+	b := &Bot{}
+	state := &streamingState{
+		activeMessageID: "",
+		hasEventUpdates: true,
+		eventMessages:   make(map[string]*eventMessageState),
+	}
+
+	if b.eventPipelineSettledLocked(state, true) {
+		t.Fatalf("expected not settled without an active assistant message")
+	}
+}
+
+func TestApplyMessageUpdatedEventLocked_RequestUserMessageMarksObserved(t *testing.T) {
+	b := &Bot{}
+	state := &streamingState{
+		requestMessageID:  "msg_req",
+		initialMessageIDs: map[string]bool{},
+		eventMessages:     make(map[string]*eventMessageState),
+		displaySet:        make(map[string]bool),
+		pendingSet:        make(map[string]bool),
+	}
+
+	raw, _ := json.Marshal(opencode.MessageUpdatedProperties{
+		Info: opencode.MessageInfo{
+			ID:        "msg_req",
+			SessionID: "ses_test",
+			Role:      "user",
+			Time: opencode.MessageTime{
+				Created: time.Now().UnixMilli(),
+			},
+		},
+	})
+
+	changed, force := b.applyMessageUpdatedEventLocked(state, "ses_test", raw)
+	if changed || force {
+		t.Fatalf("expected request user message to be ignored for rendering state")
+	}
+	if !state.requestObserved {
+		t.Fatalf("expected requestObserved to be true when request user message appears")
 	}
 }

@@ -179,6 +179,217 @@ func TestPostMessage(t *testing.T) {
 	}
 }
 
+func TestPromptAsync(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" || !strings.HasPrefix(r.URL.Path, "/session/test-session/prompt_async") {
+			t.Errorf("Unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		var req SendMessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("Failed to decode request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if req.MessageID != "msg_custom_async_1" {
+			t.Errorf("expected messageID msg_custom_async_1, got %q", req.MessageID)
+		}
+
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, 5)
+	err := client.PromptAsync(context.Background(), "test-session", &SendMessageRequest{
+		MessageID: "msg_custom_async_1",
+		Parts: []MessagePart{
+			{
+				Type: "text",
+				Text: "hello async",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("PromptAsync failed: %v", err)
+	}
+}
+
+func TestGetSessionStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" || r.URL.Path != "/session/status" {
+			t.Errorf("Unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		resp := map[string]SessionStatusInfo{
+			"ses_1": {Type: "busy"},
+			"ses_2": {Type: "idle"},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, 5)
+	statuses, err := client.GetSessionStatus(context.Background())
+	if err != nil {
+		t.Fatalf("GetSessionStatus failed: %v", err)
+	}
+	if len(statuses) != 2 {
+		t.Fatalf("expected 2 statuses, got %d", len(statuses))
+	}
+	if statuses["ses_1"].Type != "busy" {
+		t.Fatalf("unexpected status for ses_1: %+v", statuses["ses_1"])
+	}
+}
+
+func TestGetConfig(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" || r.URL.Path != "/config" {
+			t.Errorf("Unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		resp := map[string]interface{}{
+			"theme":  "dark",
+			"format": "markdown",
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, 5)
+	cfg, err := client.GetConfig(context.Background())
+	if err != nil {
+		t.Fatalf("GetConfig failed: %v", err)
+	}
+	if cfg["theme"] != "dark" {
+		t.Fatalf("unexpected config payload: %+v", cfg)
+	}
+}
+
+func TestGetAgentsAndCommands(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/agent":
+			if r.Method != "GET" {
+				t.Errorf("Unexpected method for /agent: %s", r.Method)
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			resp := []map[string]interface{}{
+				{"id": "build", "name": "Build"},
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+		case "/command":
+			if r.Method != "GET" {
+				t.Errorf("Unexpected method for /command: %s", r.Method)
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			resp := []map[string]interface{}{
+				{"name": "fix"},
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, 5)
+
+	agents, err := client.GetAgents(context.Background())
+	if err != nil {
+		t.Fatalf("GetAgents failed: %v", err)
+	}
+	if len(agents) != 1 {
+		t.Fatalf("expected 1 agent, got %d", len(agents))
+	}
+
+	commands, err := client.GetCommands(context.Background())
+	if err != nil {
+		t.Fatalf("GetCommands failed: %v", err)
+	}
+	if len(commands) != 1 {
+		t.Fatalf("expected 1 command, got %d", len(commands))
+	}
+}
+
+func TestGetMessagesByParentID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" || r.URL.Path != "/session/test-session/message" {
+			t.Errorf("Unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if got := r.URL.Query().Get("parentID"); got != "msg_req_1" {
+			t.Errorf("expected query parentID=msg_req_1, got %q", got)
+		}
+
+		resp := []map[string]interface{}{
+			{
+				"info": map[string]interface{}{
+					"id":         "msg_assistant_1",
+					"sessionID":  "test-session",
+					"role":       "assistant",
+					"parentID":   "msg_req_1",
+					"finish":     "",
+					"error":      nil,
+					"modelID":    "m",
+					"providerID": "p",
+					"time": map[string]interface{}{
+						"created":   float64(1000),
+						"completed": float64(2000),
+					},
+				},
+				"parts": []map[string]interface{}{
+					{
+						"id":        "part_1",
+						"sessionID": "test-session",
+						"messageID": "msg_assistant_1",
+						"type":      "text",
+						"text":      "hello",
+					},
+				},
+			},
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, 5)
+	messages, err := client.GetMessagesByParentID(context.Background(), "test-session", "msg_req_1")
+	if err != nil {
+		t.Fatalf("GetMessagesByParentID failed: %v", err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(messages))
+	}
+	msg := messages[0]
+	if msg.ID != "msg_assistant_1" {
+		t.Fatalf("unexpected message id: %s", msg.ID)
+	}
+	if msg.ParentID != "msg_req_1" {
+		t.Fatalf("unexpected parent id: %s", msg.ParentID)
+	}
+	if msg.CompletedAt.IsZero() {
+		t.Fatalf("expected completedAt to be set")
+	}
+	if msg.Content != "hello" {
+		t.Fatalf("unexpected content: %q", msg.Content)
+	}
+}
+
 func TestGetSession(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" || r.URL.Path != "/session/test-session-123" {

@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -77,16 +78,19 @@ type SessionTime struct {
 
 // Message represents a message in a session
 type Message struct {
-	ID         string                 `json:"id"`
-	SessionID  string                 `json:"session_id"`
-	Role       string                 `json:"role"` // "user", "assistant", "system"
-	Content    string                 `json:"content"`
-	Parts      []interface{}          `json:"parts,omitempty"`
-	CreatedAt  time.Time              `json:"created_at"`
-	Metadata   map[string]interface{} `json:"metadata,omitempty"`
-	Finish     string                 `json:"finish,omitempty"`
-	ModelID    string                 `json:"model_id,omitempty"`
-	ProviderID string                 `json:"provider_id,omitempty"`
+	ID          string                 `json:"id"`
+	SessionID   string                 `json:"session_id"`
+	Role        string                 `json:"role"` // "user", "assistant", "system"
+	Content     string                 `json:"content"`
+	Parts       []interface{}          `json:"parts,omitempty"`
+	CreatedAt   time.Time              `json:"created_at"`
+	CompletedAt time.Time              `json:"completed_at,omitempty"`
+	Metadata    map[string]interface{} `json:"metadata,omitempty"`
+	ParentID    string                 `json:"parent_id,omitempty"`
+	Error       interface{}            `json:"error,omitempty"`
+	Finish      string                 `json:"finish,omitempty"`
+	ModelID     string                 `json:"model_id,omitempty"`
+	ProviderID  string                 `json:"provider_id,omitempty"`
 }
 
 // MessageResponse represents the actual API response for a message
@@ -226,6 +230,14 @@ type ProvidersResponse struct {
 type ModelSelection struct {
 	ProviderID string `json:"providerID"`
 	ModelID    string `json:"modelID"`
+}
+
+// SessionStatusInfo represents per-session runtime status reported by /session/status.
+type SessionStatusInfo struct {
+	Type    string `json:"type"`
+	Attempt int    `json:"attempt,omitempty"`
+	Message string `json:"message,omitempty"`
+	Next    int64  `json:"next,omitempty"`
 }
 
 // request makes an HTTP request to the OpenCode API
@@ -389,6 +401,25 @@ func (c *Client) PostMessage(ctx context.Context, sessionID string, req *SendMes
 	return nil
 }
 
+// PromptAsync enqueues a user message for asynchronous processing.
+// The OpenCode runtime replies immediately (typically 204 No Content) and
+// progress/results should be consumed from /event and/or message snapshots.
+func (c *Client) PromptAsync(ctx context.Context, sessionID string, req *SendMessageRequest) error {
+	resp, err := c.request(ctx, "POST", fmt.Sprintf("/session/%s/prompt_async", sessionID), req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("prompt_async failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
+}
+
 // GetMessages gets all messages in a session
 func (c *Client) GetMessages(ctx context.Context, sessionID string) ([]Message, error) {
 	resp, err := c.request(ctx, "GET", fmt.Sprintf("/session/%s/message", sessionID), nil)
@@ -400,41 +431,9 @@ func (c *Client) GetMessages(ctx context.Context, sessionID string) ([]Message, 
 	if err := decodeResponse(resp, &msgResponses); err != nil {
 		return nil, err
 	}
-
-	// Convert to Message slice
-	messages := make([]Message, len(msgResponses))
-	messageIDs := make([]string, 0, len(msgResponses))
-	for i, msgResp := range msgResponses {
-		msg := Message{
-			ID:         msgResp.Info.ID,
-			SessionID:  msgResp.Info.SessionID,
-			Role:       msgResp.Info.Role,
-			Parts:      make([]interface{}, len(msgResp.Parts)),
-			Finish:     msgResp.Info.Finish,
-			ModelID:    msgResp.Info.ModelID,
-			ProviderID: msgResp.Info.ProviderID,
-		}
-
-		// Extract text content from parts and store all parts
-		var content strings.Builder
-		for j, part := range msgResp.Parts {
-			// Store the part
-			msg.Parts[j] = part
-
-			// Extract text content
-			if part.Type == "text" && part.Text != "" {
-				content.WriteString(part.Text)
-				content.WriteString("\n")
-			}
-		}
-		msg.Content = strings.TrimSpace(content.String())
-
-		// Set CreatedAt from time
-		if msgResp.Info.Time.Created > 0 {
-			msg.CreatedAt = time.UnixMilli(msgResp.Info.Time.Created)
-		}
-
-		messages[i] = msg
+	messages := convertMessageResponses(msgResponses)
+	messageIDs := make([]string, 0, len(messages))
+	for _, msg := range messages {
 		if msg.ID != "" {
 			messageIDs = append(messageIDs, msg.ID)
 		}
@@ -443,6 +442,67 @@ func (c *Client) GetMessages(ctx context.Context, sessionID string) ([]Message, 
 	log.Infof("OpenCode API message snapshot: path=/session/%s/message count=%d message_ids=%s", sessionID, len(messages), formatMessageIDsForLog(messageIDs, 30))
 
 	return messages, nil
+}
+
+// GetMessagesByParentID gets messages in a session filtered by parent message ID.
+func (c *Client) GetMessagesByParentID(ctx context.Context, sessionID, parentID string) ([]Message, error) {
+	path := fmt.Sprintf("/session/%s/message?parentID=%s", sessionID, url.QueryEscape(parentID))
+	resp, err := c.request(ctx, "GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var msgResponses []MessageResponse
+	if err := decodeResponse(resp, &msgResponses); err != nil {
+		return nil, err
+	}
+
+	messages := convertMessageResponses(msgResponses)
+	messageIDs := make([]string, 0, len(messages))
+	for _, msg := range messages {
+		if msg.ID != "" {
+			messageIDs = append(messageIDs, msg.ID)
+		}
+	}
+	log.Infof("OpenCode API message snapshot: path=/session/%s/message?parentID=%s count=%d message_ids=%s", sessionID, parentID, len(messages), formatMessageIDsForLog(messageIDs, 30))
+	return messages, nil
+}
+
+func convertMessageResponses(msgResponses []MessageResponse) []Message {
+	messages := make([]Message, len(msgResponses))
+	for i, msgResp := range msgResponses {
+		msg := Message{
+			ID:         msgResp.Info.ID,
+			SessionID:  msgResp.Info.SessionID,
+			Role:       msgResp.Info.Role,
+			Parts:      make([]interface{}, len(msgResp.Parts)),
+			ParentID:   msgResp.Info.ParentID,
+			Error:      msgResp.Info.Error,
+			Finish:     msgResp.Info.Finish,
+			ModelID:    msgResp.Info.ModelID,
+			ProviderID: msgResp.Info.ProviderID,
+		}
+
+		var content strings.Builder
+		for j, part := range msgResp.Parts {
+			msg.Parts[j] = part
+			if part.Type == "text" && part.Text != "" {
+				content.WriteString(part.Text)
+				content.WriteString("\n")
+			}
+		}
+		msg.Content = strings.TrimSpace(content.String())
+
+		if msgResp.Info.Time.Created > 0 {
+			msg.CreatedAt = time.UnixMilli(msgResp.Info.Time.Created)
+		}
+		if msgResp.Info.Time.Completed > 0 {
+			msg.CompletedAt = time.UnixMilli(msgResp.Info.Time.Completed)
+		}
+
+		messages[i] = msg
+	}
+	return messages
 }
 
 func formatMessageIDsForLog(ids []string, max int) string {
@@ -522,6 +582,62 @@ func (c *Client) GetModels(ctx context.Context) ([]Model, error) {
 	}
 
 	return models, nil
+}
+
+// GetSessionStatus gets status for all sessions.
+func (c *Client) GetSessionStatus(ctx context.Context) (map[string]SessionStatusInfo, error) {
+	resp, err := c.request(ctx, "GET", "/session/status", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	statuses := make(map[string]SessionStatusInfo)
+	if err := decodeResponse(resp, &statuses); err != nil {
+		return nil, err
+	}
+	return statuses, nil
+}
+
+// GetConfig gets app-level configuration from /config.
+func (c *Client) GetConfig(ctx context.Context) (map[string]interface{}, error) {
+	resp, err := c.request(ctx, "GET", "/config", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	config := make(map[string]interface{})
+	if err := decodeResponse(resp, &config); err != nil {
+		return nil, err
+	}
+	return config, nil
+}
+
+// GetAgents gets available agents from /agent.
+func (c *Client) GetAgents(ctx context.Context) ([]map[string]interface{}, error) {
+	resp, err := c.request(ctx, "GET", "/agent", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var agents []map[string]interface{}
+	if err := decodeResponse(resp, &agents); err != nil {
+		return nil, err
+	}
+	return agents, nil
+}
+
+// GetCommands gets available commands from /command.
+func (c *Client) GetCommands(ctx context.Context) ([]map[string]interface{}, error) {
+	resp, err := c.request(ctx, "GET", "/command", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var commands []map[string]interface{}
+	if err := decodeResponse(resp, &commands); err != nil {
+		return nil, err
+	}
+	return commands, nil
 }
 
 // generateMessageID generates a unique message ID starting with "msg"

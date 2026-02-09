@@ -40,6 +40,7 @@ type Bot struct {
 	tgBot          *telebot.Bot
 	opencodeClient *opencode.Client
 	sessionManager *session.Manager
+	runtime        *openCodeRuntime
 	ctx            context.Context
 	cancel         context.CancelFunc
 
@@ -91,6 +92,8 @@ type streamingState struct {
 	// Session ID for this streaming state
 	sessionID        string
 	requestMessageID string
+	requestTraceID   string
+	requestText      string
 
 	// Event-driven stream state for /event updates.
 	requestStartedAt      int64
@@ -108,6 +111,11 @@ type streamingState struct {
 	requestObserved       bool
 	reconcileInFlight     bool
 	lastReconcileAt       time.Time
+	pendingEventParts     map[string][]pendingEventPart
+	sessionStatus         string
+	lastStatusAt          time.Time
+	sawBusyStatus         bool
+	sawIdleAfterBusy      bool
 
 	isStreaming bool
 	isComplete  bool
@@ -118,6 +126,11 @@ type eventMessageState struct {
 	PartOrder []string
 	Parts     map[string]opencode.MessagePartResponse
 	LastEvent time.Time
+}
+
+type pendingEventPart struct {
+	Part  opencode.MessagePartResponse
+	Delta string
 }
 
 // modelSelection represents a model selection with provider and model IDs
@@ -191,6 +204,13 @@ func NewBot(cfg *config.Config) (*Bot, error) {
 
 	// Build global model mapping after successful initialization.
 	bot.buildGlobalModelMapping(initCtx)
+
+	runtime, err := newOpenCodeRuntime(ctx, bot)
+	if err != nil {
+		returnErr = fmt.Errorf("failed to initialize OpenCode runtime: %w", err)
+		return nil, returnErr
+	}
+	bot.runtime = runtime
 
 	return bot, nil
 }
@@ -1037,24 +1057,20 @@ func (b *Bot) handleSetModel(c telebot.Context) error {
 	return c.Send(fmt.Sprintf("✅ Current session model set to %s (%s/%s)\n\nThis model will be used as your default for new sessions.", selection.ModelName, selection.ProviderID, selection.ModelID))
 }
 
-// handleText handles plain text messages (non-commands) with real-time streaming
+// handleText handles plain text messages (non-commands) through attach-like runtime actors.
 func (b *Bot) handleText(c telebot.Context) error {
 	userID := c.Sender().ID
-	text := c.Text()
-
-	// Ignore empty messages
-	if strings.TrimSpace(text) == "" {
+	text := strings.TrimSpace(c.Text())
+	if text == "" {
 		return nil
 	}
 
-	// Get or create session for user
 	sessionID, err := b.sessionManager.GetOrCreateSession(b.ctx, userID)
 	if err != nil {
 		log.Errorf("Failed to get/create session: %v", err)
 		return c.Send(fmt.Sprintf("Session error: %v", err))
 	}
 
-	// Get session metadata to check model configuration
 	var messageModel *opencode.MessageModel
 	meta, exists := b.sessionManager.GetSessionMeta(sessionID)
 	if exists && meta.ProviderID != "" && meta.ModelID != "" {
@@ -1064,238 +1080,91 @@ func (b *Bot) handleText(c telebot.Context) error {
 		}
 		log.Debugf("Using session model %s/%s for message", meta.ProviderID, meta.ModelID)
 	} else {
-		// No model configured for this session
 		log.Warnf("No model configured for session %s", sessionID)
 		return c.Send("⚠️ No AI model configured for this session.\n\nPlease use `/models` to view available models, then use `/setmodel <number>` to set a model for this session.")
 	}
 
-	// Cancel any existing streaming for this session.
-	// Wait briefly for prior goroutine shutdown to avoid overlapping reconcile loops.
-	cancelledExistingStream := false
-	var previousState *streamingState
-	b.streamingStateMu.Lock()
-	if existingState, ok := b.streamingStates[sessionID]; ok && existingState.isStreaming {
-		existingState.cancel()
-		existingState.isStreaming = false
-		log.Infof("Cancelled existing streaming for session %s before starting new request", sessionID)
-		cancelledExistingStream = true
-		previousState = existingState
-	}
-	b.streamingStateMu.Unlock()
-	if previousState != nil && previousState.done != nil {
-		select {
-		case <-previousState.done:
-			log.Infof("Previous streaming goroutine exited for session %s", sessionID)
-		case <-time.After(2 * time.Second):
-			log.Warnf("Timed out waiting for previous streaming goroutine to exit for session %s", sessionID)
-		}
-	}
-	if cancelledExistingStream {
-		abortCtx, abortCancel := context.WithTimeout(b.ctx, 5*time.Second)
-		if abortErr := b.opencodeClient.AbortSession(abortCtx, sessionID); abortErr != nil {
-			log.Warnf("Failed to abort previous session execution for %s: %v", sessionID, abortErr)
-		}
-		abortCancel()
+	requestTraceID := opencode.GenerateMessageID()
+
+	if b.runtime == nil {
+		return c.Send("Processing error: runtime is not initialized")
 	}
 
-	// Send initial "processing" message
-	processingMsg, err := b.sendRenderedTelegramMessage(c, "🤖 Processing...", true)
+	err = b.runtime.SubmitTextTask(runtimeTaskRequest{
+		SessionID:      sessionID,
+		RequestTraceID: requestTraceID,
+		Text:           text,
+		Model:          messageModel,
+		TelegramCtx:    c,
+	})
 	if err != nil {
-		return err
+		log.Warnf("OpenCode runtime task failed for session %s request_trace_id=%s: %v", sessionID, requestTraceID, err)
+		return c.Send(fmt.Sprintf("Processing error: %v", err))
 	}
-
-	// Prepare context for event-driven streaming request lifecycle.
-	ctx, cancel := context.WithCancel(b.ctx)
-	defer cancel()
-
-	requestMessageID := opencode.GenerateMessageID()
-
-	// Track streaming state
-	streamingState := &streamingState{
-		ctx:                   ctx,
-		cancel:                cancel,
-		done:                  make(chan struct{}),
-		telegramMsg:           processingMsg,
-		telegramMessages:      []*telebot.Message{processingMsg},
-		lastRendered:          []string{"🤖 Processing..."},
-		telegramCtx:           c,
-		content:               &strings.Builder{},
-		lastUpdate:            time.Now(),
-		updateMutex:           &sync.Mutex{},
-		renderedMessageIDs:    make(map[string]bool),
-		cachedMessageChunks:   make(map[string][]string),
-		allDisplayChunks:      nil,
-		sessionInfoAdded:      false,
-		sessionID:             sessionID,
-		requestMessageID:      requestMessageID,
-		requestStartedAt:      time.Now().UnixMilli(),
-		initialMessageIDs:     make(map[string]bool),
-		initialMessageDigests: make(map[string]string),
-		eventMessages:         make(map[string]*eventMessageState),
-		displaySet:            make(map[string]bool),
-		pendingSet:            make(map[string]bool),
-		isStreaming:           true,
-	}
-
-	// Store streaming state for potential abort
-	b.streamingStateMu.Lock()
-	b.streamingStates[sessionID] = streamingState
-	b.streamingStateMu.Unlock()
-
-	// Clean up streaming state when done
-	defer func() {
-		if streamingState.done != nil {
-			close(streamingState.done)
-		}
-		b.streamingStateMu.Lock()
-		delete(b.streamingStates, sessionID)
-		b.streamingStateMu.Unlock()
-		streamingState.isStreaming = false
-	}()
-
-	updateCh := make(chan struct{}, 1)
-	eventErrCh := make(chan error, 1)
-
-	// Start event stream updates as the single real-time source.
-	eventDone := make(chan struct{})
-	go func() {
-		defer close(eventDone)
-		b.consumeSessionEvents(ctx, streamingState, sessionID, updateCh, eventErrCh)
-	}()
-
-	sendReq := &opencode.SendMessageRequest{
-		MessageID: requestMessageID,
-		Parts: []opencode.MessagePart{
-			{
-				Type: "text",
-				Text: text,
-			},
-		},
-	}
-	if messageModel != nil {
-		sendReq.Model = messageModel
-	}
-
-	modelLabel := "unknown"
-	if messageModel != nil {
-		modelLabel = messageModel.ProviderID + "/" + messageModel.ModelID
-	}
-	log.Infof("Dispatching OpenCode message: session=%s request_message_id=%s model=%s text_len=%d", sessionID, requestMessageID, modelLabel, len(text))
-
-	if sendErr := b.opencodeClient.PostMessage(ctx, sessionID, sendReq); sendErr != nil {
-		log.Warnf("OpenCode PostMessage failed for session %s request_message_id=%s: %v", sessionID, requestMessageID, sendErr)
-		cancel()
-		select {
-		case <-eventDone:
-		case <-time.After(2 * time.Second):
-			log.Warnf("Timed out waiting for event stream to stop after send failure for session %s", sessionID)
-		}
-		errorMsg := fmt.Sprintf("Processing error: %v", sendErr)
-		b.updateTelegramMessage(c, processingMsg, errorMsg, false)
-		return nil
-	}
-
-	log.Infof("OpenCode PostMessage acknowledged for session %s request_message_id=%s", sessionID, requestMessageID)
-
-	const settleGrace = 600 * time.Millisecond
-	const noOutputGrace = 12 * time.Second
-
-	waitTimeout := 2 * time.Duration(b.config.OpenCode.Timeout) * time.Second
-	if waitTimeout < 90*time.Second {
-		waitTimeout = 90 * time.Second
-	}
-	if waitTimeout > 30*time.Minute {
-		waitTimeout = 30 * time.Minute
-	}
-
-	deadline := time.Now().Add(waitTimeout)
-	ticker := time.NewTicker(250 * time.Millisecond)
-	defer ticker.Stop()
-
-	stableSettledPasses := 0
-	stableNoOutputPasses := 0
-	settleSince := time.Time{}
-	acknowledgedAt := time.Now()
-
-renderLoop:
-	for {
-		if time.Now().After(deadline) {
-			log.Warnf("Timed out waiting for assistant stream completion: session=%s request_message_id=%s", sessionID, requestMessageID)
-			break
-		}
-
-		select {
-		case <-ctx.Done():
-			break renderLoop
-		case <-updateCh:
-		case streamErr := <-eventErrCh:
-			if streamErr != nil && ctx.Err() == nil {
-				log.Warnf("Event stream warning for session %s request_message_id=%s: %v", sessionID, requestMessageID, streamErr)
-			}
-		case <-ticker.C:
-		}
-
-		streamingState.updateMutex.Lock()
-		for b.tryPromoteNextActiveMessage(streamingState) {
-		}
-		displays := b.buildEventDrivenDisplaysLocked(streamingState)
-		settled := b.eventPipelineSettledLocked(streamingState, true)
-		noOutputCandidate := b.eventPipelineNoOutputCandidateLocked(streamingState, true)
-		streamingState.updateMutex.Unlock()
-
-		if len(displays) > 0 {
-			b.updateStreamingTelegramMessages(streamingState, displays)
-		}
-
-		if settled {
-			stableSettledPasses++
-		} else {
-			stableSettledPasses = 0
-		}
-		if noOutputCandidate && time.Since(acknowledgedAt) >= noOutputGrace {
-			stableNoOutputPasses++
-		} else {
-			stableNoOutputPasses = 0
-		}
-
-		if stableSettledPasses >= eventSettleStableReconciles {
-			if settleSince.IsZero() {
-				settleSince = time.Now()
-			}
-			if time.Since(settleSince) >= settleGrace {
-				break
-			}
-		} else {
-			settleSince = time.Time{}
-		}
-
-		if stableNoOutputPasses >= noOutputStableReconciles {
-			break
-		}
-	}
-
-	cancel()
-	select {
-	case <-eventDone:
-	case <-time.After(2 * time.Second):
-		log.Warnf("Timed out waiting for event stream to stop for session %s", sessionID)
-	}
-
-	streamingState.updateMutex.Lock()
-	for b.tryPromoteNextActiveMessage(streamingState) {
-	}
-	streamingState.isComplete = true
-	hasRenderableOutput := len(streamingState.displayOrder) > 0
-	displays := b.buildEventDrivenDisplaysLocked(streamingState)
-	streamingState.updateMutex.Unlock()
-	if hasRenderableOutput && len(displays) > 0 {
-		b.updateStreamingTelegramMessages(streamingState, displays)
-		return nil
-	}
-
-	log.Infof("No renderable assistant output for session %s request_message_id=%s", sessionID, requestMessageID)
-	b.updateTelegramMessage(c, processingMsg, "🤖 Response completed with no content.", false)
 	return nil
+}
+
+func normalizeParentReplies(messages []opencode.Message, requestMessageID string) []opencode.Message {
+	filtered := make([]opencode.Message, 0, len(messages))
+	for _, msg := range messages {
+		if strings.EqualFold(strings.TrimSpace(msg.Role), "user") {
+			continue
+		}
+		if msg.ParentID != "" && requestMessageID != "" && msg.ParentID != requestMessageID {
+			continue
+		}
+		filtered = append(filtered, msg)
+	}
+	sort.SliceStable(filtered, func(i, j int) bool {
+		if filtered[i].CreatedAt.Equal(filtered[j].CreatedAt) {
+			return filtered[i].ID < filtered[j].ID
+		}
+		if filtered[i].CreatedAt.IsZero() {
+			return false
+		}
+		if filtered[j].CreatedAt.IsZero() {
+			return true
+		}
+		return filtered[i].CreatedAt.Before(filtered[j].CreatedAt)
+	})
+	return filtered
+}
+
+func allParentRepliesCompleted(messages []opencode.Message) bool {
+	if len(messages) == 0 {
+		return false
+	}
+	for _, msg := range messages {
+		if msg.Error != nil {
+			continue
+		}
+		if !msg.CompletedAt.IsZero() {
+			continue
+		}
+		if strings.TrimSpace(msg.Finish) != "" {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func digestMessagesForPolling(messages []opencode.Message) string {
+	if len(messages) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	for i, msg := range messages {
+		if i > 0 {
+			sb.WriteString("||")
+		}
+		sb.WriteString(snapshotMessageDigest(msg))
+		if !msg.CompletedAt.IsZero() {
+			sb.WriteString("|completed=")
+			sb.WriteString(strconv.FormatInt(msg.CompletedAt.UnixMilli(), 10))
+		}
+	}
+	return sb.String()
 }
 
 // buildGlobalModelMapping builds the global model mapping from preloaded models
@@ -1502,9 +1371,52 @@ func (b *Bot) applySessionEventLocked(state *streamingState, sessionID string, e
 		return b.applyMessageUpdatedEventLocked(state, sessionID, event.Properties)
 	case "message.part.updated":
 		return b.applyMessagePartUpdatedEventLocked(state, sessionID, event.Properties)
+	case "session.status":
+		return b.applySessionStatusEventLocked(state, sessionID, event.Properties)
 	default:
 		return false, false
 	}
+}
+
+func (b *Bot) applySessionStatusEventLocked(state *streamingState, sessionID string, raw json.RawMessage) (bool, bool) {
+	var payload struct {
+		SessionID string                     `json:"sessionID"`
+		Status    opencode.SessionStatusInfo `json:"status"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return false, false
+	}
+	if payload.SessionID == "" || payload.SessionID != sessionID {
+		return false, false
+	}
+
+	next := strings.TrimSpace(strings.ToLower(payload.Status.Type))
+	if next == "" {
+		return false, false
+	}
+
+	changed := state.sessionStatus != next
+	state.sessionStatus = next
+	state.lastStatusAt = time.Now()
+	switch next {
+	case "busy":
+		if !state.sawBusyStatus {
+			changed = true
+		}
+		state.sawBusyStatus = true
+		state.sawIdleAfterBusy = false
+	case "idle":
+		if state.sawBusyStatus && !state.sawIdleAfterBusy {
+			changed = true
+		}
+		if state.sawBusyStatus {
+			state.sawIdleAfterBusy = true
+		}
+	}
+	if !changed {
+		return false, false
+	}
+	return true, next == "idle"
 }
 
 func (b *Bot) applyMessageUpdatedEventLocked(state *streamingState, sessionID string, raw json.RawMessage) (bool, bool) {
@@ -1516,10 +1428,24 @@ func (b *Bot) applyMessageUpdatedEventLocked(state *streamingState, sessionID st
 	if info.ID == "" || info.SessionID == "" || info.SessionID != sessionID {
 		return false, false
 	}
-	if info.ID == state.requestMessageID && strings.EqualFold(strings.TrimSpace(info.Role), "user") {
+	role := strings.ToLower(strings.TrimSpace(info.Role))
+	if role == "user" {
+		if b.isRequestUserMessageLocked(state, info) {
+			state.requestObserved = true
+			state.requestMessageID = info.ID
+			return false, false
+		}
 		return false, false
 	}
-	if !b.shouldTrackEventMessageLocked(state, info.ID, info.Time.Created) {
+	parentID := strings.TrimSpace(info.ParentID)
+	if state.requestMessageID != "" {
+		if parentID != "" && parentID != state.requestMessageID {
+			return false, false
+		}
+		if parentID == "" && !b.shouldTrackEventMessageLocked(state, info.ID, info.Time.Created) {
+			return false, false
+		}
+	} else if !b.shouldTrackEventMessageLocked(state, info.ID, info.Time.Created) {
 		return false, false
 	}
 
@@ -1537,6 +1463,7 @@ func (b *Bot) applyMessageUpdatedEventLocked(state *streamingState, sessionID st
 	if infoChanged || displayChanged {
 		msgState.LastEvent = time.Now()
 	}
+	b.applyPendingPartsForMessageLocked(state, msgState.Info.ID)
 	return infoChanged || displayChanged, completedNow || displayChanged
 }
 
@@ -1551,9 +1478,33 @@ func (b *Bot) applyMessagePartUpdatedEventLocked(state *streamingState, sessionI
 		return false, false
 	}
 	if part.MessageID == state.requestMessageID {
+		state.requestObserved = true
 		return false, false
 	}
+	if state.requestMessageID == "" && !state.requestObserved {
+		if state.initialMessageIDs == nil || !state.initialMessageIDs[part.MessageID] {
+			if strings.TrimSpace(part.Type) == "text" && strings.TrimSpace(state.requestText) != "" {
+				partText := strings.TrimSpace(part.Text)
+				reqText := strings.TrimSpace(state.requestText)
+				if partText == reqText {
+					state.requestMessageID = part.MessageID
+					state.requestObserved = true
+					return false, false
+				}
+			}
+		}
+	}
 	if !b.shouldTrackEventMessageLocked(state, part.MessageID, 0) {
+		if state.initialMessageIDs != nil && state.initialMessageIDs[part.MessageID] {
+			return false, false
+		}
+		if state.pendingEventParts == nil {
+			state.pendingEventParts = make(map[string][]pendingEventPart)
+		}
+		state.pendingEventParts[part.MessageID] = append(state.pendingEventParts[part.MessageID], pendingEventPart{
+			Part:  part,
+			Delta: payload.Delta,
+		})
 		return false, false
 	}
 
@@ -1563,6 +1514,43 @@ func (b *Bot) applyMessagePartUpdatedEventLocked(state *streamingState, sessionI
 	}
 	changed := upsertEventPartLocked(msgState, part, payload.Delta)
 	return changed, false
+}
+
+func (b *Bot) isRequestUserMessageLocked(state *streamingState, info opencode.MessageInfo) bool {
+	if state == nil || info.ID == "" {
+		return false
+	}
+	if state.requestMessageID != "" {
+		return info.ID == state.requestMessageID
+	}
+	if state.initialMessageIDs != nil && state.initialMessageIDs[info.ID] {
+		return false
+	}
+	if info.Time.Created > 0 && state.requestStartedAt > 0 && info.Time.Created+1500 < state.requestStartedAt {
+		return false
+	}
+	return true
+}
+
+func (b *Bot) applyPendingPartsForMessageLocked(state *streamingState, messageID string) {
+	if state == nil || messageID == "" || len(state.pendingEventParts) == 0 {
+		return
+	}
+	pending := state.pendingEventParts[messageID]
+	if len(pending) == 0 {
+		delete(state.pendingEventParts, messageID)
+		return
+	}
+
+	msgState := b.getOrCreateEventMessageStateLocked(state, messageID)
+	for _, item := range pending {
+		part := item.Part
+		if strings.TrimSpace(part.ID) == "" {
+			part.ID = synthesizePartID(part, 0)
+		}
+		_ = upsertEventPartLocked(msgState, part, item.Delta)
+	}
+	delete(state.pendingEventParts, messageID)
 }
 
 func (b *Bot) shouldTrackEventMessageLocked(state *streamingState, messageID string, created int64) bool {
@@ -1575,7 +1563,13 @@ func (b *Bot) shouldTrackEventMessageLocked(state *streamingState, messageID str
 	if state.initialMessageIDs != nil && state.initialMessageIDs[messageID] {
 		return false
 	}
-	return true
+	if created > 0 && state.requestStartedAt > 0 {
+		if created+1500 < state.requestStartedAt {
+			return false
+		}
+		return true
+	}
+	return state.requestObserved
 }
 
 func (b *Bot) getOrCreateEventMessageStateLocked(state *streamingState, messageID string) *eventMessageState {
@@ -1734,7 +1728,7 @@ func (b *Bot) eventPipelineSettledLocked(state *streamingState, sendCompleted bo
 		return false
 	}
 	if state.activeMessageID == "" {
-		return len(state.displayOrder) > 0 || state.hasEventUpdates
+		return false
 	}
 	active := state.eventMessages[state.activeMessageID]
 	return isEventMessageCompleted(active)
@@ -1903,20 +1897,54 @@ func (b *Bot) reconcileEventStateWithLatestMessages(state *streamingState) bool 
 	})
 
 	requestObserved := false
+	observedRequestMessageID := ""
 	if state.requestMessageID != "" {
 		for _, msg := range messages {
 			if msg.ID == state.requestMessageID {
 				requestObserved = true
+				observedRequestMessageID = msg.ID
 				break
 			}
+		}
+	} else {
+		reqText := strings.TrimSpace(state.requestText)
+		for _, msg := range messages {
+			if strings.ToLower(strings.TrimSpace(msg.Role)) != "user" || msg.ID == "" {
+				continue
+			}
+			if state.initialMessageIDs != nil && state.initialMessageIDs[msg.ID] {
+				continue
+			}
+			created := int64(0)
+			if !msg.CreatedAt.IsZero() {
+				created = msg.CreatedAt.UnixMilli()
+			}
+			if created > 0 && state.requestStartedAt > 0 && created+1500 < state.requestStartedAt {
+				continue
+			}
+			if reqText != "" {
+				msgText := strings.TrimSpace(msg.Content)
+				if msgText != "" && msgText != reqText && !strings.Contains(msgText, reqText) && !strings.Contains(reqText, msgText) {
+					continue
+				}
+			}
+			requestObserved = true
+			observedRequestMessageID = msg.ID
+			break
 		}
 	}
 
 	state.updateMutex.Lock()
 	defer state.updateMutex.Unlock()
-	if requestObserved && !state.requestObserved {
+	if requestObserved {
+		changed := !state.requestObserved || (observedRequestMessageID != "" && state.requestMessageID != observedRequestMessageID)
 		state.requestObserved = true
-		log.Infof("Observed request message in OpenCode snapshot: session=%s request_message_id=%s", state.sessionID, state.requestMessageID)
+		if observedRequestMessageID != "" {
+			state.requestMessageID = observedRequestMessageID
+		}
+		if changed {
+			log.Infof("Observed request message in OpenCode snapshot: session=%s request_trace_id=%s request_message_id=%s", state.sessionID, state.requestTraceID, state.requestMessageID)
+		}
 	}
 	b.reconcileEventStateWithMessagesLocked(state, messages)
 	return state.requestObserved
@@ -1998,18 +2026,7 @@ func (b *Bot) shouldTrackSnapshotMessageLocked(state *streamingState, msg openco
 		return true, false
 	}
 	if state.initialMessageIDs != nil && state.initialMessageIDs[msg.ID] {
-		if state.initialMessageDigests == nil {
-			return false, false
-		}
-		baselineDigest, hasBaseline := state.initialMessageDigests[msg.ID]
-		if !hasBaseline {
-			return false, false
-		}
-		currentDigest := snapshotMessageDigest(msg)
-		if baselineDigest == currentDigest {
-			return false, false
-		}
-		return true, true
+		return false, false
 	}
 	if created > 0 && state.requestStartedAt > 0 && created+500 < state.requestStartedAt {
 		return false, false
@@ -3120,6 +3137,10 @@ func normalizeFenceLineForSplit(trimmedLine string) (fenceLine string, quotePref
 
 // Close closes the bot and releases resources
 func (b *Bot) Close() error {
+	if b.runtime != nil {
+		b.runtime.Close()
+	}
+
 	if b.cancel != nil {
 		b.cancel()
 	}
