@@ -122,7 +122,7 @@ release-packages: release
 	tar -czf opencode-tg-darwin-arm64.tar.gz -C release/darwin-arm64 .
 	
 	# Source code package
-	tar --exclude='.git' --exclude='release' --exclude='opencode-tg-*' --exclude='*.tar.gz' -czf opencode-tg-src.tar.gz .
+	tar --exclude='.git' --exclude='release' --exclude='./opencode-tg-*' --exclude='./*.tar.gz' -czf opencode-tg-src.tar.gz .
 	
 	@echo "Release packages created:"
 	@ls -la *.tar.gz
