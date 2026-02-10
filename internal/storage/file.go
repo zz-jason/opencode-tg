@@ -57,6 +57,7 @@ func NewFileStore(filePath string) (Store, error) {
 }
 
 func migrateLegacyStateFileIfNeeded(filePath string) error {
+	// Check for legacy bot-state.json file
 	if filepath.Base(filePath) != "bot-state.json" {
 		return nil
 	}

@@ -22,19 +22,19 @@ enabled = true
 url = "http://proxy:7890"
 
 [opencode]
-url = "http://192.168.50.100:8080"
+url = "http://127.0.0.1:8080"
 timeout = 30
 
 [storage]
 type = "file"
-file_path = "bot-state.json"
+file_path = "opencode-tg-state.json"
 
 [render]
 mode = "markdown_stream"
 
 [logging]
 level = "info"
-output = "bot.log"
+output = "opencode-tg.log"
 enable_opencode_request_logs = true
 enable_telegram_request_logs = true
 enable_telegram_interface_logs = true
@@ -63,8 +63,8 @@ enable_telegram_interface_logs = true
 	if cfg.Proxy.URL != "http://proxy:7890" {
 		t.Errorf("Expected proxy URL 'http://proxy:7890', got %s", cfg.Proxy.URL)
 	}
-	if cfg.OpenCode.URL != "http://192.168.50.100:8080" {
-		t.Errorf("Expected OpenCode URL 'http://192.168.50.100:8080', got %s", cfg.OpenCode.URL)
+	if cfg.OpenCode.URL != "http://127.0.0.1:8080" {
+		t.Errorf("Expected OpenCode URL 'http://127.0.0.1:8080', got %s", cfg.OpenCode.URL)
 	}
 	if cfg.OpenCode.Timeout != 30 {
 		t.Errorf("Expected OpenCode timeout 30, got %d", cfg.OpenCode.Timeout)
@@ -99,7 +99,7 @@ func TestLoadConfigDefaults(t *testing.T) {
 token = "test_token"
 
 [opencode]
-url = "http://192.168.50.100:8080"
+url = "http://127.0.0.1:8080"
 `
 
 	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
@@ -124,8 +124,8 @@ url = "http://192.168.50.100:8080"
 	if cfg.Storage.Type != "file" {
 		t.Errorf("Expected default storage type 'file', got %s", cfg.Storage.Type)
 	}
-	if cfg.Storage.FilePath != "bot-state.json" {
-		t.Errorf("Expected default file path 'bot-state.json', got %s", cfg.Storage.FilePath)
+	if cfg.Storage.FilePath != "opencode-tg-state.json" {
+		t.Errorf("Expected default file path 'opencode-tg-state.json', got %s", cfg.Storage.FilePath)
 	}
 	if cfg.Render.Mode != "markdown_stream" {
 		t.Errorf("Expected default render mode 'markdown_stream', got %s", cfg.Render.Mode)
