@@ -50,7 +50,6 @@ jobs:
           opencode-tg-linux-arm64.tar.gz
           opencode-tg-darwin-amd64.tar.gz
           opencode-tg-darwin-arm64.tar.gz
-          opencode-tg-src.tar.gz
           checksums.txt
         generate_release_notes: true
         draft: false

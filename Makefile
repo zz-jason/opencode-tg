@@ -55,7 +55,7 @@ clean:
 	rm -f bot-state.json
 	rm -rf release
 	rm -rf dist
-	rm -f *.tar.gz
+	rm -f opencode-tg-*.tar.gz
 
 # Run the bot
 run: build
@@ -119,9 +119,6 @@ release-packages: release
 	cp config.example.toml release/darwin-arm64/config.toml
 	cp README.md release/darwin-arm64/
 	tar -czf opencode-tg-darwin-arm64.tar.gz -C release/darwin-arm64 .
-	
-	# Source code package
-	tar --exclude='.git' --exclude='release' --exclude='dist' --exclude='*.tar.gz' -czf opencode-tg-src.tar.gz .
 	
 	@echo "Release packages created:"
 	@ls -la *.tar.gz
