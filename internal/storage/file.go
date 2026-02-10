@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -35,10 +34,6 @@ type modelPreference struct {
 
 // NewFileStore creates a new file-based store
 func NewFileStore(filePath string) (Store, error) {
-	if err := migrateLegacyStateFileIfNeeded(filePath); err != nil {
-		return nil, fmt.Errorf("failed to migrate legacy state file: %w", err)
-	}
-
 	store := &fileStore{
 		filePath:       filePath,
 		userSessions:   make(map[int64]string),
@@ -54,28 +49,6 @@ func NewFileStore(filePath string) (Store, error) {
 	}
 
 	return store, nil
-}
-
-func migrateLegacyStateFileIfNeeded(filePath string) error {
-	// Check for legacy bot-state.json file
-	if filepath.Base(filePath) != "bot-state.json" {
-		return nil
-	}
-
-	if _, err := os.Stat(filePath); err == nil {
-		return nil
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-
-	legacyPath := filepath.Join(filepath.Dir(filePath), "sessions.json")
-	if _, err := os.Stat(legacyPath); err == nil {
-		return os.Rename(legacyPath, filePath)
-	} else if os.IsNotExist(err) {
-		return nil
-	} else {
-		return err
-	}
 }
 
 // load reads data from file
