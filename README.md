@@ -62,9 +62,9 @@ mode = "markdown_stream"
 ```
 
 `telegram.polling_timeout` and `telegram.polling_limit` are optional. Defaults are `60` and `100`.
-`storage.type` and `storage.file_path` are optional. Defaults are `file` and `bot-state.json`.
+`storage.type` and `storage.file_path` are optional. Defaults are `file` and `opencode-tg-state.json`.
 `render.mode` is optional. Defaults to `markdown_stream` (`plain`, `markdown_final`, `markdown_stream`).
-`logging.level` and `logging.output` are optional. Defaults are `info` and `bot.log`.
+`logging.level` and `logging.output` are optional. Defaults are `info` and `opencode-tg.log`.
 
 ### Start OpenCode (hostname and port)
 
@@ -86,7 +86,7 @@ Then set `opencode.url` in `config.toml` to the address reachable from the bot h
 
 ```bash
 make build
-./tg-bot --config ./config.toml
+./opencode-tg --config ./config.toml
 ```
 
 ## Common Commands
@@ -106,4 +106,4 @@ Any non-command text message is forwarded to OpenCode.
 - Cannot connect to OpenCode: verify `opencode.url` and OpenCode service health.
 - Cannot connect to Telegram: verify `telegram.token`; if proxy is enabled, verify `proxy.url`.
 - Request timeout: increase `opencode.timeout` and check OpenCode server load.
-- Session state file: defaults to `bot-state.json`.
+- Session state file: defaults to `opencode-tg-state.json`.
