@@ -7,23 +7,23 @@ polling_timeout = 60
 polling_limit = 100
 
 [proxy]
-enabled = false
+enabled = true
 url = "http://127.0.0.1:7890"
 
 [opencode]
-url = "http://127.0.0.1:8080"
+url = "http://192.168.50.100:8080"
 timeout = 30
 
 [storage]
 type = "file"  # only "file" storage is supported
-file_path = "opencode-tg-state.json"  # path to JSON file for session storage
+file_path = "bot-state.json"  # path to JSON file for session storage
 
 [render]
 mode = "markdown_stream"  # plain | markdown_final | markdown_stream
 
 [logging]
 level = "info"
-output = "opencode-tg.log"
+output = "bot.log"
 enable_opencode_request_logs = false
 enable_telegram_request_logs = false
 enable_telegram_interface_logs = false

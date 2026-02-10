@@ -32,11 +32,11 @@ func TestCodeSpanProtection(t *testing.T) {
 }
 
 func TestInputValidation(t *testing.T) {
-	// Test large input handling
+	// 测试大输入处理
 	largeInput := strings.Repeat("a", 200000)
 	result := MarkdownToTelegramHTML(largeInput)
 
-	// Should be truncated
+	// 应该被截断
 	if len(result) <= 100000 {
 		t.Errorf("Large input should be truncated, got length %d", len(result))
 	}
@@ -106,15 +106,15 @@ func TestEdgeCases(t *testing.T) {
 		input    string
 		expected string
 	}{
-		// Nested formatting tests
+		// 嵌套测试
 		{"Bold in italic", "*italic **bold** italic*", "<i>italic <b>bold</b> italic</i>"},
 		{"Italic in bold", "**bold *italic* bold**", "<b>bold <i>italic</i> bold</b>"},
-		// Edge case tests
+		// 边界测试
 		{"Adjacent formatting", "**bold****bold**", "<b>bold</b><b>bold</b>"},
 		{"Mixed formatting", "***bold italic*** text", "<b><i>bold italic</i></b> text"},
-		// Special characters
+		// 特殊字符
 		{"Special chars in code", "`a < b && c > d`", "<code>a &lt; b &amp;&amp; c &gt; d</code>"},
-		// Newline handling
+		// 换行处理
 		{"Newlines in text", "line1\nline2\nline3", "line1\nline2\nline3"},
 	}
 

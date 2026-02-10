@@ -64,7 +64,7 @@ run: build
 # Check OpenCode connection
 check-opencode:
 	@echo "Checking OpenCode connection..."
-	@if curl -s --max-time 10 "http://127.0.0.1:8080/global/health" > /dev/null; then \
+	@if curl -s --max-time 10 "http://192.168.50.100:8080/global/health" > /dev/null; then \
 		echo "✅ OpenCode is reachable"; \
 	else \
 		echo "❌ OpenCode is not reachable"; \

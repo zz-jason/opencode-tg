@@ -115,7 +115,7 @@ func setDefaults(cfg *Config) {
 		cfg.Storage.Type = "file"
 	}
 	if cfg.Storage.FilePath == "" && cfg.Storage.Type == "file" {
-		cfg.Storage.FilePath = "opencode-tg-state.json"
+		cfg.Storage.FilePath = "bot-state.json"
 	}
 	if cfg.Render.Mode == "" {
 		cfg.Render.Mode = "markdown_stream"
@@ -124,7 +124,7 @@ func setDefaults(cfg *Config) {
 		cfg.Logging.Level = "info"
 	}
 	if cfg.Logging.Output == "" {
-		cfg.Logging.Output = "opencode-tg.log"
+		cfg.Logging.Output = "bot.log"
 	}
 }
 

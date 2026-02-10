@@ -10,7 +10,7 @@ Design a Telegram Bot for interacting with OpenCode AI programming assistant dep
 ## Background
 
 ### Problem Context
-- OpenCode is an AI programming assistant deployed on an internal server (127.0.0.1:8080), providing rich OpenAPI interfaces.
+- OpenCode is an AI programming assistant deployed on an internal server (192.168.50.100:8080), providing rich OpenAPI interfaces.
 - Users want to conveniently interact with OpenCode via Telegram without directly accessing CLI or web interfaces.
 - Internal network environments cannot be accessed from the external internet, so the bot must use polling to receive messages.
 - Internal network access to external services requires HTTP proxy (for accessing Telegram, Google, and other overseas services).
@@ -38,7 +38,7 @@ Design a Telegram Bot for interacting with OpenCode AI programming assistant dep
 ```
 +-------------+      +-------------------+      +-------------------+
 | Telegram    |      | Telegram Bot      |      | OpenCode Server   |
-| API         |<---->| (Golang)          |<---->| (127.0.0.1:8080)|
+| API         |<---->| (Golang)          |<---->| (192.168.50.100:8080)|
 +-------------+      +-------------------+      +-------------------+
                          ^       ^
                          |       |
@@ -77,7 +77,7 @@ enabled = true
 url = "http://proxy:port"
 
 [opencode]
-url = "http://127.0.0.1:8080"
+url = "http://192.168.50.100:8080"
 timeout = 30
 
 [storage]

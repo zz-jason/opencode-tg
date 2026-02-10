@@ -204,7 +204,7 @@ func MarkdownToTelegramHTML(input string) string {
 				backtickCount++
 			}
 
-			// Check if it ends on the same line
+			// 检查是否在同一行结束
 			if !inFence {
 				// Check if there are closing backticks on the same line
 				if strings.HasSuffix(trimmed, strings.Repeat("`", backtickCount)) && len(trimmed) > backtickCount*2 {
