@@ -371,10 +371,22 @@ func (a *sessionActor) run() {
 			}
 
 			if time.Now().After(current.deadline) {
-				err := fmt.Errorf("timed out waiting for session %s to complete", a.sessionID)
-				a.finishTask(current, err)
-				current.req.resultCh <- err
-				current = nil
+				// Check if there are still active event updates
+				current.state.updateMutex.Lock()
+				hasRecentEvents := time.Since(current.state.lastEventAt) < 30*time.Second
+				current.state.updateMutex.Unlock()
+
+				if hasRecentEvents {
+					// Events are still updating, extend the deadline
+					current.deadline = time.Now().Add(30 * time.Second)
+					log.Infof("Extending deadline for session %s due to recent events", a.sessionID)
+				} else {
+					// Real timeout
+					err := fmt.Errorf("timed out waiting for session %s to complete", a.sessionID)
+					a.finishTask(current, err)
+					current.req.resultCh <- err
+					current = nil
+				}
 			}
 		}
 	}
@@ -689,11 +701,11 @@ func safeCloseStreamDone(done chan struct{}) {
 
 func taskWaitTimeout(openCodeTimeoutSeconds int) time.Duration {
 	waitTimeout := 2 * time.Duration(openCodeTimeoutSeconds) * time.Second
-	if waitTimeout < 90*time.Second {
-		waitTimeout = 90 * time.Second
+	if waitTimeout < 180*time.Second {
+		waitTimeout = 180 * time.Second
 	}
-	if waitTimeout > 30*time.Minute {
-		waitTimeout = 30 * time.Minute
+	if waitTimeout > 60*time.Minute {
+		waitTimeout = 60 * time.Minute
 	}
 	return waitTimeout
 }
